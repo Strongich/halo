@@ -6,8 +6,9 @@ policy and the reference, the policy term, the capped k3 KL against the referenc
 quantities buffered as diagnostics, and the loss type's reduction. The reduction comes in two halves
 because the pipeline divides once per step: :func:`offline_loss_numerator` is row-local, so
 microbatch numerators sum to the batch's, and :func:`offline_loss_normalizer` reads batch metadata
-alone. Under CP the numerator sums its partials across the shards first. :func:`offline_loss` is
-their quotient.
+alone. Under CP the numerator sums its partials across the shards first, and each row's complete
+token count comes from the replicated full-row labels rather than a collective. :func:`offline_loss`
+is their quotient.
 """
 
 from __future__ import annotations
@@ -54,8 +55,8 @@ def offline_token_objective(
     """The per-token loss (unmasked and unweighted) plus the per-token diagnostics to buffer.
 
     ``prob_weighted`` L = -(π·A) weights high-prob tokens more; ``reinforce`` L = -(log π·A) is
-    uniform. At ``beta != 0`` the capped k3 KL ``exp(Δ) - Δ - 1`` is added on top of the reward term,
-    so the diagnostics capture the reward term before the KL lands.
+    uniform. At ``beta != 0`` the capped k3 KL ``exp(Δ) - Δ - 1`` is added on top of the policy-gradient
+    term, so the ``pg_objective`` diagnostic (π·A or log π·A) captures that term before the KL lands.
 
     ``clamp_ref_logps`` is fed the detached policy log-probs: the ceiling is ``policy + the clamp``,
     so a grad-carrying policy tensor would make ``ref_clamped - logp`` constant on every clamped
@@ -67,7 +68,7 @@ def offline_token_objective(
     sample_values = {
         "logps": token_logps,
         "logps_unclamped": token_logps_unclamped,
-        "rewards": -per_token_loss,
+        "pg_objective": -per_token_loss,
     }
     if beta != 0.0:
         ref_logps, _ = clamp_ref_logps(ref_logps, token_logps.detach())
@@ -77,24 +78,40 @@ def offline_token_objective(
     return per_token_loss, sample_values
 
 
+def _complete_row_token_counts(
+    supervised_mask: torch.Tensor, row_token_counts: torch.Tensor | None, cp_config: CPConfig | None
+) -> torch.Tensor:
+    """Each row's supervised-token count in fp32: ``row_token_counts`` when given, else the mask's own,
+    which a CP shard holds only part of."""
+    if row_token_counts is not None:
+        if row_token_counts.shape != supervised_mask.shape[:1]:
+            raise ValueError("Offline loss needs one supervised-token count per token row")
+        return row_token_counts.float()
+    if cp_config is not None and cp_config.cp_size > 1:
+        raise ValueError("A CP shard's mask holds part of each row: pass the complete row_token_counts")
+    return supervised_mask.sum(dim=1, dtype=torch.float32)
+
+
 def offline_loss_numerator(
     per_token_loss: torch.Tensor,
     supervised_mask: torch.Tensor,
     group_sizes: torch.Tensor,
     *,
     loss_type: str,
+    row_token_counts: torch.Tensor | None = None,
     cp_config: CPConfig | None = None,
 ) -> torch.Tensor:
     """The per-token loss summed over the supervised tokens, each row weighted ``1/group_size`` so every
-    source group counts equally; ``grpo`` first averages each row over its own tokens. Row-local, so
-    pipeline microbatch numerators sum to the batch's."""
+    source group counts equally; ``grpo`` first averages each row over its own tokens, counted by
+    ``row_token_counts`` (required under CP). Row-local, so pipeline microbatch numerators sum to the
+    batch's."""
     if per_token_loss.shape != supervised_mask.shape or per_token_loss.shape[0] != group_sizes.numel():
         raise ValueError("Offline loss needs one supervision mask and group size per token row")
     group_weights = 1.0 / group_sizes.float()
     weighted = per_token_loss * group_weights.unsqueeze(1) * supervised_mask
     if loss_type == "grpo":
         rows = cp_sum_rows(weighted.sum(dim=1, dtype=torch.float32), cp_config)
-        counts = cp_sum_rows(supervised_mask.sum(dim=1, dtype=torch.float32), cp_config)
+        counts = _complete_row_token_counts(supervised_mask, row_token_counts, cp_config)
         return (rows / counts.clamp(min=1)).sum()
     return cp_sum_rows(weighted.sum(), cp_config)
 
@@ -130,13 +147,15 @@ def offline_loss(
     *,
     loss_type: str,
     max_completion_length: int | None,
+    row_token_counts: torch.Tensor | None = None,
     cp_config: CPConfig | None = None,
 ) -> torch.Tensor:
-    """Offline objective on complete rows or CP-owned token shards of the same rows."""
+    """Offline objective on complete rows or CP-owned token shards of the same rows; a shard passes
+    each row's complete ``row_token_counts``."""
+    counts = _complete_row_token_counts(supervised_mask, row_token_counts, cp_config)
     numerator = offline_loss_numerator(
-        per_token_loss, supervised_mask, group_sizes, loss_type=loss_type, cp_config=cp_config
+        per_token_loss, supervised_mask, group_sizes, loss_type=loss_type, row_token_counts=counts, cp_config=cp_config
     )
-    counts = cp_sum_rows(supervised_mask.sum(dim=1, dtype=torch.float32), cp_config) if loss_type == "bnpo" else None
     return numerator / offline_loss_normalizer(
         counts, group_sizes, loss_type=loss_type, max_completion_length=max_completion_length
     )

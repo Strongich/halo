@@ -21,9 +21,18 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from src.checkpoint.format import REFERENCE_LOGPS_FILE
-from src.trainers.mixins.reference_logps import ReferenceLogpsCheckpointMixin, is_token_type, token_digest
+from src.trainers.mixins.reference_logps import (
+    ReferenceLogpsCheckpointMixin,
+    is_reference_entry,
+    is_token_type,
+    reference_regeneration_steps,
+    token_digest,
+)
 
 logger = get_logger(__name__, log_level="info")
+
+# The settings key recording the precision the sweep summed a split's log-probs in.
+_PRECISION_KEY = "logprob_precision"
 
 
 def _attach_reference_columns(dataset: Dataset, columns: Mapping[str, torch.Tensor]) -> Dataset:
@@ -33,6 +42,9 @@ def _attach_reference_columns(dataset: Dataset, columns: Mapping[str, torch.Tens
 
 class PrecomputeRefLogpsRankConsistentMixin(ReferenceLogpsCheckpointMixin):
     """Run TRL's reference sweep on the DP axis and preserve each named split on resume."""
+
+    # Declared by FP32LogprobsMixin; part of every saved split's identity.
+    logprob_precision: str | None = None
 
     def _init_reference_resume(self, kwargs: dict) -> None:
         given = "resume_checkpoint" in kwargs
@@ -47,6 +59,16 @@ class PrecomputeRefLogpsRankConsistentMixin(ReferenceLogpsCheckpointMixin):
 
     def _reference_settings(self) -> dict:
         raise NotImplementedError(f"{type(self).__name__} must name the settings its reference depends on")
+
+    def _reference_identity_settings(self) -> dict:
+        """The settings a saved split records and must match: the run's knobs plus the precision the
+        sweep sums its log-probs in."""
+        if self.logprob_precision is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must declare the logprob_precision its reference sweep sums in "
+                "(list FP32LogprobsMixin in its bases)"
+            )
+        return {**self._reference_settings(), _PRECISION_KEY: self.logprob_precision}
 
     def _precompute_ref_logps(self, dataset, name, batch_size):
         needed = self._required_ref_logps_columns()
@@ -68,7 +90,7 @@ class PrecomputeRefLogpsRankConsistentMixin(ReferenceLogpsCheckpointMixin):
                 f"their reference log-probs would share one {REFERENCE_LOGPS_FILE} entry. Rename it."
             )
         self._check_reference_resume_context()
-        identity = self._reference_split_identity(dataset, name)
+        identity = self._reference_split_identity(dataset, name, self._reference_identity_settings())
         restored = self._restore_reference_split(dataset, name, needed, identity)
         if restored is not None:
             return restored
@@ -124,6 +146,19 @@ class PrecomputeRefLogpsRankConsistentMixin(ReferenceLogpsCheckpointMixin):
             if not isinstance(columns[column], torch.Tensor) or tuple(columns[column].shape) != (len(dataset),)
         ]
         return f"its {malformed} do not hold one value per row" if malformed else None
+
+    def _reference_mismatch_refusal(self, name: str, entry: object, identity: Mapping, mismatch: str) -> str:
+        """A split summed at another precision names only the regeneration: no setting selects it."""
+        ours = identity["settings"][_PRECISION_KEY]
+        if not is_reference_entry(entry) or entry["settings"].get(_PRECISION_KEY) == ours:
+            return super()._reference_mismatch_refusal(name, entry, identity, mismatch)
+        return (
+            f"Regenerate the '{name}' reference log-probs for this run: "
+            f"{reference_regeneration_steps(self._reference_resume_checkpoint)}. The saved ones in "
+            f"{self._reference_saved_path} were summed at "
+            f"{entry['settings'].get(_PRECISION_KEY, 'unrecorded')} precision, and this run sums them in "
+            f"{ours}, which no setting changes."
+        )
 
     def _attach_reference_payload(self, dataset: Dataset, entry: Mapping, needed: Sequence[str]) -> Dataset:
         return _attach_reference_columns(dataset, {column: entry["columns"][column] for column in needed})

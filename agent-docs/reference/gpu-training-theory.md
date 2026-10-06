@@ -108,7 +108,7 @@ A coarse MoE (gpt-oss: 32–128 experts, `2880²`) gives each expert more tokens
 
 The cheapest M is the one you are already paying for. Padding spends it on nothing: a varlen Flash Attention kernel skips pad tokens (SDPA computes and masks them), but every pad row still flows through the projections and the MLP at full GEMM cost.
 
-Packing documents into full rows takes it back — 9.2× the real tokens/s on Qwen3-30B-A3B at `max_length` 4096 with ~1024-token documents (2× B300, EP=2) ([Padding-Free Collator](../optimization/padding-free-collator.md#benchmark-results)).
+Packing documents into full rows takes it back — 14.5× the real tokens/s on Qwen3-30B-A3B at `max_length` 4096 with ~1024-token documents (2× B300, EP=2) ([Padding-Free Collator](../optimization/padding-free-collator.md#benchmark-results)).
 
 First question of any step: are its dominant kernels' M above the ridge? If not, the fix is **a bigger M** — longer packed sequences, a bigger batch, or a smaller parallel degree — not a faster kernel. It buys nothing once the step is compute-bound and saturated, or already at the memory limit.
 
@@ -127,7 +127,7 @@ A step is thousands of kernels, and at any moment one of four resources limits i
 
 The launch floor is a few microseconds of host time per kernel — the sustained issue cost with framework dispatch included, not the bare driver call. [§11](#11-measuring-it-yourself)'s script measures it on your GPU.
 
-Run a MoE layer as a per-expert loop and that cost dominates. Qwen3-30B-A3B's `128 experts × 2 fused projections = 256` tiny matmuls take 1.33 ms in the forward against 0.11 ms for one grouped kernel (B300, 4k tokens) ([Grouped GEMM](../optimization/grouped-gemm.md)). Batching into one kernel matters at high expert count independent of the roofline.
+Run a MoE layer as a per-expert loop and that cost dominates. Qwen3-30B-A3B's `128 experts × 2 fused projections = 256` tiny matmuls take 1.12 ms in the forward against 0.11 ms for one grouped kernel (B300, 4k tokens) ([Grouped GEMM](../optimization/grouped-gemm.md)). Batching into one kernel matters at high expert count independent of the roofline.
 
 ### Anatomy of one step
 
@@ -156,7 +156,7 @@ It ramps first — small M means few tiles and most SMs idle, the §2 penalty �
 
 ![Measured bf16 GEMM efficiency versus M on a B300, gpt-oss expert (K=N=2880), as a percentage of the shape's own peak. Efficiency ramps steeply from a few percent at small M, where few tiles leave most of the 148 SMs idle, to near 90% by M≈1100, then ripples between roughly 70% and 95% as tiles repack across the SMs: a ramp plus a ripple, not the deep sawtooth the tile/wave geometry predicts in the abstract](../assets/diagrams/tile_quantization.png)
 
-This is why `F.grouped_mm` and per-shape cuBLAS trade places. The loop lets cuBLAS pick a per-shape tile and absorb the tail, at one launch per expert; grouped GEMM uses one tile shape for all groups and eats the tail on small ones, but pays a single launch. Which wins is set by `M` and expert count, roofline plus launch floor.
+This is why per-shape cuBLAS narrows `F.grouped_mm`'s lead as `M` grows. The loop lets cuBLAS pick a per-shape tile and absorb the tail, at one launch per expert; grouped GEMM uses one tile shape for all groups and eats the tail on small ones, but pays a single launch. The margin is set by `M` and expert count, roofline plus launch floor; on every measured gpt-oss-20b shape grouped still wins ([Grouped GEMM](../optimization/grouped-gemm.md#grouped-vs-the-loop-path)).
 
 ### Blackwell vs Hopper: same idea, different tensor cores
 
@@ -229,7 +229,7 @@ The cost is that `outputs.logits` never exists. That makes FLCE SFT-only (prefer
 ### What fusion does not buy
 
 - **Chains, not isolated ops.** `torch.compile(mode="max-autotune")` on a single `silu(a)*b` is slower than eager on a B300, since autotune and guard overhead exceed the one-op saving.
-- **Compile carries guard and recompile cost.** On parallel models the DeepEP all-to-all (EP), DTensor dispatch (TP), and Ulysses all-to-all (CP) each break the graph, so compile fuses only the spans between breaks and its ceiling stays near Liger's ([torch.compile](../optimization/torch-compile.md)).
+- **Compile carries guard and recompile cost.** On parallel models the DeepEP all-to-all (EP), DTensor dispatch (TP), and Ulysses all-to-all (CP) each break the graph, so compile fuses only the spans between breaks; on EP MoE it gains at most 1% ([torch.compile](../optimization/torch-compile.md)).
 - **Nothing for compute-bound matmuls**, which have no HBM pass to remove.
 
 ---
@@ -348,14 +348,14 @@ Split a model across GPUs and a third speed enters the picture: inter-GPU bandwi
 | **HBM** | a GPU to its own memory | **~6.6 TB/s** (measured) | 1× |
 | **NVLink / NVSwitch** | GPUs within a node / NVL72 rack | **~1.8 TB/s** spec (NVLink 5) | ~4× slower (spec) |
 | **PCIe** | CPU ↔ GPU | ~64 GB/s/dir (Gen5 ×16) | ~100× slower |
-| **InfiniBand / Ethernet** | across nodes | ~50 GB/s (400 Gb/s NDR; ~46–48 effective) | ~130× slower |
+| **InfiniBand / EFA** | across nodes | ~50 GB/s at 400 Gb/s (NDR; ~46–48 effective); ~100 GB/s at 800 Gb/s (B300 EFA; 93 GB/s measured NCCL broadcast) | ~65–130× slower |
 
 The one recorded collective, an NCCL all-reduce at **767 GB/s** bus bandwidth, ran on 16 GPUs across two
 nodes, so it measures a job that crosses the node boundary, not NVLink alone.
 
 ![The bandwidth ladder on a log scale: HBM at 6.6 TB/s measured (spec 8 TB/s), NVLink/NVSwitch inside the node at 1.8 TB/s spec (~4× below HBM), with the repo's one recorded all-reduce bus bandwidth, 767 GB/s across 16 GPUs on 2 nodes, drawn as the measured bar, PCIe Gen5 ×16 at 64 GB/s per direction (~100× below HBM), and InfiniBand NDR across nodes at ~48 GB/s (~130× below HBM, the node boundary). Filled bars are measured, dashed outlines are spec; a collective is priced by the slowest tier it touches](../assets/diagrams/interconnect_tiers.png)
 
-One ratio drives distributed design. Crossing a node boundary costs ~36× more per byte than staying on NVLink (1.8 TB/s vs 50 GB/s, spec against spec). A collective inside the NVLink domain is cheap. Stretch it across nodes and it hits the InfiniBand wall.
+One ratio drives distributed design. Crossing a node boundary costs ~18–36× more per byte than staying on NVLink (1.8 TB/s vs 50–100 GB/s per GPU). A collective inside the NVLink domain is cheap. Stretch it across nodes and it hits the InfiniBand wall.
 
 - **NVLink** is direct GPU-to-GPU (Blackwell NVLink 5 ≈ 1.8 TB/s/GPU, Hopper NVLink 4 ≈ 0.9) and bypasses the CPU.
 - **NVSwitch** is an on-board crossbar: all 8 GPUs reach each other at full NVLink bandwidth, any-to-any.
@@ -390,7 +390,7 @@ Cost has two regimes. The crossover message size is roughly `link_bandwidth × p
 
 Comm does no FLOPs. The defenses are amortize (bigger M per step), shrink the degree (fewer ranks make a cheaper collective), and overlap (own stream, hidden behind compute).
 
-Gradient accumulation amortizes when memory caps the micro-batch: run several micro-batches, sum gradients locally, then fire the optimizer step and collective once. It buys a larger global batch than fits, but it is not itself a throughput lever, since it adds compute proportionally.
+Gradient accumulation runs several micro-batches per optimizer step, so it buys a larger global batch than fits. By default FSDP2 still reduce-scatters after every micro-batch, so it adds compute and communication in proportion and is not a throughput lever. With `fsdp_defer_grad_sync: true` the gradients are summed locally and reduced once per window, which makes it one: +5% on one 8-GPU node and +9–13% across two nodes over EFA on Qwen3-8B, +12% on an `ep_size: 1` MoE ([Data Parallelism](../parallelism/data-parallelism.md#deferred-gradient-reduce-fsdp_defer_grad_sync)).
 
 ### Each parallelism mode is a communication pattern
 
@@ -402,7 +402,7 @@ Each mode buys memory headroom by spending a specific collective.
     The catch is load balance: real routing is lumpy, so the busiest expert and the all-to-all gate the step and skew utilization. The toolkit tracks per-expert load and rebalances the router (aux loss or DeepSeek-V3 bias update).
 
 - **TP (tensor parallel)** splits each matmul and needs an all-reduce on the forward's critical path that the toolkit does not overlap, so TP must stay NVLink-local. [Tensor Parallelism](../parallelism/tensor-parallelism.md).
-- **CP (context parallel)** splits the sequence; a pair of all-to-alls swaps sequence-sharding for head-sharding around each attention (Ulysses). Use it for sequences too long for one GPU. [Context Parallelism](../parallelism/context-parallelism.md).
+- **CP (context parallel)** splits the sequence; all-to-alls swap sequence-sharding for head-sharding around each attention (Ulysses): one for Q, one for the fused K and V, one for the output. Use it for sequences too long for one GPU. [Context Parallelism](../parallelism/context-parallelism.md).
 
 **Where ZeRO fits.** Most readers arrive with DeepSpeed's stage vocabulary. DDP replicates everything; ZeRO-1 shards optimizer state, ZeRO-2 adds the gradients, ZeRO-3 shards the parameters too.
 
@@ -428,7 +428,7 @@ That is what "outermost" means, and it is why each stage must be a whole number 
 
 At `T = 8192, H = 4096` that is 134 MB, against the ~32 GB FSDP2 moves per rank per step on an 8B model. That is ~250× apart, and point-to-point rather than every-link (the third identity above).
 
-Every other model-splitting axis prices its traffic per *parameter*; PP prices it per *token × hidden*. So PP is the axis worth spending a ~50 GB/s cross-node link on. The same pricing is why the toolkit forces stage boundaries onto NVLink-domain boundaries: every intra-stage collective then stays inside a domain, and only the P2P activation crosses.
+Every other model-splitting axis prices its traffic per *parameter*; PP prices it per *token × hidden*. So PP is the axis worth spending a 50–100 GB/s per-GPU cross-node link on. The same pricing is why the toolkit forces stage boundaries onto NVLink-domain boundaries: every intra-stage collective then stays inside a domain, and only the P2P activation crosses.
 
 **The bubble.** Fill and drain leave each rank idle for `p−1` of a step's `m + p − 1` microbatch slots (the figure below splits each slot into its forward and backward halves, 6 idle of 22):
 
@@ -495,9 +495,9 @@ The levers are the same three ideas at step granularity instead of kernel granul
 - **Batching** — a bigger *generation batch* saturates the decode engine the way a bigger M saturates a GEMM, while the concurrency cap only throttles work that already exists.
 - **Amortization** — `sync_weights_every_n_steps` spreads the broadcast over more steps.
 
-The weight sync itself is a bandwidth question with the same shape as §9's ladder. A full-model broadcast (~42 GB at 20B) is cheap over NVLink and still ~1–2 s over host loopback, a tier below the ladder's bottom rung.
+The weight sync itself is a bandwidth question with the same shape as §9's ladder. A full-model broadcast is ~42 GB at 20B and 234 GB for gpt-oss-120b; on one host NCCL moves it GPU to GPU over CUDA IPC (`P2P/CUMEM`).
 
-Across nodes it rides the fabric: ~53 GB/s over EFA against ~10 GB/s on sockets, under a second per sync at 20B ([Rollout Servers](../infrastructure/rollout-servers.md#servers-on-other-nodes-efa)). Throughput anatomy and the tuning order live in [Async GRPO with Environments](../training-methods/grpo/async-grpo/performance.md#throughput-levers).
+Across nodes it rides the fabric: 53 GB/s (vLLM client) to 80 GB/s (SGLang) over EFA against 9.7 GB/s on sockets: 4.4 s, 2.9 s and 24 s for gpt-oss-120b (234 GB), and 0.5–0.8 s at 20B by the same EFA rates ([Rollout Servers](../infrastructure/rollout-servers.md#servers-on-other-nodes-efa)). Throughput anatomy and the tuning order live in [Async GRPO with Environments](../training-methods/grpo/async-grpo/performance.md#throughput-levers).
 
 ---
 

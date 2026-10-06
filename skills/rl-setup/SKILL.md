@@ -68,8 +68,8 @@ and full launch examples see [`wiring.md`](wiring.md).
    GRPO (RLVR) uses TRL's native vLLM fields instead (`use_vllm: true`,
    `vllm_mode: server`, `vllm_server_host`, `vllm_server_port`).
 
-3. **NCCL weight sync** is the vendored `VLLMWeightSyncClient`
-   (`src/distributed/nccl/`) — trainer is NCCL rank 0, vLLM workers rank 1+,
+3. **NCCL weight sync** is the vendored `VLLMWeightSyncClient` (`SGLangWeightSyncClient` under
+   `rollout_backend: sglang`; `src/distributed/nccl/`) — trainer is NCCL rank 0, server workers rank 1+,
    weights pushed as packed broadcasts (`pause → packed NCCL broadcast →
    resume`). Online and env GRPO share **one** gather routine,
    `gather_and_send_weights` (`src/trainers/grpo/rollout/weight_sync.py`), which is
@@ -129,6 +129,7 @@ during the sync; the rolling sync that keeps (N-1) servers generating exists
 only on the single-process path (no EP wrappers, no PEFT).
 
 ## Sources of truth
+
 `wiring.md` + `agent-docs/training-methods/grpo/` document the setup (`rewards.md` owns the
 term list, `async-grpo/setup.md` the servers and launch). The code is the **ultimate** authority:
 `src/trainers/grpo/environmental.py`, `src/distributed/nccl/` (the vendored weight-sync client), and

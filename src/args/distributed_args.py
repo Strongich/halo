@@ -69,6 +69,18 @@ class DistributedArguments:
         },
     )
 
+    allow_optimizer_warm_restart: bool = field(
+        default=False,
+        metadata={
+            "help": "Resume only. When restoring per-rank optimizer shards that match this run's "
+            "topology fails on any rank (an unreadable shard, a CUDA OOM while applying it), continue "
+            "with a freshly initialized optimizer (weights, step and LR schedule still resume) instead "
+            "of raising on every rank. Off by default: a warm restart resets the optimizer moments "
+            "mid-run. A changed parallelism layout and a checkpoint saved without optimizer state are "
+            "not failures; see agent-docs/reference/checkpoints.md for every resume outcome."
+        },
+    )
+
     merge_expert_lora_on_save: bool = field(
         default=False,
         metadata={
@@ -231,12 +243,13 @@ class DistributedArguments:
         default="auto",
         metadata={
             "help": "DeepEP transport backend for the EP all-to-all. 'auto' (default) == 'elastic': "
-            "ElasticBuffer over NCCL Gin — cross-node capable (AWS EFA) and forwards arbitrary sequence "
-            "length (gpt-oss-20b ep8 to 65536). The only guarded limit is DeepEP's 32-bit wire index "
-            "(~175k tokens/rank, far beyond any training sequence). 'legacy': the original deep_ep.Buffer "
-            "(CUDA IPC P2P over NVLink) — numerically identical, intranode / node-local only; pick it for "
-            "an IBGDA InfiniBand fabric or to A/B the transport. Legacy cross-node forces NVSHMEM IBGDA, "
-            "so it is rejected for a cross-node group on AWS EFA (no IBGDA). See agent-docs/infrastructure/deepep.md."
+            "ElasticBuffer over NCCL Gin, cross-node capable (AWS EFA). Its guarded limits are DeepEP's "
+            "32-bit wire index (~175k tokens/rank) and, for a cross-node group, the proxy-Gin ceiling "
+            "(HALO_DEEPEP_GIN_MAX_TOKENS_PER_RANK, default 8192 tokens/rank). 'legacy': the original "
+            "deep_ep.Buffer (CUDA IPC P2P over NVLink), numerically identical and intranode only: every "
+            "cross-node EP group is rejected. Pick it for long-context ep8 training, where elastic at "
+            ">=~64k tokens/rank deadlocks its combine against FSDP2, or to A/B the transport. See "
+            "agent-docs/infrastructure/deepep.md."
         },
     )
 
@@ -365,8 +378,10 @@ class DistributedArguments:
             "model on the next microstep — wasted collectives when nothing changed, and the "
             "dominant step cost whenever those collectives run over sockets. Leaves one re-gather per "
             "optimizer step instead of one per "
-            "microstep (so it does nothing at gradient_accumulation_steps=1), and costs one full "
-            "unsharded bf16 param copy per GPU for the whole run. Plain-DP/CP/EP torchrun path only; "
+            "microstep (so it does nothing at gradient_accumulation_steps=1). The unsharded params (at "
+            "the FSDP param dtype) are the ones ZeRO-2 already holds from forward to backward, kept "
+            "between microsteps and freed at the window's last backward, so peak memory is unchanged. "
+            "Plain-DP/CP/EP torchrun path only; "
             "rejected with fsdp_reshard_after_forward=True, TP, or PP."
         },
     )
@@ -390,12 +405,12 @@ class DistributedArguments:
             "help": "At ep_group_size==1 only (ep_size * expert_tp_size, i.e. the experts are truly "
             "replicated): FSDP-shard the MoE experts (reduce-scatter is their sole gradient sync; the "
             "EP layer skips its own hooks). True (default): frees memory that grows with DP "
-            "(gpt-oss-20b on 8 GPUs at batch 1: -59% peak memory for -10.5% throughput), "
-            "grad-equivalent. False: every DP rank keeps a full copy (max throughput, e.g. dense-ep1 "
-            "b1 SFT). No effect when "
+            "(gpt-oss-20b on 8 GPUs at batch 1: -59% peak memory at +1.8% throughput), "
+            "grad-equivalent. False: every DP rank keeps a full copy. No effect when "
             "ep_group_size>1 — that includes pure ETP (ep_size==1, expert_tp_size>1), where the "
-            "experts are sharded across the ETP group rather than replicated. RL-safe (the vLLM "
-            "weight-sync gather materializes the shards with full_tensor before reshaping) under both "
+            "experts are sharded across the ETP group rather than replicated. RL-safe (the engine "
+            "weight-sync gather, vLLM or SGLang, materializes the shards with full_tensor before "
+            "reshaping) under both "
             "ZeRO2 and ZeRO3."
         },
     )

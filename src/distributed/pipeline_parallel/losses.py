@@ -18,7 +18,7 @@ pair layout, the completion-only labels, the fixed-shape padding and the normali
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 import torch
@@ -27,19 +27,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from src.data.spans import LABEL_IGNORE_INDEX
+from src.kernels.logprobs import logit_chunk_rows, selective_logprobs
 from src.models.head_transform import HeadTransform
-
-# fp32 elements per CE chunk. The fp32 upcast of a [tokens, V] plane is the last stage's memory peak;
-# chunking under a non-reentrant checkpoint bounds the held fp32 state to one chunk. Budgeted in
-# elements rather than token rows because the plane is tokens×V, so a fixed row count would scale the
-# held state with the vocabulary. 128M elements = 512 MB fp32, i.e. 4096 rows at V=32k. The fused
-# path (:func:`fused_causal_lm_token_loss`) uses the same budget to bound its head projection.
-_CE_CHUNK_ELEMENTS = 128 * 1024 * 1024
-
-
-def _ce_chunk_rows(vocab_size: int) -> int:
-    """Token rows whose fp32 [rows, V] plane fits the chunk budget; at least one row."""
-    return max(1, _CE_CHUNK_ELEMENTS // max(vocab_size, 1))
 
 
 def _shift_labels_left(labels: torch.Tensor) -> torch.Tensor:
@@ -66,62 +55,32 @@ def _head_ce_sum_chunk(
     return _ce_sum_chunk(head_transform.project(head, chunk_hidden), chunk_labels)
 
 
-def _chunked_token_results(
-    fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    rows: torch.Tensor,
-    flat_labels: torch.Tensor,
-    chunk_rows: int,
-) -> Iterator[torch.Tensor]:
-    """``fn(rows[chunk], flat_labels[chunk])`` per token chunk, each under a non-reentrant checkpoint.
-
-    ``rows`` is the flattened logits plane (unfused) or the flattened hidden states (fused), sliced
-    in lockstep with its labels. Checkpointing bounds the held fp32 state to one chunk; a single
-    chunk needs none, so the short-sequence case keeps the plain call. Callers add their own
-    reduction over the results.
-    """
-    n_tokens = flat_labels.numel()
-    if n_tokens <= chunk_rows:
-        yield fn(rows, flat_labels)
-        return
-    for start in range(0, n_tokens, chunk_rows):
-        end = start + chunk_rows
-        yield checkpoint(fn, rows[start:end], flat_labels[start:end], use_reentrant=False)
-
-
 def _chunked_token_sum(
     fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     rows: torch.Tensor,
     flat_labels: torch.Tensor,
     chunk_rows: int,
 ) -> torch.Tensor:
-    """``sum(fn(rows[chunk], flat_labels[chunk]))`` over token chunks, accumulated in fp32."""
+    """``sum(fn(rows[chunk], flat_labels[chunk]))`` over token chunks, accumulated in fp32.
+
+    ``rows`` is the flattened logits plane (unfused) or the flattened hidden states (fused), sliced
+    in lockstep with its labels. Each chunk runs under a non-reentrant checkpoint, which bounds the
+    held fp32 state to one chunk; a single chunk needs none, so the short-sequence case keeps the
+    plain call.
+    """
     total = rows.new_zeros((), dtype=torch.float32)
-    for value in _chunked_token_results(fn, rows, flat_labels, chunk_rows):
-        total = total + value
+    n_tokens = flat_labels.numel()
+    if n_tokens <= chunk_rows:
+        return total + fn(rows, flat_labels)
+    for start in range(0, n_tokens, chunk_rows):
+        end = start + chunk_rows
+        total = total + checkpoint(fn, rows[start:end], flat_labels[start:end], use_reentrant=False)
     return total
 
 
 def _chunked_ce_sum(flat_logits: torch.Tensor, flat_labels: torch.Tensor) -> torch.Tensor:
     """Summed fp32 cross-entropy over an already-flattened ``[tokens, V]`` plane, chunked."""
-    return _chunked_token_sum(_ce_sum_chunk, flat_logits, flat_labels, _ce_chunk_rows(flat_logits.size(-1)))
-
-
-def _logprob_chunk(chunk_logits: torch.Tensor, chunk_labels: torch.Tensor) -> torch.Tensor:
-    """fp32 log-probs of ``chunk_labels`` under one ``[rows, V]`` chunk — a ``[rows]`` vector."""
-    logps = torch.log_softmax(chunk_logits.float(), dim=-1)
-    return logps.gather(-1, chunk_labels.unsqueeze(-1)).squeeze(-1)
-
-
-def _chunked_token_logprobs(flat_logits: torch.Tensor, flat_labels: torch.Tensor) -> torch.Tensor:
-    """Per-token fp32 log-probs over a flattened ``[tokens, V]`` plane, chunked like the CE path.
-
-    The vector counterpart of :func:`_chunked_token_sum`: each chunk yields a ``[rows]`` slice rather
-    than a scalar, so the results are concatenated instead of summed. Chunking keeps the two full
-    fp32 planes (the ``.float()`` upcast and the ``log_softmax`` output saved for backward) off the
-    stage carrying the head — ~26 GB per microbatch at ``V=201088``, ``S=8192``.
-    """
-    results = _chunked_token_results(_logprob_chunk, flat_logits, flat_labels, _ce_chunk_rows(flat_logits.size(-1)))
-    return torch.cat(list(results))
+    return _chunked_token_sum(_ce_sum_chunk, flat_logits, flat_labels, logit_chunk_rows(flat_logits.size(-1)))
 
 
 @dataclass(frozen=True)
@@ -259,7 +218,7 @@ def fused_causal_lm_token_loss(
         functools.partial(_head_ce_sum_chunk, head, head_transform),
         hidden_states.reshape(-1, hidden_states.size(-1)),
         _shift_labels_left(labels).reshape(-1),
-        _ce_chunk_rows(vocab_size),
+        logit_chunk_rows(vocab_size),
     )
 
 
@@ -323,14 +282,9 @@ def token_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Te
     pre-masked: ignored positions carry the (finite) log-prob of label 0, so callers that clamp or
     reweight per token do so before applying the mask, which is the order the trainer losses need.
     """
-    # Shift the labels, not the logits: slicing dim 1 leaves a non-contiguous view whose reshape
-    # would copy the whole bf16 plane, so the flatten below stays a view. The last shifted position
-    # is ignore-only, so dropping it recovers the [B, S-1] contract.
-    shifted = _shift_labels_left(labels)
-    mask = shifted != LABEL_IGNORE_INDEX
-    safe_labels = shifted.masked_fill(~mask, 0)
-    flat = _chunked_token_logprobs(logits.reshape(-1, logits.size(-1)), safe_labels.reshape(-1))
-    return flat.view(shifted.shape)[:, :-1], mask[:, :-1]
+    shift_labels = labels[:, 1:]
+    mask = shift_labels != LABEL_IGNORE_INDEX
+    return selective_logprobs(logits[:, :-1], shift_labels.masked_fill(~mask, 0)), mask
 
 
 def sequence_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

@@ -65,10 +65,13 @@ The DeepEP knobs — `EP_DISABLE_GIN`, `EP_SUPPRESS_NCCL_CHECK`, `CUDA_DEVICE_MA
 `HALO_DEEPEP_GPU_TIMEOUT_SECONDS`, `HALO_EP_SHARED_OVERLAP` and `HALO_EP_CAPACITY_DEDUP` — are catalogued
 with their defaults in [Environment variables](../reference/configuration-reference.md#environment-variables).
 
-`CUDA_DEVICE_MAX_CONNECTIONS=1` (the image `ENV`) serializes device work onto one hardware queue and is
-free: neutral on dense and `ep_size=2`, **+9.7%** on `ep_size=8` (8×B300, gpt-oss-20b, seq 4096, GC on).
-It is latched at `cuInit`, so a launch outside the image exports it before the process starts, and it
-does not make the racy single-domain multi-group shape safe ([below](#ep-grouping-what-is-reliable)).
+`CUDA_DEVICE_MAX_CONNECTIONS=1` (the image `ENV`) serializes device work onto one hardware queue. It is a
+correctness setting: without it, EP with more than one dispatch group per NVLink domain can deadlock the
+combine barrier against FSDP2's DP-wide collectives, and the trainer warns at startup when it is not `1`.
+It costs no throughput: against `8`, `ep_size=8` reads +1.5% (2026-10-05, commit 0e9a51172, median of
+2) and `ep_size=2` +0.2% (2026-10-03, commit 0bc3a22a5); 8× B300, gpt-oss-20b, seq 4096, batch 1, GC on,
+Blackwell image. It is latched at `cuInit`, so a launch outside the image exports it before the process
+starts, and it does not make the racy single-domain multi-group shape safe ([below](#ep-grouping-what-is-reliable)).
 
 **These must agree across every rank of the job**: `HALO_EP_CAPACITY_DEDUP`,
 `HALO_DEEPEP_GPU_TIMEOUT_SECONDS`, `HALO_DEEPEP_NUM_SMS`, `HALO_DEEPEP_NUM_QPS`,
@@ -210,7 +213,8 @@ interface (`_DeepEPBackend`), so it is transparent to the MoE layer and the auto
 | `legacy` | `deep_ep.Buffer` (V1) | CUDA IPC P2P over NVLink | fixed-size chunked pipeline sized by hidden, streams arbitrary length | **No** (rejected at config time) |
 
 The two are **numerically identical** (bit-identical loss + matching expert/router gradients on
-gpt-oss-20b ep2) and throughput-comparable (legacy ≈ 1.04× elastic step time at ep2/seq4096). `auto`
+gpt-oss-20b ep2); legacy takes ≈1.12× elastic's fwd+bwd time at ep2/seq4096 (2× B300,
+`bench_ep_buffer_backends.py` defaults; 2026-10-03, commit 0bc3a22a5, Blackwell image). `auto`
 resolves to `elastic`, which fits every topology; the backend is fixed for the run.
 
 Pick explicit **`legacy`** (intranode / node-local) for long-context ep8 training: elastic ep8 at extreme
@@ -225,6 +229,10 @@ long-context ep8 path.
 The dispatcher re-applies the same rules at backend selection for a hand-built `EPConfig`; the
 `gpus_per_node` bound is what refuses a node-local group spanning OS nodes (an NVL72 `ep8` over 4-GPU
 trays), since the V1 buffer is built with `num_rdma_bytes=0`.
+
+**Deterministic dispatch.** Under `full_determinism` the `elastic` buffer is built with
+`deterministic=True`; a cross-domain group (hybrid kernels, no deterministic mode) is refused.
+[Expert Parallelism → Determinism](../parallelism/expert-parallelism.md#determinism).
 
 ## SM control
 
@@ -385,8 +393,8 @@ alone predicts). Three consequences:
     an async `unspecified launch failure` in whatever kernel is on-stream).
 
     The dispatcher rejects an oversized cross-node dispatch at buffer sizing
-    (`HALO_DEEPEP_GIN_MAX_TOKENS_PER_RANK`, default 8192, `0` disables). Intra-node NVLink dispatch is
-    unaffected to 65k tokens/rank.
+    (`HALO_DEEPEP_GIN_MAX_TOKENS_PER_RANK`, default 8192, `0` disables). Intra-node NVLink dispatch has
+    no such cap; ep8 at ≥~64k tokens/rank needs `ep_buffer_backend: legacy` ([Transport backend](#transport-backend)).
 
 - **A lower-latency fabric removes the wall.** Mellanox IB with IBGDA, or rack-wide NVLink (GB200/GB300
   NVL72, where cross-node EP rides NVLink), collapse the dispatch latency that dominates here. The limit is

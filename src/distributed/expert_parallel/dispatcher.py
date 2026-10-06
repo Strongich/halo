@@ -345,13 +345,19 @@ class _ElasticArena(_SharedArena):
     a retirement earlier needs a point where no live handle can name it, and no rank-uniform such
     point exists here. Pre-size instead: pack the corpus, or keep the first forward's tokens/rank at
     the run's maximum (``max_length × per_device_train_batch_size``).
+
+    ``deterministic`` builds the buffer in DeepEP's deterministic mode: a prologue kernel assigns each
+    token's receive slot from prefix sums over source rank and token index instead of an atomic claim,
+    so an expert's tokens arrive in the same order on every step and its weight gradient sums them in
+    the same order.
     """
 
-    def __init__(self, group, key: tuple, padded_hidden: int, num_topk: int, num_qps: int):
+    def __init__(self, group, key: tuple, padded_hidden: int, num_topk: int, num_qps: int, deterministic: bool):
         super().__init__(group, key)
         self.padded_hidden = padded_hidden
         self.num_topk = num_topk
         self.num_qps = num_qps
+        self.deterministic = deterministic
         self.capacity = 0
         # A grow cannot free the old arena in place: under a pipeline schedule an earlier microbatch's
         # backward may still hold handles against it. Retired arenas are freed at teardown instead.
@@ -384,6 +390,7 @@ class _ElasticArena(_SharedArena):
             num_max_tokens_per_rank=needed,
             hidden=self.padded_hidden,
             num_topk=self.num_topk,
+            deterministic=self.deterministic,
             explicitly_destroy=True,
             # A pinned QP count must also be allocated: dispatch asserts `num_qps <= num_allocated_qps`
             # and DeepEP's automatic allocation is 17 (65/129 in hybrid mode). 0 keeps that sizing.
@@ -424,6 +431,30 @@ class _LegacyArena(_SharedArena):
         return True
 
 
+def _deterministic_dispatch() -> bool:
+    """Whether dispatches must place received tokens in a fixed order: torch's deterministic-algorithms
+    mode is on, which HF's ``Trainer.__init__`` turns on for ``full_determinism``."""
+    return torch.are_deterministic_algorithms_enabled()
+
+
+def _release_uninitialized_memory_fill() -> None:
+    """Switch off ``torch.utils.deterministic.fill_uninitialized_memory`` under deterministic mode.
+
+    DeepEP asserts at every dispatch and combine, on both buffers, that the two are not on together: the
+    fill launches on the compute stream and races DeepEP's communication-stream allocations. The flag
+    defaults to on, so ``full_determinism`` alone trips the assert. Switching it off lasts for the rest
+    of the process and covers every op; it only made reads of never-written memory reproducible.
+    """
+    if torch.are_deterministic_algorithms_enabled() and torch.utils.deterministic.fill_uninitialized_memory:
+        torch.utils.deterministic.fill_uninitialized_memory = False
+        if is_global_main_process():
+            logger.warning(
+                "Deterministic algorithms are on with an EP model: setting "
+                "torch.utils.deterministic.fill_uninitialized_memory=False for the rest of the process, "
+                "which DeepEP's dispatch and combine require under deterministic mode."
+            )
+
+
 class _DeepEPBackend(ABC):
     """A DeepEP transport backend held by a :class:`DeepEPDispatcher`.
 
@@ -452,8 +483,12 @@ class _DeepEPBackend(ABC):
         """Non-collective setup, safe to call during sequential model loading (env selection, etc.)."""
 
     @abstractmethod
-    def ensure(self, num_tokens: int, num_topk: int) -> None:
-        """Create (or grow) the buffer to serve ``num_tokens`` per rank. Collective over the EP group."""
+    def ensure(self, num_tokens: int, num_topk: int, *, deterministic: bool) -> None:
+        """Create (or grow) the buffer to serve ``num_tokens`` per rank. Collective over the EP group.
+
+        ``deterministic``: the run asked for deterministic algorithms, so received tokens must land in
+        the same order on every dispatch (:func:`_deterministic_dispatch`).
+        """
 
     @abstractmethod
     def dispatch_fwd(self, x, topk_idx, topk_weights):
@@ -532,7 +567,7 @@ class _ElasticBackend(_DeepEPBackend):
             backend = "NCCL Gin (RDMA)" if self._d.is_inter_node else "NVLink intranode (Gin disabled)"
             logger.info(f"DeepEP ElasticBuffer backend: {backend} (EP_DISABLE_GIN={os.environ['EP_DISABLE_GIN']})")
 
-    def ensure(self, num_tokens: int, num_topk: int) -> None:
+    def ensure(self, num_tokens: int, num_topk: int, *, deterministic: bool) -> None:
         d = self._d
         # Reuse the first layer's capacity; the generation is rank-uniform, so a miss hits every rank together.
         gid = id(d.ep_group)
@@ -562,16 +597,18 @@ class _ElasticBackend(_DeepEPBackend):
             needed, num_topk=num_topk, padded_hidden=self._padded_hidden, is_inter_node=d.is_inter_node
         )
 
-        if self.buffer is not None and needed <= self._capacity and num_topk == self._num_topk:
+        mode_changed = self._arena is not None and self._arena.deterministic != deterministic
+        if self.buffer is not None and needed <= self._capacity and num_topk == self._num_topk and not mode_changed:
             return
 
         self._configure_env()
-        # A changed top-k reshapes the wire, so this layer moves to the arena for the new shape.
-        if self._arena is not None and num_topk != self._num_topk:
+        # A changed top-k reshapes the wire and a changed mode (a forward ahead of Trainer.__init__)
+        # rebuilds the buffer, so this layer moves to the arena for the new kind.
+        if self._arena is not None and (num_topk != self._num_topk or mode_changed):
             self._arena.release(free_buffer=True)
             self._arena = None
         if self._arena is None:
-            self._arena = _ElasticArena.acquire(d.ep_group, self._padded_hidden, num_topk, _NUM_QPS)
+            self._arena = _ElasticArena.acquire(d.ep_group, self._padded_hidden, num_topk, _NUM_QPS, deterministic)
         built = self._arena.ensure(needed)
         self._num_topk = num_topk
         # get_theoretical_num_sms zero-divides on some cross-NVLink-domain Blackwell topologies; fall back.
@@ -593,9 +630,11 @@ class _ElasticBackend(_DeepEPBackend):
             tp_info = f", expert_tp={ep_tp}" if ep_tp > 1 else ""
             pad_info = f", hidden_padded={self._padded_hidden}" if self._needs_pad else ""
             scope = "shared by every MoE layer" if self._arena.is_shared() else "private to this layer"
+            det_info = ", deterministic dispatch" if deterministic else ""
             logger.info(
                 f"DeepEP ElasticBuffer ({mode}, {scope}): ep_size={d.ep_size}, hidden={d.hidden_dim}"
                 f"{pad_info}, num_max_tokens_per_rank={needed}, num_sms={self._resolved_num_sms}{tp_info}"
+                f"{det_info}"
             )
 
     # Hidden padding lives on the wire only: stripped before results re-enter autograd, so callers
@@ -688,7 +727,9 @@ class _LegacyBackend(_DeepEPBackend):
                 "applies to the default 'elastic' backend only."
             )
 
-    def ensure(self, num_tokens: int, num_topk: int) -> None:
+    def ensure(self, num_tokens: int, num_topk: int, *, deterministic: bool) -> None:
+        # ``deterministic`` needs nothing here: V1 places received tokens at offsets prefix-summed over
+        # source rank and channel, so the receive order is fixed by construction.
         if self.buffer is not None:
             return
         d = self._d
@@ -829,7 +870,8 @@ class DeepEPDispatcher:
 
     def _ensure_buffer(self, num_tokens: int, num_topk: int) -> None:
         """Build/grow the transport buffer to hold ``num_tokens`` per rank (collective)."""
-        self.backend.ensure(num_tokens, num_topk)
+        _release_uninitialized_memory_fill()
+        self.backend.ensure(num_tokens, num_topk, deterministic=_deterministic_dispatch())
         _LIVE_DISPATCHERS[id(self)] = self
         self._destroyed = False
 

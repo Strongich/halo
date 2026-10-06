@@ -58,19 +58,19 @@ FA2 + FA3.
 
 ## FA4 vs FA2 vs SDPA on Blackwell
 
-FA2 is an SM80-style kernel, untuned for Blackwell. FA4 is the Blackwell-native CuTe DSL kernel: **2.1–3.7× faster than FA2 on the isolated attention kernel** (microbench B2×S8192×H32×D128: fwd 2.71→0.70 ms, fwd+bwd 10.9→3.0 ms). Both match an fp32 SDPA reference to ~2e-3 (bf16 floor) across MHA/GQA and head_dim 64/128.
+FA2 is an SM80-style kernel, untuned for Blackwell. FA4 is the Blackwell-native CuTe DSL kernel: **3.6–3.9× faster than FA2 on the isolated attention kernel** (microbench B2×S8192×H32×D128: fwd 2.71→0.70 ms, 3.9×; fwd+bwd 10.9→3.0 ms, 3.6×). Both match an fp32 SDPA reference to ~2e-3 (bf16 floor) across MHA/GQA and head_dim 64/128.
 
-The end-to-end step win is a function of attention's share of the step, which grows with sequence length (attention is O(seq²), the rest ~O(seq)). Measured on Qwen3-4B, batch 1, GC on, single B300 (tok/s/GPU), each row one same-session A/B; compare within this table (the separate [Throughput Benchmarks](throughput-benchmarks.md) run reads 25,459 for the FA4 4k cell, where the step is overhead-bound):
+The end-to-end step win is a function of attention's share of the step, which grows with sequence length (attention is O(seq²), the rest ~O(seq)). Qwen3-4B-Instruct-2507, batch 1, GC on, Liger on, tok/s/GPU on one B300 (every cell on the same device), mean of two runs, measured 2026-10-03 at commit 0bc3a22a5 on the Blackwell image. Runs repeat within 1.1%, except flex at 4,096 (7.9%):
 
-| SeqLen | FA4 | FA2 | SDPA | FA4/FA2 |
-|--------|-----|-----|------|---------|
-| 4,096 | 21,918 | 19,320 | 25,656 | 1.13× |
-| 16,384 | 22,732 | 12,267 | 22,738 | 1.85× |
-| 32,768 | 17,141 | 7,484 | 16,771 | 2.29× |
+| SeqLen | FA4 | FA2 | SDPA | flex | FA4/FA2 |
+|--------|-----|-----|------|------|---------|
+| 4,096 | 23,614 | 19,920 | 25,733 | 20,147 | 1.19× |
+| 16,384 | 23,139 | 12,282 | 23,112 | 16,167 | 1.88× |
+| 32,768 | 17,504 | 7,497 | 17,047 | 10,607 | 2.33× |
 
-At 4k batch-1 the step is overhead-bound, so FA4 stays close to FA2 (1.13×); the gap opens past 8k and reaches 2.3× at 32k. SDPA tracks-or-slightly-leads FA4 (Blackwell-tuned cuDNN kernel) — it leads at 4k (overhead regime) and ties at 16k+ — so SDPA is a fine fallback for plain dense models; flex trails both.
+At 4k batch-1 the step is overhead-bound, so FA4 stays close to FA2 (1.19×); the gap opens with length and reaches 2.3× at 32k. SDPA (Blackwell-tuned cuDNN kernel) leads FA4 by 9% at 4k and is within 3% of it from 16k, so SDPA is a fine fallback for plain dense models. flex trails both at every length; it ties FA2 at 4k (within its own 7.9% run spread) and beats it from 16k.
 
-On sparse MoE the step is dominated by expert GEMM + DeepEP all-to-all, so the kernel speedup is only **+13%** end-to-end. gpt-oss-20b, EP=8, seq 16,384, GC on, 8× B300: FA4 9,749 vs FA2 8,632 tok/s/GPU (1.13×). FA4 is the shipped default for GptOss SFT; SDPA also dispatches once sinks are reset but lacks FA4's native sink/sliding-window/softcap handling.
+On sparse MoE the step is dominated by expert GEMM + DeepEP all-to-all, so the kernel speedup is only **+17%** end-to-end. gpt-oss-20b, EP=8, seq 16,384, batch 1, GC on, 8× B300 (2026-10-05, commit 0e9a51172, Blackwell image, median of 2): FA4 12,382 vs FA2 10,627 tok/s/GPU (1.17×); the FA4 arm is the s16384 row of the ep8 sequence sweep in [Throughput Benchmarks](throughput-benchmarks.md). FA4 is the shipped default for GptOss SFT; SDPA also dispatches once sinks are reset but lacks FA4's native sink/sliding-window/softcap handling.
 
 EP/long-context throughput tables live in [Throughput Benchmarks](throughput-benchmarks.md), which already run the FA4 default.
 
@@ -109,7 +109,7 @@ The `reset_sinks` decision is recorded on the config instance, so the nested EP/
 
 **Gemma4** (5 full-attention layers at `global_head_dim=512`): FA2/FA3/FA4/cuDNN-SDPA all reject head_dim>256 (FA2 cap 256, cuDNN cap 128 on cu13, FA4's SM100 kernel overflows tensor memory and asserts in `flash_fwd_sm100`); math SDPA materializes `[B, heads, S, S]` (64 GB/layer at 32k → OOM).
 
-The loader therefore redirects any FlashAttention impl — auto-detected or caller-supplied — to SDPA for any model whose widest head exceeds 256 (`head_dim_exceeds_flash`, off the per-layer `head_dim`), and on SDPA `patch_sdpa_for_wide_heads` forces mem-efficient SDPA (the only backend supporting head_dim=512) and sets `transformers.integrations.sdpa_attention.use_gqa_in_sdpa → False` for manual KV repeat. Gemma4 32k EP=8 then runs at peak ~155 GB/rank. On CUDA the model itself is built with `sdpa_flex_sliding`, which moves the sliding and short-context global layers off that kernel ([Gemma 4](../models/gemma4.md)).
+The loader therefore redirects any FlashAttention impl — auto-detected or caller-supplied — to SDPA for any model whose widest head exceeds 256 (`head_dim_exceeds_flash`, off the per-layer `head_dim`), and on SDPA `patch_sdpa_for_wide_heads` forces mem-efficient SDPA (the only backend supporting head_dim=512) and sets `transformers.integrations.sdpa_attention.use_gqa_in_sdpa → False` for manual KV repeat. On that path alone (`HALO_FLEX_SLIDING=0`), Gemma4 32k EP=8 peaks at ~155 GB/rank (measured at v1.0.0). On CUDA the model itself is built with `sdpa_flex_sliding`, which moves the sliding and short-context global layers off that kernel ([Gemma 4](../models/gemma4.md)).
 
 **Qwen3.5 / Qwen3.6 / Qwen3-Next and GLM-4 MoE Lite (GLM-4.7-Flash)**: auto-fall back from FA4 to **SDPA** (`model_fa4_backward_nan_prone`). The FA4 beta backward emits **NaN gradients** on these models — forward is finite, the first backward goes non-finite and collapses loss to 0 (NaN `grad_norm`).
 
@@ -123,19 +123,19 @@ A Bailing run therefore sets `attn_implementation: sdpa` itself; an unset or fla
 
 **Padded workloads**: the scripts that forward right-padded batches — DPO / SMPO / KTO, teacher distillation, reward modeling, classification, and all three GRPO scripts (offline, online, environmental) — default `attn_implementation` to **SDPA** when the YAML sets none (`padded_workload_attn_implementation` / `attn_default="sdpa"`, both overridable).
 
-Every one of them takes that default only under `reset_sinks: true`. With live gpt-oss sinks (`reset_sinks: false`) the default drops and the model config passes through untouched, since SDPA drops the sink column and would be rejected outright. SFT keeps the auto-selected FA4: a packed batch takes its varlen path, kept fast by the `max_seqlen` int-coercion.
+Every one of them takes that default only under `reset_sinks: true`, and offline GRPO and SMPO also skip it under CP, leaving an unset label to the loader's FlashAttention selection, which Ulysses requires. With live gpt-oss sinks (`reset_sinks: false`) the default drops and the model config passes through untouched, since SDPA drops the sink column and would be rejected outright. SFT keeps the auto-selected FA4: a packed batch takes its varlen path, kept fast by the `max_seqlen` int-coercion.
 
-That default costs throughput at the lengths these methods actually run. Measured on 8×B300 with `benchmark_smpo_ep.py`, which does *not* apply it (tokens/s/GPU, auto = FA4):
+That default costs throughput at the lengths these methods actually run. Measured on 8× B300 with `benchmark_smpo_ep.py`, which does *not* apply it (2026-10-04, training code at commit 0bc3a22a5; the gpt-oss-20b rows 2026-10-05 at commit 0e9a51172; Blackwell image; auto = FA4; mean of 2 runs). The SMPO collator emits no `input_ids`, so the callback's tokens/s is a padded-length estimate; the table gives the step-time speedup of auto over SDPA:
 
-| model | seq | auto | SDPA |
-|---|---|---|---|
-| gpt-oss-20b ep8 | 4096 | **7,602** | 5,595 |
-| gpt-oss-20b ep8 | 8192 | **14,842** | 11,132 |
-| qwen3-30b-a3b ep8 | 4096 | 3,204 | **3,579** |
-| qwen3-30b-a3b ep8 | 8192 | **8,024** | 7,145 |
-| qwen3-8b ep1 (dense) | 4096 | **7,406** | 5,817 |
+| model | seq | auto vs SDPA |
+|---|---|---|
+| gpt-oss-20b ep8 | 4096 | **1.36×** |
+| gpt-oss-20b ep8 | 8192 | **1.42×** |
+| qwen3-30b-a3b ep8 | 4096 | **1.17×** |
+| qwen3-30b-a3b ep8 | 8192 | **1.14×** |
+| qwen3-8b ep1 (dense) | 4096 | **1.26×** |
 
-FA4 wins everywhere except qwen3-30b at 4096, and the crossover is sequence length, not architecture — the dense no-sinks model prefers FA4 by 27%, and qwen3-30b switches sides between 4k and 8k. Set `attn_implementation: flash_attention_4` explicitly in a preference/reward config running ≥8k.
+FA4 wins every row, on MoE and dense alike. Set `attn_implementation: flash_attention_4` explicitly in a preference/reward config.
 
 **Context Parallelism**: an explicit `flex_attention` label auto-switches to `flash_attention_4` (Blackwell) / `flash_attention_2` (Hopper) since Ulysses can't dispatch flex — the label is cosmetic, though: see [Supported backends](#supported-backends) for what `get_flash_attn_func` actually runs. SDPA/eager unsupported.
 
@@ -208,7 +208,7 @@ Every row is what the loader picks on its own; the reason for each redirect is i
 | Hopper training | `flash_attention_3` (else FA2 when not installed) |
 | No flash-attn | FA2 is still requested and the model build raises — set `attn_implementation: sdpa` yourself (CP then unavailable) |
 | GptOss | FA4 on Blackwell, FA3 on Hopper |
-| Qwen3.5 / Qwen3.6 / GLM-4.7-Flash | → SDPA (FA4 backward NaN) |
+| Qwen3.5 / Qwen3.6 / Qwen3-Next / GLM-4.7-Flash | → SDPA on Blackwell (FA4 backward NaN) |
 | Gemma4 | → `sdpa_flex_sliding` on CUDA: FlexAttention on the sliding layers, matmul attention (mem-efficient SDPA past a score-memory budget) on the head_dim-512 global layers ([Gemma 4](../models/gemma4.md)) |
 | Bailing / Ling | no fallback: the flash label fails the model build — set `attn_implementation: sdpa` |
 | DeepSeek-V4 | → eager |

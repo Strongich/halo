@@ -2,7 +2,7 @@
 
 Poolside's `LagunaForCausalLM` (`poolside/Laguna-S-2.1`, `poolside/Laguna-XS-2.1`) — a MoE with a sigmoid top-k router, fused 3D expert storage, and one shared expert on every token. Both released sizes route to 256 experts: **S** is 48 layers / hidden 3072 / top-10 at 1M positions, **XS** is 40 layers / hidden 2048 / top-8 at 256K.
 
-Transformers ships `transformers.models.laguna` natively, and the released checkpoints still load through `auto_map`, so both implementations are reachable: the shipped configs set `trust_remote_code: true` with a pinned `model_revision` (the revisions the EP path was validated against), while a checkpoint converted to library format loads the in-library classes. The EP wrapper claims both by class name and by `model_type`.
+Transformers ships `transformers.models.laguna` natively, and the released checkpoints also load through `auto_map`, so both implementations are reachable: the shipped configs set `trust_remote_code: true` with a pinned `model_revision` (the revisions the EP path was validated against), while a checkpoint converted to library format loads the in-library classes. The EP wrapper claims both by class name and by `model_type`.
 
 | | EP | CP | TP | ETP | PP | EP+CP | EP+TP | LoRA |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
@@ -60,7 +60,7 @@ Both are registry-gated, and Laguna is in neither registry:
 - **CP** needs a Ulysses attention wrapper. `LagunaAttention` is absent from `CP_SUPPORTED_ATTENTION_CLASSES` — the registered wrappers in `src/distributed/context_parallel/layers/` — so CP, and therefore EP+CP, is rejected.
 - **TP** on a MoE model takes the selective attention-only path (HF's `tp_plan="auto"` mis-shards expert weights), gated on `TP_SHARDABLE_ATTENTION_CLASSES` (`src/distributed/tensor_parallel/module_types.py`). `LagunaAttention` is not listed, so there is nothing for the DTensor path to shard.
 
-ETP is mechanically reachable (the experts use the shared fused-GLU storage, so `_init_fused_glu_params` handles `expert_tp_size > 1`) but has not been validated on Laguna.
+ETP is mechanically reachable (the experts use the shared fused-GLU storage, so `_init_fused_glu_params` handles `expert_tp_size > 1`); its only GPU coverage is the tiny-model LoRA row in footnote ².
 
 ## Configs
 

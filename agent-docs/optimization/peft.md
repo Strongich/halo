@@ -255,41 +255,41 @@ before the checkpoint downloads.
 
 ## Measured cost
 
+Both tables measured 2026-10-03 at commit 0bc3a22a5 on the Blackwell image.
+
 Dense — 1× B300 (SM103), `DistributedSFTTrainer`, AdamWBF16, Liger, FA4, Qwen3-8B, seq 16384, BS=1, GC,
 10 steps / 3 warmup (full fine-tuning at this shape: [Liger → Benchmarks](liger-kernels.md#benchmarks)):
 
 | Config | Trainable | tokens/s/GPU | Peak memory |
 |---|---|---|---|
-| LoRA r=64, attn only | 61M (0.7%) | 16,824 | 34.6 GB |
-| LoRA r=64, all linear | 175M (2.1%) | 11,717 | 35.9 GB |
-| QLoRA r=64, all linear (NF4 base) | 175M (3.6%) | 15,802 | 25.3 GB |
+| LoRA r=64, attn only | 61M (0.7%) | 18,897 | 34.3 GiB |
+| LoRA r=64, all linear | 175M (2.1%) | 16,203 | 35.0 GiB |
+| QLoRA r=64, all linear (NF4 base) | 175M (2.1%) | 15,410 | 25.3 GiB |
 
-Attention-only matches full-FT throughput at about half its memory; all-linear is ~29% slower, since
-adapter matmuls run on every MLP layer. Throughput is **rank-invariant** within a variant (attn-only
-~16.8k, all-linear ~11.9k across r=16/64/128): the frozen base forward/backward dominates the step, and
-only memory grows with rank.
+Attention-only runs 18% faster than full fine-tuning (15,966) at about half its memory; all-linear is ~14%
+slower than attention-only, since adapter matmuls run on every MLP layer. Throughput is **rank-invariant**
+within a variant (attn-only ~18.8k, all-linear ~16.0k across r=16/64/128): the frozen base forward/backward
+dominates the step, and only memory grows with rank.
 
-QLoRA saves ~10 GB more than bf16 all-linear LoRA and is ~35% faster, because the 4-bit base cuts weight
-bandwidth on the bandwidth-bound MLP matmuls. It is the path onto consumer GPUs, since plain LoRA needs
-~34 GB even at the minimum rank.
+QLoRA saves ~10 GiB more than bf16 all-linear LoRA at ~5% lower throughput. It is the path onto consumer
+GPUs, since plain LoRA needs ~34 GiB even at the minimum rank.
 
 MoE — same setup on 8× B300, `gpt-oss-20b` (32 experts, top_k=4) at EP=2, seq 4096, r=64 (full
 fine-tuning at this shape: [Throughput Benchmarks → EP-only](throughput-benchmarks.md#ep-only-batch-scaling)):
 
 | Config | Trainable | tokens/s/GPU | Peak memory |
 |---|---|---|---|
-| LoRA r=64, attn only (PEFT) | 32M (0.28%) | 9,632 | 28.4 GB |
-| LoRA r=64, experts only (grouped) | 425M (3.60%) | 9,919 | 32.0 GB |
-| LoRA r=64, attn + experts | 457M (3.86%) | 7,586 | 32.0 GB |
+| LoRA r=64, attn only (PEFT) | 32M (0.28%) | 16,166 | 29.6 GiB |
+| LoRA r=64, experts only (grouped) | 425M (3.60%) | 17,002 | 31.9 GiB |
+| LoRA r=64, attn + experts | 457M (3.86%) | 14,316 | 32.0 GiB |
 
 **LoRA under EP is far leaner than full fine-tuning.** The frozen base carries no gradients or optimizer
-state, so every variant peaks at 28–32 GB against full fine-tuning's 77.3 GB at this shape (batch 1);
-full fine-tuning's throughput comes from a different run set, so compare it only within that page.
-Experts-only ties attention-only because the grouped expert adapters fold into the grouped-GEMM compute;
-attn + experts is slower than either alone.
+state, so every variant peaks at 30–32 GiB against full fine-tuning's 78.9 GiB at this shape (batch 1), and
+every variant runs faster than its 12,432 tok/s/GPU. Experts-only is 5% faster than attention-only, since
+the grouped expert adapters fold into the grouped-GEMM compute; attn + experts is slower than either alone.
 
-On `qwen3-30b-a3b` (128 experts) experts-only r=64 is 9.39% trainable at 5,034 tok/s/GPU and 46.8 GB. At
-batch 1 the step is communication-bound, so tok/s/GPU varies ±10% run-to-run.
+On `qwen3-30b-a3b` (128 experts) at EP=2, experts-only r=64 is 9.39% trainable at 9,894 tok/s/GPU and
+46.7 GiB. At batch 1 the step is communication-bound, so tok/s/GPU varies ±10% run-to-run.
 
 ## Reference model handling
 
@@ -395,8 +395,8 @@ base, set `optim: adamw_8bit`.
 ### FusedLinearCrossEntropy for long sequences
 
 [Liger FLCE](liger-kernels.md) fuses `lm_head` with the loss instead of materializing the
-`batch × seq × vocab` logits. Qwen3-8B QLoRA r=32 all-linear at 32k (BS=1, GC, Liger, FA4) needs **43.5 GB
-with plain CE and 20.9 GB with FLCE**, so it fits a 24 GB consumer GPU only with FLCE. FLCE is SFT-only and
+`batch × seq × vocab` logits. Qwen3-8B QLoRA r=32 all-linear at 32k (BS=1, GC, Liger, FA4) needs **43.5 GiB
+with plain CE and 20.9 GiB with FLCE**, so it fits a 24 GB consumer GPU only with FLCE. FLCE is SFT-only and
 disables entropy logging.
 
 ## Checkpoint saving

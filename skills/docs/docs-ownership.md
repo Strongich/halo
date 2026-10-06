@@ -21,6 +21,7 @@ changes.
 | `src/trainers/sft.py` | `agent-docs/training-methods/sft.md`, `agent-docs/training-methods/pretraining.md` |
 | `src/trainers/preference/` (DPO, SMPO, KTO) | `agent-docs/training-methods/preference/dpo.md`, `agent-docs/training-methods/preference/smpo.md`, `agent-docs/training-methods/preference/kto.md` |
 | `src/trainers/grpo/` (online, offline, environmental) | `agent-docs/training-methods/grpo/{README,online-grpo,offline-grpo}.md`, `agent-docs/training-methods/grpo/async-grpo/*.md` |
+| `src/trainers/grpo/reference_lifecycle.py`, `reference_cache.py`, `reference_logps.py` (offline GRPO's run-start reference scores, their bounded cache and the `reference_logps.pt` sidecar) | `agent-docs/training-methods/grpo/offline-grpo.md` (Reference model), `agent-docs/reference/checkpoints.md` |
 | `src/rewards/` (reward terms, judge, served reward model, composer, TRL adapters, RLVR graders, answer matching) | `agent-docs/training-methods/grpo/rewards.md`, `agent-docs/training-methods/grpo/online-grpo.md`, `agent-docs/training-methods/grpo/environments/README.md`, `agent-docs/reference/configuration-reference.md` |
 | `src/trainers/reward/` | `agent-docs/training-methods/preference/reward-modeling.md`, `agent-docs/training-methods/classification.md` |
 | `src/trainers/distillation/` | `agent-docs/training-methods/distillation/{README,teacher-distillation,self-distillation,online-sdpg}.md` |
@@ -120,6 +121,7 @@ changes.
 | `src/kernels/grouped_gemm.py` (precision dispatch), `src/kernels/grouped_mm_autograd.py` (bf16 primitive) | `agent-docs/optimization/grouped-gemm.md` |
 | `src/kernels/fused_glu.py` (fused GLU kernels, activation probes, the `HALO_FUSED_GLU` switch) | `agent-docs/models/glm4.md` (gate), `agent-docs/models/gpt-oss.md` (clamped variant), `agent-docs/optimization/liger-kernels.md` (Fused GLU under an EP wrapper), `agent-docs/reference/configuration-reference.md` (`HALO_FUSED_GLU`), `agent-docs/reference/troubleshooting.md` (Turning off a fused kernel), `agent-docs/optimization/grouped-gemm.md` (packed GLU), `agent-docs/optimization/torch-compile.md`, `agent-docs/parallelism/expert-parallelism.md` (the EP warm-up) |
 | `src/kernels/moe_permute.py` (atomic-free token permute: `build_inv_map`, `MoEGatherPermute`, the fused weighted un-permute) | `agent-docs/optimization/grouped-gemm.md` |
+| `src/kernels/logprobs.py` (chunked fp32 log-probs: `selective_logprobs` and the logit chunk budget, shared by the PP last-stage losses and the DPO/KTO loss paths) | `agent-docs/training-methods/preference/dpo.md` (Log-prob precision), `agent-docs/parallelism/pipeline-parallelism.md` |
 | attention selection (`src/models/patches/attention.py`, `_detect_attention_impl`) | `agent-docs/optimization/flash-attention.md` |
 | `src/models/patches/flex_sliding_attention.py` (FlexAttention on SDPA sliding-window and wide-head layers) | `agent-docs/optimization/flash-attention.md`, `agent-docs/models/gemma4.md` |
 | GptOss sink policy (`src/models/patches/gpt_oss_sinks.py`) | `agent-docs/models/gpt-oss.md` (Attention sinks), the `reset_sinks`/`train_sinks` rows of `agent-docs/reference/configuration-reference.md` |

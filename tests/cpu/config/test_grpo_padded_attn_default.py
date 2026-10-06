@@ -17,6 +17,7 @@ Run: python tests/cpu/config/test_grpo_padded_attn_default.py  (or pytest)
 """
 
 import ast
+import contextlib
 import sys
 import types
 from pathlib import Path
@@ -46,7 +47,7 @@ def _load_script_module(rel_path: str):
     return load_script_module(f"scripts/training/{rel_path}", name)
 
 
-def _requested_attn(rel_path: str, yaml_body: str, tmp_path: Path) -> str | None:
+def _requested_attn(rel_path: str, yaml_body: str, tmp_path: Path, parallelism_config=None) -> str | None:
     """The attention implementation the script's model load would actually resolve under.
 
     ``load_script_model`` falls back to ``model_config.attn_implementation`` when the script passes
@@ -64,17 +65,31 @@ def _requested_attn(rel_path: str, yaml_body: str, tmp_path: Path) -> str | None
         captured["requested"] = kwargs.get("attn_implementation") or model_config.attn_implementation
         raise _StopAtModelLoad
 
+    def fake_load_model_for_training(model_config, training_config, parallelism_config, **kwargs):
+        captured["requested"] = model_config.attn_implementation or kwargs.get("attn_default")
+        raise _StopAtModelLoad
+
     runtime = types.SimpleNamespace(
-        parallelism_config=ParallelismConfig(), model_source="dummy/model", mode_suffix="", local_rank=0
+        parallelism_config=parallelism_config or ParallelismConfig(),
+        model_source="dummy/model",
+        policy_from_checkpoint=False,
+        mode_suffix="",
+        local_rank=0,
     )
-    with (
-        mock.patch.object(module, "init_training_script", return_value=runtime),
-        mock.patch.object(module, "load_script_model", fake_load_script_model),
+    loaders = {"load_script_model": fake_load_script_model, "load_model_for_training": fake_load_model_for_training}
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(module, "init_training_script", return_value=runtime))
+        for name, fake in loaders.items():
+            if hasattr(module, name):
+                stack.enter_context(mock.patch.object(module, name, fake))
+        # SMPO reads its data before the model load to decide the run's modality: a text run here.
+        if hasattr(module, "resolve_vlm_run"):
+            stack.enter_context(mock.patch.object(module, "load_script_datasets", return_value=(None, False)))
+            stack.enter_context(mock.patch.object(module, "resolve_vlm_run", return_value=False))
         # The log tee redirects the process's stdout/stderr fds — keep it out of the test process.
-        mock.patch("src.training.parser.install_log_tee"),
-        mock.patch.object(sys, "argv", ["prog", str(config)]),
-        pytest.raises(_StopAtModelLoad),
-    ):
+        stack.enter_context(mock.patch("src.training.parser.install_log_tee"))
+        stack.enter_context(mock.patch.object(sys, "argv", ["prog", str(config)]))
+        stack.enter_context(pytest.raises(_StopAtModelLoad))
         module.main()
     return captured["requested"]
 
@@ -98,23 +113,54 @@ def test_live_sinks_drop_the_padded_default(script, tmp_path):
     assert _requested_attn(script, "reset_sinks: false\n", tmp_path) is None
 
 
+# A CP shape ParallelismConfig would refuse on a GPU-less host (CP must fit an NVLink domain); the
+# script reads only this verdict before its model load.
+_CP_PARALLELISM = types.SimpleNamespace(is_cp_mode=True)
+
+
+# The CP-capable scripts that request the padded default.
+_CP_SCRIPTS = ["offline_grpo.py", "preference/smpo.py"]
+
+
+@pytest.mark.parametrize("script", _CP_SCRIPTS)
+@pytest.mark.parametrize(
+    ("yaml_body", "expected"),
+    [("", None), ("attn_implementation: flash_attention_2\n", "flash_attention_2")],
+    ids=["unpinned", "pinned"],
+)
+def test_cp_scripts_leave_the_kernel_to_the_loader(script, yaml_body, expected, tmp_path):
+    """Ulysses calls FlashAttention itself, and the CP validator refuses an SDPA label for most
+    families, so the padded default must not reach a CP run's load."""
+    assert _requested_attn(script, yaml_body, tmp_path, _CP_PARALLELISM) == expected
+
+
+def test_smpo_off_cp_keeps_the_padded_default(tmp_path):
+    assert _requested_attn("preference/smpo.py", "", tmp_path) == "sdpa"
+
+
 # --- the consolidated seam -------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("pinned", "sinks_reset", "expected"),
+    ("pinned", "sinks_reset", "context_parallel", "expected"),
     [
-        (None, True, "sdpa"),
-        (None, False, None),
-        ("flash_attention_4", True, "flash_attention_4"),
-        ("flash_attention_4", False, "flash_attention_4"),
+        (None, True, False, "sdpa"),
+        (None, False, False, None),
+        (None, True, True, None),
+        (None, False, True, None),
+        ("flash_attention_4", True, False, "flash_attention_4"),
+        ("flash_attention_4", False, False, "flash_attention_4"),
+        ("eager", True, True, "eager"),
     ],
 )
-def test_the_seam_owns_the_sinks_exemption(pinned, sinks_reset, expected):
+def test_the_seam_owns_the_padded_default_exemptions(pinned, sinks_reset, context_parallel, expected):
     """The whole decision in one place: pin wins; unpinned takes the padded default only while the
-    sinks are being reset."""
+    sinks are being reset and the run is not context-parallel."""
     model_config = types.SimpleNamespace(attn_implementation=pinned)
-    assert padded_workload_attn_implementation(model_config, sinks_reset=sinks_reset) == expected
+    assert (
+        padded_workload_attn_implementation(model_config, sinks_reset=sinks_reset, context_parallel=context_parallel)
+        == expected
+    )
 
 
 def _helper_calls(path: Path) -> list[ast.Call]:

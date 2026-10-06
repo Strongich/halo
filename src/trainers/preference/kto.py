@@ -49,6 +49,7 @@ from src.trainers.mixins.pp_gates import (
     require_precomputed_reference,
 )
 from src.trainers.mixins.validation import ctor_config, ctor_positions, ctor_value, disable_trl_liger
+from src.trainers.preference.logprobs import FP32LogprobsMixin
 from src.trainers.preference.precompute import PrecomputeRefLogpsRankConsistentMixin
 
 # TRL KTOTrainer positional slots, for ctor params arriving via *args — derived from the installed signature
@@ -58,8 +59,13 @@ _CTOR_POSITIONS = ctor_positions(KTOTrainer, "model", "args", "ref_model")
 _REF_LOGPS_COLUMN = "ref_logps"
 
 
-class DistributedKTOTrainer(PrecomputeRefLogpsRankConsistentMixin, DistributedTrainerMixin, KTOTrainer):
+class DistributedKTOTrainer(
+    FP32LogprobsMixin, PrecomputeRefLogpsRankConsistentMixin, DistributedTrainerMixin, KTOTrainer
+):
     """TRL's KTOTrainer plus EP/TP/PP via DistributedTrainerMixin. CP unsupported (see module docstring).
+
+    ``FP32LogprobsMixin`` keeps TRL's loss (policy, reference and KL terms) and reference pass on fp32
+    sequence log-probs.
 
     ``PrecomputeRefLogpsRankConsistentMixin`` runs ``precompute_ref_log_probs`` (the EP/TP
     full-finetune reference path) on the DP axis, attaches its columns in memory on every rank and
@@ -69,6 +75,7 @@ class DistributedKTOTrainer(PrecomputeRefLogpsRankConsistentMixin, DistributedTr
     """
 
     _tag_names = ["trl", "kto"]
+    _reference_token_settings = "per_device_train_batch_size or dataset_num_proc, which pair the KL completions"
 
     _supports_pp = True
     # TRL's KTO loss adds the aux term itself and this class does not override it, so aux_loss

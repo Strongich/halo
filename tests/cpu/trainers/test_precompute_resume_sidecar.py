@@ -166,7 +166,7 @@ def test_pre_extraction_reference_schema_resumes_without_rewriting_its_identity(
             "ref_KL_logps": torch.tensor([-109.0, -109.0, -111.0, -111.0]),
         }
     )
-    settings = {"max_length": MAX_LENGTH}
+    settings = {"max_length": MAX_LENGTH, "logprob_precision": "float32"}
     if kind == "dpo":
         settings.update(truncation_mode="keep_start", ld_alpha=None)
     legacy = {
@@ -299,6 +299,8 @@ def test_every_column_the_reference_reads_is_in_the_digest(tmp_path, kind, bumpe
         # TRL pairs the KL completions within map batches of the per-device size, across num_proc shards.
         assert "per_device_train_batch_size" in str(raised.value)
         assert "dataset_num_proc" in str(raised.value)
+    if kind == "dpo":
+        assert "dataset_num_proc" not in str(raised.value), "DPO's causes must not name KTO's KL pairing"
 
 
 @pytest.mark.parametrize(
@@ -340,6 +342,57 @@ def test_a_reference_mismatch_names_the_data_and_settings_to_resume_with(kind, t
     message = str(raised.value)
     assert "Resume with the data and reference settings the checkpoint was written with" in message
     assert "row's reference" in message
+    assert "--max_steps=1" in message, "the refusal must also name how to regenerate the file"
+    assert trainer.compute_ref_log_probs.batches == 0
+
+
+def test_a_split_saved_at_the_runs_precision_is_restored(kind, tmp_path):
+    """Every saved split records the precision its log-probs were summed in, and a resume summing at
+    that precision attaches it."""
+    _save_base_run(kind, tmp_path, {"train": token_rows(kind)})
+    saved = torch.load(tmp_path / REFERENCE_LOGPS_FILE, weights_only=True)["train"]
+    assert saved["settings"]["logprob_precision"] == TRAINERS[kind][0].logprob_precision
+
+    resumed = _resumed(kind, tmp_path)
+    resumed._precompute_ref_logps(token_rows(kind), "train", SWEEP_BATCH_SIZE)
+
+    assert resumed.compute_ref_log_probs.batches == 0
+
+
+@pytest.mark.parametrize("saved_precision", [None, "bfloat16"], ids=["unrecorded", "bfloat16"])
+def test_a_split_summed_at_another_precision_is_not_reused(kind, tmp_path, saved_precision):
+    """A split whose settings record another log-prob precision, or none, carries that precision's
+    rounding: a resume whose sweep would score the trained weights refuses it and names how to
+    regenerate the file, and any other resume re-sweeps."""
+    _save_base_run(kind, tmp_path, {"train": token_rows(kind)})
+    saved = torch.load(tmp_path / REFERENCE_LOGPS_FILE, weights_only=True)
+    settings = saved["train"]["settings"]
+    if saved_precision is None:
+        settings.pop("logprob_precision", None)
+    else:
+        settings["logprob_precision"] = saved_precision
+    torch.save(saved, tmp_path / REFERENCE_LOGPS_FILE)
+    precision = TRAINERS[kind][0].logprob_precision
+
+    resumed = _resumed(kind, tmp_path)
+    with pytest.raises(ValueError, match=f"^Regenerate .* summed at .* this run sums them in {precision}") as raised:
+        resumed._precompute_ref_logps(token_rows(kind), "train", SWEEP_BATCH_SIZE)
+    assert "--max_steps=1" in str(raised.value), "the refusal must name how to regenerate the file"
+    assert "settings the checkpoint was written with" not in str(raised.value), "no setting selects the precision"
+    assert resumed.compute_ref_log_probs.batches == 0
+    from_base = precompute_trainer(kind, resume_checkpoint=str(tmp_path), policy_from_checkpoint=False)
+    from_base._precompute_ref_logps(token_rows(kind), "train", SWEEP_BATCH_SIZE)
+    assert from_base.compute_ref_log_probs.batches > 0, "the old-precision split was reused, not re-swept"
+
+
+def test_a_trainer_without_a_declared_precision_refuses_before_sweeping(kind):
+    """The precision is every saved split's identity; a trainer that does not declare it would save
+    splits a resume could not tell apart from another precision's."""
+    trainer = precompute_trainer(kind)
+    trainer.logprob_precision = None
+
+    with pytest.raises(NotImplementedError, match="logprob_precision"):
+        trainer._precompute_ref_logps(token_rows(kind), "train", SWEEP_BATCH_SIZE)
     assert trainer.compute_ref_log_probs.batches == 0
 
 

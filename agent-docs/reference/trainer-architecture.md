@@ -40,7 +40,11 @@ hands to `_apply_ep_aware_dp_fsdp2`.
 
 `ReferenceLogpsCheckpointMixin` is mixed in by DPO/KTO precompute and offline GRPO. It owns
 reference identity checks, resume attachment and atomic sidecar persistence; each trainer owns its
-score payload and sweep ([Checkpoints](checkpoints.md#what-gets-saved)).
+score payload and sweep ([Checkpoints](checkpoints.md#what-gets-saved)). The preference mixin also
+records the log-prob precision each split was summed in
+([DPO](../training-methods/preference/dpo.md#resuming-a-precompute-run)), and precedes
+`DistributedTrainerMixin` in the trainer's bases so the checkpointing default cannot shadow its
+sidecar hook.
 Offline GRPO's `reference_cache.py` streams current-batch scores to filesystem-aware writers and
 maps the ordered ragged token values; its reference mixin attaches those buffers without repacking
 them ([Reference model](../training-methods/grpo/offline-grpo.md#reference-model)).
@@ -399,8 +403,9 @@ but under CP they cover only the local chunk.
   [Async GRPO](../training-methods/grpo/async-grpo/README.md).
 
 The `src/trainers/grpo/` package keeps the three trainers (`environmental.py`, `online.py`,
-`offline.py`) and two shared leaves (`early_stop.py`; `world_metrics.py`, the step metrics folded
-from every rank's counts in one collective) at the top level, with support code in `objective/`
+`offline.py`), two shared leaves (`early_stop.py`; `world_metrics.py`, the step metrics folded
+from every rank's counts in one collective) and offline GRPO's reference modules
+(`reference_cache.py`, `reference_logps.py`, `reference_lifecycle.py`) at the top level, with support code in `objective/`
 (pure loss-side functions), `mixins/`, and `rollout/`. `environmental.py` keeps the objective
 itself: batch assembly, advantages, the IS trust region and the rank-uniform fences.
 

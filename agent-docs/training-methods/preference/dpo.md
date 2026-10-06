@@ -31,6 +31,20 @@ output_dir: checkpoints/dpo-qwen3.5-9b
 
 No training-side prompt cap exists, so an over-long prompt eats its own completion: filter those rows in the dataset ([sequence length](../../reference/configuration-reference.md#sequence-length-caps-vs-generation-budgets)).
 
+## Log-prob precision
+
+The trainer sums sequence log-probs in fp32. TRL's own `selective_log_softmax` keeps the per-token log-probs of bf16 logits in bf16, and sums them in bf16. At `|logp|` in [8192, 16384) that grid is 64 nats, so a long completion's margin carries tens of nats of rounding.
+
+`FP32LogprobsMixin` (`src/trainers/preference/logprobs.py`) swaps that function out while TRL's loss and reference pass run. The replacement is a chunked fp32 log-softmax (`src/kernels/logprobs.py`) that never builds a full fp32 `[B, T, V]` plane. TRL sums its output in fp32, so these are fp32:
+
+- every loss term built on the sequence log-probs, and the `ld_alpha` split;
+- the log-prob term of the WPO weights;
+- the `logps/*` and `rewards/*` metrics.
+
+Terms TRL takes from the logits directly keep TRL's precision: the `sft` loss type's cross-entropy, WPO's normalizer, and the `entropy`, `logits/*` and `mean_token_accuracy` metrics. Reference columns the dataset supplies keep the precision they were computed in.
+
+Nearly every run takes the fp32 path. TRL's fused Liger DPO loss runs only when Liger's fused linear cross-entropy was applied at load (the [per-model default](../../optimization/liger-kernels.md#configuration) for Zaya, DeepSeek-V4 and GLM-4.7-Flash, or `fused_linear_cross_entropy: true`), on an unsharded policy against a frozen reference copy. FSDP2, EP and TP switch it off, and TRL refuses it alongside precompute or PEFT.
+
 ## Reference model
 
 Three shapes, decided by `load_reference_model_for_preference` (`src/distributed/loading/frozen_models.py`):
@@ -45,9 +59,10 @@ A policy carrying live attention sinks (`reset_sinks: false`) is refused wheneve
 
 ### Resuming a precompute run
 
-The sweep runs inside the trainer's `__init__`, over the policy when no separate reference exists, and every rank attaches the gathered columns in memory, so per-node storage needs no shared cache file. A [Path-B resume](../../reference/checkpoints.md#resuming-training) builds the policy from the checkpoint before that, so a sweep there would score the trained weights and zero every log-ratio. Every checkpoint of a sweeping run therefore carries the columns in `reference_logps.pt`: one entry per split (`train`, then each eval dataset by name) with its row count, a digest of each token-id column the reference read, and the settings that shape the values (`max_length`, plus `truncation_mode` and `ld_alpha` for DPO). The script hands the trainer the resume checkpoint, and the shared lifecycle attaches the saved columns instead of sweeping (`src/trainers/mixins/reference_logps.py`).
+The sweep runs inside the trainer's `__init__`, over the policy when no separate reference exists, and every rank attaches the gathered columns in memory, so per-node storage needs no shared cache file. A [Path-B resume](../../reference/checkpoints.md#resuming-training) builds the policy from the checkpoint before that, so a sweep there would score the trained weights and zero every log-ratio. Every checkpoint of a sweeping run therefore carries the columns in `reference_logps.pt`: one entry per split (`train`, then each eval dataset by name) with its row count, a digest of each token-id column the reference read, and the settings that shape the values (`max_length` and the [log-prob precision](#log-prob-precision), plus `truncation_mode` and `ld_alpha` for DPO). The script hands the trainer the resume checkpoint, and the shared lifecycle attaches the saved columns instead of sweeping (`src/trainers/mixins/reference_logps.py`).
 
 - When the policy was built from the checkpoint's weights and no separate reference exists, a split with no saved entry raises, and so does one whose row count, token ids, settings or columns (a KL column the run's KTO loss needs) differ from the run's. Any other resume (an adapter or merge-on-save checkpoint builds the policy from the base; a frozen reference copy) sweeps untrained weights for such a split and proceeds.
+- A split whose settings record another log-prob precision, or none, is such a mismatch: its values carry that precision's rounding. The refusal names the one-step regeneration below.
 - Splits the resumed run does not precompute (an eval dataset switched off) ride unchanged into its checkpoints, for a later resume that uses them again.
 - To give a checkpoint without the file one, run the same config for one step from the base into a scratch directory outside the run's `output_dir`, whose rotation could otherwise delete the checkpoint (`--output_dir=<scratch> --max_steps=1 --save_strategy=steps --save_steps=1 --save_only_model=true --resume_from_checkpoint=null`; the refusal names a scratch path), and copy its `checkpoint-1/reference_logps.pt` into the checkpoint, on every node when checkpoints are node-local; the resume validates it like its own. A checkpoint whose save stopped before the file can take the previous checkpoint's copy, which holds the same values.
 - Columns the dataset already carries are read from it and not persisted.
@@ -102,6 +117,7 @@ Covering tests:
 Failure signatures:
 
 - A reference-model raise on a live-sinks policy — `use_peft: true`, or precompute under EP/TP/PP. `beta: 0` does not help: it changes the loss, not whether a reference loads.
-- "Cannot hold a separate dense reference" under EP/TP/PP — set `precompute_ref_log_probs: true` or `--use_peft`.
+- "cannot hold a separate dense reference model" under EP/TP/PP — set `precompute_ref_log_probs: true` or `--use_peft`.
 - "Cannot resume precompute_ref_log_probs" — the checkpoint's `reference_logps.pt` is missing or lacks that split. Recover it with the one-step run [above](#resuming-a-precompute-run), or put the reference columns (computed on the base model) in the dataset.
-- "does not belong to this '<split>' dataset" on resume — the resumed data or reference settings differ from the saving run's (dataset, split, chat template, tokenizer, `max_length`, `truncation_mode`, `ld_alpha`).
+- "does not belong to this '<split>' dataset" on resume — the resumed data or reference settings differ from the saving run's (dataset, split, chat template, tokenizer, `max_length`, `truncation_mode`, `ld_alpha`). Resume with the saving run's data and settings, or regenerate the file with the one-step run [above](#resuming-a-precompute-run).
+- "Regenerate the '<split>' reference log-probs for this run" on resume — the saved split was summed at another [log-prob precision](#log-prob-precision), which no setting selects. Run the one-step regeneration the message names.

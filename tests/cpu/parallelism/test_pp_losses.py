@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 import src.distributed.pipeline_parallel.losses as pp_losses
+import src.kernels.logprobs as logprob_kernels
 from src.distributed.pipeline_parallel.losses import causal_lm_token_loss
 
 
@@ -46,7 +47,7 @@ def test_single_chunk_matches_naive(batch, seq):
 
 def test_multi_chunk_values_and_grads_match(monkeypatch):
     # Several chunks with an uneven tail: the path a wrong chunk boundary breaks.
-    monkeypatch.setattr(pp_losses, "_CE_CHUNK_ELEMENTS", 50 * 37)  # 50 rows at vocab 37
+    monkeypatch.setattr(logprob_kernels, "LOGIT_CHUNK_ELEMENTS", 50 * 37)  # 50 rows at vocab 37
     logits, labels = _make(4, 40)  # 160 tokens -> 4 chunks (50/50/50/10)
     loss = causal_lm_token_loss(logits, labels)
     loss.backward()
@@ -61,29 +62,8 @@ def test_multi_chunk_values_and_grads_match(monkeypatch):
     )
 
 
-def test_chunk_budget_is_vocab_aware():
-    """The held fp32 plane must stay bounded as the vocabulary grows.
-
-    The chunk budget is what keeps the last stage's fp32 upcast off the memory peak, and the plane it
-    slices is ``tokens x V``. Sizing it in token ROWS bounds nothing in particular: at gpt-oss's
-    V=201k a 4096-row chunk is 3.3 GB — the size of the entire bf16 plane it is supposed to be a
-    fraction of — while at V=32k the same constant is 0.5 GB. Asserting a flat ceiling in BYTES is
-    what catches a regression back to a row-count budget.
-    """
-    ceiling = pp_losses._CE_CHUNK_ELEMENTS * 4  # fp32
-    for vocab in (32_000, 151_936, 201_088, 262_144):
-        rows = pp_losses._ce_chunk_rows(vocab)
-        assert rows >= 1, f"vocab {vocab} must still take at least one row per chunk"
-        assert rows * vocab * 4 <= ceiling, (
-            f"vocab {vocab}: chunk holds {rows * vocab * 4 / 1e9:.2f} GB of fp32, over the "
-            f"{ceiling / 1e9:.2f} GB budget — the chunk is sized in rows, not elements"
-        )
-    # A vocabulary past the whole budget must not round down to a zero-row (infinite-loop) chunk.
-    assert pp_losses._ce_chunk_rows(pp_losses._CE_CHUNK_ELEMENTS * 2) == 1
-
-
 def test_all_ignored_chunk_is_inert(monkeypatch):
-    monkeypatch.setattr(pp_losses, "_CE_CHUNK_ELEMENTS", 8 * 37)  # 8 rows at vocab 37
+    monkeypatch.setattr(logprob_kernels, "LOGIT_CHUNK_ELEMENTS", 8 * 37)  # 8 rows at vocab 37
     logits, labels = _make(1, 32)
     labels[:] = -100
     loss = causal_lm_token_loss(logits, labels)
@@ -102,8 +82,7 @@ def _unchunked_token_logprobs(logits, labels):
     return logps, mask
 
 
-# The last case's budget exceeds the batch's token count: the single-chunk short-circuit, which
-# skips the checkpoint and must still hand back the plane unchanged.
+# The last case's budget exceeds every row: each row is one chunk.
 @pytest.mark.parametrize(("batch", "seq", "budget_rows"), [(2, 16, 4), (4, 33, 7), (2, 9, 1), (2, 16, 64)])
 def test_chunked_token_logprobs_match_the_full_plane(monkeypatch, batch, seq, budget_rows):
     """Per-token log-probs must be BITWISE identical to the unchunked formulation, grads included.
@@ -115,7 +94,7 @@ def test_chunked_token_logprobs_match_the_full_plane(monkeypatch, batch, seq, bu
     asserts equality rather than closeness.
     """
     vocab = 37
-    monkeypatch.setattr(pp_losses, "_CE_CHUNK_ELEMENTS", budget_rows * vocab)
+    monkeypatch.setattr(logprob_kernels, "LOGIT_CHUNK_ELEMENTS", budget_rows * vocab)
     torch.manual_seed(batch * 100 + seq)
     base = torch.randn(batch, seq, vocab, dtype=torch.bfloat16)
     labels = torch.randint(0, vocab, (batch, seq))

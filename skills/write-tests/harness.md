@@ -72,7 +72,7 @@ Build checks from these rather than re-deriving them per file:
 | `parallel_shape_checks(model, parallelism_config)` | `tests/common/parallel_shape.py` | one model-side probe per axis the config enables: EP wrappers, the expert bank split EP-way, ETP sharding, TP-sharded params, Ulysses attention layers |
 | `ep_layers(model)` | `tests/common/ep_reference.py` | every EP/ETP-wrapped MoE layer |
 | `group_max_abs_diff(tensor, group)` | `tests/common/distributed.py` | the replica-identity probe: the largest elementwise difference across a group, NaN-propagating (collective) |
-| `pin_deterministic_ep_dispatch()` | `tests/common/distributed.py` | every DeepEP `ElasticBuffer` of the process built in deterministic mode, for an EP body that replays a run exactly; the default dispatch claims receive slots with atomics, so expert weight gradients round differently run to run |
+| `pin_deterministic_ep_dispatch()` | `tests/common/distributed.py` | every DeepEP `ElasticBuffer` of the process built in deterministic mode, for an EP body that replays a run exactly without `full_determinism` (under it the dispatcher does this itself); the default dispatch claims receive slots with atomics, so expert weight gradients round differently run to run |
 | `model_save_checks` / `resume_checkpoint_checks` / `resume_continuity_checks` | `tests/common/checkpoint_io.py` | the files a `save_model` or a mid-training checkpoint must hold, and what a resume restored at its first step |
 | `run_sft_suite(ctx, SFTSuite(...), {key: SFTMode(...)}, default_mode=)` | `tests/common/sft_modes.py` | the whole SFT smoke body: one `--mode` per manifest row, load → train → the checks above |
 | `train_recording_first_step` / `score_first_step` / `first_step_checks` / `first_step_gradient_checks` | `tests/common/first_step.py` | a parallel run's first optimizer step (microbatch losses, logged loss, sharded gradients, c10d autograd fallbacks) scored against a reference trainer on the same microbatches, for an objective a parallel axis could miscount |
@@ -207,11 +207,11 @@ those, kept separate only so the manifest can attach its family markers, timeout
   `tests.common.ep_reference.score_ep_grad_pairs(pairs, checks, metrics, cos_min=TOL.ep_grad_cosine_min)`;
   its norm-ratio band defaults to `TOL.ep_grad_norm_ratio_band`.
 - **Reporting** (`tests/common/reporting.py`):
-  - Correctness: `ctx.metrics(trainer)` → `snapshot_efficiency(cb)` flat dict. Headline at
+    - Correctness: `ctx.metrics(trainer)` → `snapshot_efficiency(cb)` flat dict. Headline at
     top level: `tokens_per_second` (per-GPU), `cluster_tokens_per_second`, `peak_allocated_gb`,
     `training_peak_allocated_gb`, `avg_step_time_seconds`. MFU/S-MFU/TFLOPS live under `"diagnostics"` and
     are never gated.
-  - Benchmarks: `emit_benchmark("<key>", efficiency_cb)` prints a `__HALO_BENCH__` line a
+    - Benchmarks: `emit_benchmark("<key>", efficiency_cb)` prints a `__HALO_BENCH__` line a
     refresh run uses to seed `tests/baselines/<key>.json`; `format_benchmark_report(cb)` for
     the human log. The result/bench lines (`RESULT_SENTINEL` = `__HALO_TEST_RESULT__`,
     `BENCH_SENTINEL` = `__HALO_BENCH__`) survive interleaved torchrun stdout.
@@ -221,7 +221,7 @@ those, kept separate only so the manifest can attach its family markers, timeout
 The pytest launcher (`tests/gpu/conftest.py`) reads the manifest and, per `(script, args)`
 node, shells out:
 
-```
+```bash
 python -m torch.distributed.run --nproc_per_node=<nproc> --master_port=<free> <script> <args>
 ```
 

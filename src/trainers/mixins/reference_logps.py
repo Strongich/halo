@@ -30,6 +30,10 @@ logger = get_logger(__name__, log_level="info")
 _DIGEST_BATCH_ROWS = 256
 _DIGEST_CHUNK_VALUES = 1 << 22
 _IDENTITY_SCHEMA = {"num_rows": int, "token_digests": Mapping, "settings": Mapping}
+# Every complete checkpoint of a run carries the same run-start reference scores.
+PREVIOUS_CHECKPOINT_RECOVERY = (
+    "A checkpoint whose save stopped before this file can take the previous checkpoint's copy instead."
+)
 
 
 def is_token_type(arrow_type: pa.DataType) -> bool:
@@ -62,12 +66,36 @@ def token_digest(dataset: Dataset, column: str) -> str:
     return hashlib.sha256(lengths.digest() + values.digest()).hexdigest()
 
 
+def is_reference_entry(entry: object) -> bool:
+    """Whether a saved split carries every identity field, each of its type."""
+    return isinstance(entry, Mapping) and all(
+        isinstance(entry.get(key), value_type) for key, value_type in _IDENTITY_SCHEMA.items()
+    )
+
+
+def reference_regeneration_steps(checkpoint: str) -> str:
+    """How to give ``checkpoint`` a reference file computed from the run's original starting model."""
+    # Outside the run's own output_dir, whose rotation could otherwise delete this checkpoint.
+    scratch = f"{os.path.dirname(os.path.abspath(checkpoint))}-reference-recovery"
+    return (
+        "run this config for one step from the run's original starting model into a scratch directory "
+        f"(--output_dir={scratch} "
+        "--max_steps=1 --save_strategy=steps --save_steps=1 --save_only_model=true "
+        f"--resume_from_checkpoint=null) and copy its checkpoint-1/{REFERENCE_LOGPS_FILE} into "
+        f"{checkpoint}, on every node when checkpoints are node-local"
+    )
+
+
 class ReferenceLogpsCheckpointMixin:
     """Shared frozen-reference lifecycle; subclasses own the score payload and the sweep.
 
     Place this mixin before DistributedTrainerMixin in the trainer's bases so its checkpoint hook
     overrides CheckpointingMixin's empty default and the reference rides every checkpoint.
     """
+
+    # Settings beyond the data, chat template and tokenizer that change this trainer's digested token
+    # columns, named as causes when a saved split's digests do not match.
+    _reference_token_settings: str | None = None
 
     def _init_reference_state(self, *, checkpoint, given: bool, policy_from_checkpoint: bool) -> None:
         self._reference_resume_given = given
@@ -148,14 +176,7 @@ class ReferenceLogpsCheckpointMixin:
             logger.info(f"Saved '{name}' reference does not match ({mismatch or 'another rank'}); sweeping.")
             return None
         reject_across_ranks(
-            None
-            if mismatch is None
-            else (
-                f"{self._reference_saved_path} does not belong to this '{name}' dataset: {mismatch}. "
-                "Each saved value is its own row's reference, so attaching it to different data would "
-                "score rows against references they were not computed for. Resume with the data and "
-                "reference settings the checkpoint was written with."
-            ),
+            None if mismatch is None else self._reference_mismatch_refusal(name, entry, identity, mismatch),
             f"Restoring the '{name}' reference log-probs",
             exc_type=ValueError,
         )
@@ -171,9 +192,7 @@ class ReferenceLogpsCheckpointMixin:
         return torch.load(path, map_location="cpu", weights_only=True)
 
     def _reference_entry_mismatch(self, entry, dataset, needed, identity) -> str | None:
-        if not isinstance(entry, Mapping) or not all(
-            isinstance(entry.get(key), value_type) for key, value_type in _IDENTITY_SCHEMA.items()
-        ):
+        if not is_reference_entry(entry):
             return f"its entry is not a saved reference split (expected {sorted(_IDENTITY_SCHEMA)})"
         if entry["num_rows"] != identity["num_rows"]:
             return f"it was saved for {entry['num_rows']} rows and this dataset has {identity['num_rows']}"
@@ -187,29 +206,36 @@ class ReferenceLogpsCheckpointMixin:
             if entry["token_digests"].get(column) != digest
         )
         if changed:
-            return (
-                f"this dataset's {changed} differ from the saved run's (a changed dataset, split, chat template "
-                "or tokenizer — or, for KTO's KL completions, per_device_train_batch_size or dataset_num_proc)"
-            )
+            causes = "a changed dataset, split, chat template or tokenizer"
+            if self._reference_token_settings:
+                causes += f", or a changed {self._reference_token_settings}"
+            return f"this dataset's {changed} differ from the saved run's ({causes})"
         return None
 
     def _validate_restored_reference_payload(self, name: str, entry: Mapping) -> None:
         """Optional rank-consistency check after all local payload validation has succeeded."""
 
+    def _reference_mismatch_refusal(self, name: str, entry: object, identity: Mapping, mismatch: str) -> str:
+        """The refusal of a saved split that does not match, where a sweep would score trained weights.
+
+        Total over a malformed ``entry``: every rank that sees a mismatch must reach the verdict.
+        """
+        return (
+            f"{self._reference_saved_path} does not belong to this '{name}' dataset: {mismatch}. "
+            "Each saved value is its own row's reference, so attaching it to different data would "
+            "score rows against references they were not computed for. Resume with the data and "
+            "reference settings the checkpoint was written with, or give it a file computed for this "
+            f"run: {reference_regeneration_steps(self._reference_resume_checkpoint)}."
+        )
+
     def _missing_reference_split(self, checkpoint: str, name: str, needed: Sequence[str]) -> str:
-        scratch = f"{os.path.dirname(os.path.abspath(checkpoint))}-reference-recovery"
         return (
             f"Cannot resume precompute_ref_log_probs from {checkpoint}: it holds no saved reference "
             f"log-probs for the '{name}' dataset ({REFERENCE_LOGPS_FILE} is missing or lacks that split), "
             "and they cannot be recomputed here: this resume built the policy from the checkpoint, "
             "so the sweep would score the TRAINED weights as the reference and zero every log-ratio. "
-            "To recover, run this config "
-            f"for one step from the base model into a scratch directory (--output_dir={scratch} "
-            "--max_steps=1 --save_strategy=steps --save_steps=1 --save_only_model=true "
-            f"--resume_from_checkpoint=null) and copy its checkpoint-1/{REFERENCE_LOGPS_FILE} into "
-            f"{checkpoint}, on every node when checkpoints are node-local. A checkpoint whose save "
-            "stopped before this file can take the previous checkpoint's copy instead. Or supply the "
-            f"{list(needed)} columns, computed on the base model, in the dataset."
+            f"To recover, {reference_regeneration_steps(checkpoint)}. {PREVIOUS_CHECKPOINT_RECOVERY} Or "
+            f"supply the {list(needed)} columns, computed on the base model, in the dataset."
         )
 
     def _remember_reference_split(self, name: str, identity: Mapping, payload: Mapping, dataset: Dataset) -> None:

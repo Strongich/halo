@@ -263,7 +263,8 @@ class ParallelismConfig:
     # toggled back on for its last backward so the optimizer still reads sharded params carrying grads).
     # FSDP2 otherwise reshards after each microstep's backward and re-all-gathers the full model on the
     # next — once per gradient_accumulation_step, and the dominant step cost whenever those collectives
-    # run over sockets. Costs one unsharded param copy per GPU; plain-DP torchrun path only.
+    # run over sockets. Holds only the unsharded params ZeRO-2 keeps from forward to backward anyway, so
+    # peak memory is unchanged. Torchrun DP/CP/EP only; TP and PP are rejected.
     fsdp_reshard_after_backward: bool = True
 
     # True skips FSDP2's gradient reduce on a grad-accum window's microsteps 1..n-1
@@ -271,8 +272,9 @@ class ParallelismConfig:
     # Costs one unsharded gradient copy per GPU (at the reduce dtype) held across the window.
     fsdp_defer_grad_sync: bool = False
 
-    # ep_size==1 only: True shards the replicated experts via FSDP reduce-scatter (grad-equivalent,
-    # frees DP-scaling memory); RL-safe — the vLLM weight-sync gather materializes shards first.
+    # ep_group_size==1 only: True shards the replicated experts via FSDP reduce-scatter (grad-equivalent,
+    # frees DP-scaling memory); RL-safe — the engine weight-sync gather (vLLM or SGLang) materializes
+    # shards first.
     fsdp_shard_ep1_experts: bool = True
 
     # Shard non-expert params within each NVLink domain, replicate across domains. Pure DP or CP only
@@ -1118,6 +1120,25 @@ class ParallelismConfig:
                 f"{'cross-domain — Gin/RDMA' if self.requires_rdma else 'within one NVLink domain'}). "
                 f"{exc}"
             ) from exc
+
+    def reject_cross_domain_determinism(self, full_determinism: bool) -> None:
+        """Reject ``full_determinism`` on an EP group spanning NVLink domains.
+
+        The dispatcher builds DeepEP's deterministic buffer under the mode ``full_determinism`` turns on,
+        but across domains DeepEP runs its hybrid RDMA kernels, which have no deterministic mode (they
+        assert on it at the first dispatch). Applied by the entry scripts before the load, and at trainer
+        construction for a hand-built config.
+        """
+        if full_determinism and self.requires_rdma:
+            raise ValueError(
+                f"full_determinism cannot run over an EP group spanning NVLink domains (ep_scope=global "
+                f"over {self.num_nvlink_domains} domains of {self.nvlink_domain_size} GPUs): DeepEP's "
+                f"cross-domain (hybrid RDMA) dispatch has no deterministic mode and places received tokens "
+                f"in atomic claim order, so every expert weight gradient is summed in a different order on "
+                f"every step. Keep each EP group inside one NVLink domain (ep_scope=node with data "
+                f"parallelism across domains; on a multi-node NVLink fabric, NVLINK_DOMAIN_SIZE set to the "
+                f"fabric's size), or drop full_determinism."
+            )
 
     @property
     def num_ep_groups(self) -> int:

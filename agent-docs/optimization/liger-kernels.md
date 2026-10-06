@@ -60,8 +60,8 @@ advertise is inert here. The spec's `gated_rms_norm` role therefore binds `flash
 `FusedRMSNormGated`, already a hard dependency for this roster's delta-rule and short-convolution kernels.
 It rides the same `rms_norm` flag, so one knob turns both norm kernels off.
 
-Measured on a B300 over `[1, 8192, 32, 128]` (262144 rows × 128) forward and backward: **2.3–4.6×**
-(1.8–2.1 ms eager → 0.43–0.86 ms fused).
+Measured on a B300 over `[1, 8192, 32, 128]` (262144 rows × 128) forward and backward (2026-10-03, commit
+0bc3a22a5, Blackwell image): **2.7–6.3×** (1.79–1.98 ms eager → 0.32–0.66 ms fused).
 
 The kernel keeps the reduction, the weight multiply and the gate in fp32, as GLM-5's module does. The Qwen
 modules round the normalized activation to storage dtype *before* the weight multiply, so the fused path is
@@ -171,6 +171,10 @@ Two rules keep it off:
   orchestrator forces it off at load (`liger_routed_expert_overrides`), an explicit `swiglu: true` included
   (warned). That covers MoE at `ep_size: 1` with `use_grouped_gemm: false`, and a family with no EP layer
   class (Mixtral) under any configuration.
+
+Under the force-off those experts run transformers' `grouped_mm`: as an op it is 18% slower than `LigerExperts`
+at Qwen3-30B-A3B's expert shape (8192 tokens, 128 experts) on B300, and faster at small shapes. The default
+grouped path is unaffected.
 
 The force-off keys on the config having experts, not on what upstream's flag patches, and drops the flag
 whole: Llama 4's upstream `swiglu`, which fuses only its dense and shared-expert MLP, goes too, and GLM-4V MoE
@@ -339,7 +343,7 @@ stay active.
 
 Upstream Liger's `gpt_oss` applier accepts a `swiglu` flag but has no patch block for it: GptOss's custom
 clamped/interleaved expert FFN has no standard-SwiGLU equivalent, so `swiglu` is a no-op at any value and
-defaults off. FLCE is supported, marginally slower than CE.
+defaults off. FLCE is supported; on gpt-oss-20b it runs 3–20% slower than CE at b1, least at long sequence and high EP ([vs Stock TRL](halo-vs-stock-trl.md#fused-linear-cross-entropy)).
 
 Effective options: `rope`, `cross_entropy`, `fused_linear_cross_entropy`, `rms_norm`. The last is served by
 the toolkit's spec with Gemma's casting mode (`GptOssRMSNorm` multiplies its weight in fp32 before the cast
@@ -353,23 +357,26 @@ The EP MoE layer's own clamped-SwiGLU is independent of Liger: every path — pe
 
 ## Benchmarks
 
-**Dense — 1× B300 (SM103), Qwen3-8B, GC on, seq 16384, batch 1:** Liger+CE gives 16,396 vs 11,943
-tokens/s/GPU (**+37%**) at 64.6 vs 78.6 GB peak (**−14 GB**).
+Both measured 2026-10-03 at commit 0bc3a22a5 on the Blackwell image.
 
-**MoE — 2× B300 (SM103) EP=2, Qwen3-30B-A3B (128 experts, top_k=8), GC on, seq 8192, batch 4:**
+**Dense — 1× B300 (SM103), Qwen3-8B, GC on, seq 16384, batch 1:** Liger+CE gives 15,966 vs 11,746
+tokens/s/GPU (**+36%**) at 64.6 vs 78.6 GiB peak (**−14 GiB**).
+
+**MoE — 2× B300 (SM103) EP=2, Qwen3-30B-A3B (128 experts, top_k=8), GC on, seq 8192, batch 4,** with the
+toolkit spec's torch fused norm on `qwen3_moe`'s norms ([above](#upstream-covered-families-the-toolkit-extends)):
 
 | Configuration | tokens/s/GPU | Peak memory | vs baseline |
 |---|:---:|:---:|---|
-| No Liger | 11,364 | 168.9 GB | baseline |
-| Liger + CrossEntropy | 15,961 | 150.2 GB | +40%, −19 GB |
-| Liger + FusedLinearCE | 15,469 | 126.6 GB | +36%, −42 GB |
+| No Liger | 13,650 | 168.9 GiB | baseline |
+| Liger + CrossEntropy | 18,956 | 141.0 GiB | +39%, −28 GiB |
+| Liger + FusedLinearCE | 17,927 | 139.5 GiB | +31%, −29 GiB |
 
-FLCE keeps nearly all of CE's throughput while cutting another −24 GB — the long-sequence lever. The saving
-is the logits plane and so scales with sequence: on Qwen3-8B activations at 32k it is 24.3 GB forward
-(32.2 vs 56.5 GB), ~2.5 GB at 8k. Reach for plain CE when a model's FLCE patch is unavailable.
+At this shape FLCE saves only 1.5 GiB more than CE and costs 5% throughput. FLCE's saving is the logits
+plane: on Qwen3-8B activations at 32k it is 24.3 GB forward (32.2 vs 56.5 GB), ~2.5 GB at 8k. Reach for plain CE when a model's FLCE patch is unavailable.
 
-**Measure MoE throughput at batch ≥ 4.** At batch 1, EP MoE is communication-bound and the Liger throughput
-effect is within run-to-run noise. Memory numbers are deterministic at any batch.
+**Measure MoE throughput at batch ≥ 4.** At batch 1 EP MoE is communication-bound and its DeepEP time varies run
+to run, so a batch-1 delta is directional (Liger measures +27% there at seq 16384, [torch.compile](torch-compile.md#benchmark-results)).
+Memory numbers are deterministic at any batch.
 
 ```bash
 # Dense (Qwen3-8B), with and without Liger
@@ -378,7 +385,8 @@ torchrun --nproc_per_node=1 \
 
 # MoE (Qwen3-30B-A3B), with/without Liger and FLCE
 torchrun --nproc_per_node=2 \
-    tests/gpu/profiling/benchmark_sft_ep.py --model qwen3-30b-a3b --ep 2 --seq 8192 [--no_liger | --fused_linear_ce]
+    tests/gpu/profiling/benchmark_sft_ep.py --model qwen3-30b-a3b --ep 2 --seq 8192 --batch_size 4 \
+    [--no_liger | --fused_linear_ce]
 ```
 
 The kernels are Triton, so they need a supported GPU (H100/H200, B200/B300).

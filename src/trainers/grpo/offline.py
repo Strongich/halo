@@ -21,6 +21,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
+from enum import Enum
 from functools import partial
 from typing import Any, Union
 
@@ -116,6 +117,17 @@ from src.trainers.mixins.base import DistributedTrainerMixin
 from src.trainers.mixins.pp_gates import reject_pp_compute_metrics, reject_pp_peft
 
 logger = get_logger(__name__, log_level="INFO")
+
+
+class ReferenceMode(Enum):
+    """Where an offline-GRPO policy's KL reference comes from; ``kl_beta`` 0 reads none of them."""
+
+    # Full fine-tune: raw run-start scores, swept once before training and checkpointed.
+    RUN_START = "run_start"
+    # PEFT, native expert LoRA beside it included: the live policy with every adapter disabled.
+    ADAPTERS_OFF = "adapters_off"
+    # Native expert LoRA alone: its unadapted base, loaded separately and forwarded per batch.
+    LIVE_BASE = "live_base"
 
 
 def _collate_reference_rows(rows, *, collator, batch_size: int):
@@ -431,7 +443,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
     # Buffered per-sample key → logged sign prefixes (unclamped: negative side only, where it binds).
     _SIGN_METRIC_KEYS = {
         "logps": ("positive", "negative"),
-        "rewards": ("positive", "negative"),
+        "pg_objective": ("positive", "negative"),
         "logps_unclamped": ("negative",),
         "kl": ("positive", "negative"),
         "ref_logps": ("positive", "negative"),
@@ -501,9 +513,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         logger.info(f"Using PG formulation: {self.policy_gradient_formulation}")
         self._precompute_reference = (
             self.beta != 0.0
-            and peft_config is None
-            and not (isinstance(model, nn.Module) and is_peft_model(model))
-            and (parallelism_config is None or parallelism_config.expert_lora is None)
+            and self._reference_mode(model, parallelism_config, peft_config) is ReferenceMode.RUN_START
         )
         reject_unsupported_reference_input(
             train_dataset,
@@ -783,20 +793,16 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
                 f"and truncating there would silently drop loss tokens."
             )
 
-    @staticmethod
-    def _reject_cp_explicit_options(model, parallelism_config, peft_config, ref_model) -> None:
+    @classmethod
+    def _reject_cp_explicit_options(cls, model, parallelism_config, peft_config, ref_model) -> None:
         """Reject unsupported CP references and adapters before allocating policy weights."""
         if parallelism_config is None or not parallelism_config.is_cp_mode:
             return
-        if (
-            peft_config is not None
-            or parallelism_config.expert_lora is not None
-            or (isinstance(model, nn.Module) and is_peft_model(model))
-        ):
+        if cls._reference_mode(model, parallelism_config, peft_config) is not ReferenceMode.RUN_START:
             raise ValueError(
-                "Offline GRPO with CP requires a full policy fine-tune. PEFT and native expert LoRA "
-                "need a separately validated adapter-disabled reference sweep and adapter checkpoint "
-                "path; refusing to silently anchor KL to adapted weights."
+                "Offline GRPO with CP requires a full policy fine-tune: PEFT and native expert LoRA are "
+                "not validated under offline-GRPO CP (their adapter checkpoint path, and at kl_beta > 0 "
+                "their adapter-disabled reference). Fully fine-tune the policy, or drop context parallelism."
             )
         if ref_model is not None:
             raise ValueError(
@@ -827,12 +833,22 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             )
 
     @staticmethod
-    def _holds_kl_reference(model, kl_beta: float, parallelism_config: "ParallelismConfig", peft_config) -> bool:
-        """Whether an external frozen reference can be read by this run."""
+    def _reference_mode(model, parallelism_config: "ParallelismConfig | None", peft_config) -> ReferenceMode:
+        """The policy's KL reference source. ``model`` may still be a checkpoint id, never a PEFT model."""
+        if peft_config is not None or (isinstance(model, nn.Module) and is_peft_model(model)):
+            return ReferenceMode.ADAPTERS_OFF
+        if getattr(parallelism_config, "expert_lora", None) is not None:
+            return ReferenceMode.LIVE_BASE
+        return ReferenceMode.RUN_START
+
+    @classmethod
+    def _holds_kl_reference(cls, model, kl_beta: float, parallelism_config: "ParallelismConfig", peft_config) -> bool:
+        """Whether this run reads an external frozen reference: the run-start sweep scores one in place
+        of the policy, and native expert LoRA forwards its base per batch. CP and PP score the reference
+        through the policy's own distributed path."""
         return (
             kl_beta != 0.0
-            and peft_config is None
-            and not is_peft_model(model)
+            and cls._reference_mode(model, parallelism_config, peft_config) is not ReferenceMode.ADAPTERS_OFF
             and not parallelism_config.is_pp_mode
             and not parallelism_config.is_cp_mode
         )
@@ -843,7 +859,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
     ) -> bool:
         """Native expert LoRA needs its unadapted base; full fine-tuning sweeps its own policy."""
         return cls._holds_kl_reference(model, args.kl_beta, parallelism_config, peft_config) and (
-            getattr(parallelism_config, "expert_lora", None) is not None
+            cls._reference_mode(model, parallelism_config, peft_config) is ReferenceMode.LIVE_BASE
         )
 
     @classmethod
@@ -853,13 +869,13 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             if ref_model is not None:
                 raise ValueError(
                     "ref_model was passed, but this run holds no KL reference model (kl_beta 0, a PEFT policy "
-                    "scored with its adapters disabled, or CP/PP, which scores the reference through "
-                    "the policy's distributed path), so it would never be read. Drop ref_model."
+                    "scored with its adapters disabled, or PP, which scores the reference through the "
+                    "policy's pipeline), so it would never be read. Drop ref_model."
                 )
             return None
         if ref_model is not None:
             return ref_model
-        if getattr(parallelism_config, "expert_lora", None) is not None:
+        if cls._reference_mode(model, parallelism_config, peft_config) is ReferenceMode.LIVE_BASE:
             raise ValueError(
                 "kl_beta > 0 with native expert LoRA needs ref_model loaded through "
                 "load_frozen_reference_model from the unadapted base with the policy's revision, "
@@ -1136,6 +1152,7 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
             inputs["group_size"],
             loss_type=self.loss_type,
             max_completion_length=self.max_completion_length,
+            row_token_counts=loss_token_counts_per_row(labels),
             cp_config=self.cp_config,
         )
         self._buffer_sign_metrics(sample_values, advantages, supervised)
@@ -1263,24 +1280,19 @@ class OfflineGRPOTrainer(ChunkedLogprobsCore, OfflineGRPOReferenceLifecycleMixin
         ]
 
     def _cp_score_reference_batch(self, batch) -> list[torch.Tensor]:
-        if self.ref_model is not None:
-            raise ValueError("CP reference scoring uses the distributed policy; drop the explicit ref_model.")
-        local_logps, local_labels = self._cp_chunked_logps(
+        local_logps, _ = self._cp_chunked_logps(
             self.model,
             batch["input_ids"],
             batch["attention_mask"],
             batch["labels"],
         )
         start, end = cp_chunk_bounds(batch["input_ids"].size(1), self.cp_config.cp_rank, self.cp_config.cp_size)
-        chunk = end - start
-        local_logps = F.pad(local_logps.float(), (0, chunk - local_logps.size(1)))
-        local_valid = F.pad(local_labels != LABEL_IGNORE_INDEX, (0, chunk - local_labels.size(1)))
+        local_logps = F.pad(local_logps.float(), (0, end - start - local_logps.size(1)))
         logp_shards = [torch.empty_like(local_logps) for _ in range(self.cp_config.cp_size)]
-        valid_shards = [torch.empty_like(local_valid) for _ in range(self.cp_config.cp_size)]
         dist.all_gather(logp_shards, local_logps, group=self.cp_config.process_group)
-        dist.all_gather(valid_shards, local_valid, group=self.cp_config.process_group)
         full_logps = torch.cat(logp_shards, dim=1)
-        full_valid = torch.cat(valid_shards, dim=1)
+        # Every rank holds the full labels; the shards' shifted targets tile this grid.
+        full_valid = F.pad(batch["labels"][:, 1:] != LABEL_IGNORE_INDEX, (0, 1))
         return [logps[valid].cpu() for logps, valid in zip(full_logps, full_valid, strict=True)]
 
     def _buffer_sign_metrics(
