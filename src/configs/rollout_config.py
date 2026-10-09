@@ -8,6 +8,14 @@ it pickled, so those imports must not be pulled into every ``import src.configs`
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
+from src.env import DEFAULT_NCCL_TIMEOUT_MINUTES
+
+# The rollout engines a run selects between: the type both config surfaces declare, and the spellings
+# every consumer branching on the engine without its weight-sync client (whose ``BACKEND_KEY`` carries
+# the same value) compares against.
+RolloutBackend = Literal["vllm", "sglang"]
+VLLM_BACKEND, SGLANG_BACKEND = get_args(RolloutBackend)
+
 # ``AsyncTrainingConfig`` is the validated YAML surface and supplies every mirrored field below, so a
 # directly-built RolloutConfig defaults to what that path would produce; one shared constant per pair
 # keeps the two in step. The fields that path derives rather than mirrors (``capture_token_ids``,
@@ -15,31 +23,32 @@ from typing import Any, Literal, get_args
 # instead — see each field.
 DEFAULT_ROLLOUT_TEMPERATURE = 0.7
 DEFAULT_ROLLOUT_TOP_P = 0.95
+# The three filters' off values, sent on every request: both engines fill an omitted one from the
+# model's generation_config.json. -1 is the top_k off value both accept (SGLang refuses 0).
+DEFAULT_ROLLOUT_TOP_K = -1
+DEFAULT_ROLLOUT_MIN_P = 0.0
+DEFAULT_ROLLOUT_REPETITION_PENALTY = 1.0
+# Those off values by RolloutConfig field, and the sampler whose reported log-probs are the raw model
+# distribution's: every filter off, temperature and top-p at 1.
+SAMPLER_FILTERS_OFF = {
+    "top_k": DEFAULT_ROLLOUT_TOP_K,
+    "min_p": DEFAULT_ROLLOUT_MIN_P,
+    "repetition_penalty": DEFAULT_ROLLOUT_REPETITION_PENALTY,
+}
+IDENTITY_SAMPLER = {"temperature": 1.0, "top_p": 1.0, **SAMPLER_FILTERS_OFF}
 DEFAULT_ROLLOUT_MAX_TOKENS = 32768
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BASE_WAIT_SECONDS = 1.0
 
-# Two thirds of the 30-min default NCCL watchdog, so a straggler episode is cancelled before its
-# peers' per-step collective aborts. Shared with ``AsyncTrainingConfig.episode_timeout`` so a
-# directly built RolloutConfig does not default above what that validated path allows.
-DEFAULT_EPISODE_TIMEOUT_SECONDS = 1200.0
+# Two thirds of the default NCCL watchdog, so a straggler episode is cancelled before its peers'
+# per-step collective aborts. Shared with ``AsyncTrainingConfig.episode_timeout`` so a directly built
+# RolloutConfig does not default above what that validated path allows.
+DEFAULT_EPISODE_TIMEOUT_SECONDS = DEFAULT_NCCL_TIMEOUT_MINUTES * 60 * 2 / 3
 
-# Chat-template variable carrying an episode's thinking budget (per turn or per episode, by the scope
-# below), the pair of the request's top-level ``reasoning_effort``; both are per episode, never run-wide.
+# Chat-template variable carrying an episode's per-turn thinking budget, the pair of the request's
+# top-level ``reasoning_effort``; both are per episode, never run-wide.
 REASONING_BUDGET_TEMPLATE_VAR = "reasoning_budget"
-# Chat-template variable naming what the stated budget covers. Run-wide, so the config builder injects
-# it into the template variables under the episode scope; absent means the per-turn scope.
-REASONING_SCOPE_TEMPLATE_VAR = "reasoning_budget_scope"
-
-# What a thinking budget covers: each turn on its own, or the episode's turns together (each turn's
-# engine cap is then what the budget has left).
-ThinkingBudgetScope = Literal["turn", "episode"]
-THINKING_BUDGET_SCOPES: tuple[str, ...] = get_args(ThinkingBudgetScope)
-THINKING_SCOPE_TURN = "turn"
-THINKING_SCOPE_EPISODE = "episode"
-DEFAULT_THINKING_BUDGET_SCOPE = THINKING_SCOPE_TURN
-DEFAULT_THINKING_TURN_RESERVE = 512
 DEFAULT_REASONING_END_TOKEN = "</think>"
 # Example end strings of the families' reasoning parsers, for the knob's help and its refusal.
 REASONING_END_TOKEN_EXAMPLES = (
@@ -51,7 +60,7 @@ REASONING_END_TOKEN_EXAMPLES = (
 class RolloutConfig:
     """Generation and retry configuration for rollout collection."""
 
-    backend: Literal["vllm", "sglang"] = "vllm"
+    backend: RolloutBackend = VLLM_BACKEND
     """Rollout engine serving these requests. Both speak OpenAI chat completions, but SGLang drops
     unknown request keys rather than rejecting them, so the payload builder gates the vLLM-only
     fields below on this value. Mirrors ``AsyncTrainingConfig.rollout_backend``, which validates
@@ -59,29 +68,33 @@ class RolloutConfig:
 
     temperature: float = DEFAULT_ROLLOUT_TEMPERATURE
     top_p: float = DEFAULT_ROLLOUT_TOP_P
+    top_k: int = DEFAULT_ROLLOUT_TOP_K
+    min_p: float = DEFAULT_ROLLOUT_MIN_P
+    repetition_penalty: float = DEFAULT_ROLLOUT_REPETITION_PENALTY
     max_tokens: int = DEFAULT_ROLLOUT_MAX_TOKENS
     """Max tokens per single-turn generation. See ``AsyncTrainingConfig.rollout_max_tokens``, the
     validated surface this mirrors."""
+    max_episode_tokens: int | None = None
+    """The most tokens one episode may sample over all its turns, reasoning and visible output
+    together: a turn's ``max_tokens`` narrows to what the episode has left, and an episode with no
+    room for a further turn ends truncated. None = only the per-turn caps and ``max_turns`` bound the
+    episode. Mirrors ``AsyncTrainingConfig.rollout_max_episode_tokens``."""
 
     max_thinking_tokens: int | None = None
-    """Reasoning-token budget (vLLM ``thinking_token_budget``): caps CoT, then forces an answer. Per
-    turn under the ``turn`` scope; under the ``episode`` scope the drivers narrow it per turn to what
-    the episode's budget has left. Requires a server-side reasoning parser. None = only ``max_tokens``
-    caps the turn."""
+    """Per-turn reasoning-token cap (vLLM ``thinking_token_budget``): caps CoT, then forces an answer
+    within the rest of ``max_tokens``. A level's ``thinking_tokens`` below it is the turn's cap instead.
+    Requires a server-side reasoning parser. None = only a level's ``thinking_tokens`` caps reasoning, or
+    nothing does."""
 
-    thinking_budget_scope: ThinkingBudgetScope = DEFAULT_THINKING_BUDGET_SCOPE
-    """What a thinking budget covers — ``turn`` (every turn gets it whole) or ``episode`` (the turns
-    share it: a turn's engine cap is the budget minus the reasoning the earlier turns spent, never below
-    ``thinking_turn_reserve``). Mirrors ``AsyncTrainingConfig.rollout_thinking_budget_scope``."""
-
-    thinking_turn_reserve: int = DEFAULT_THINKING_TURN_RESERVE
-    """Under the ``episode`` scope, the reasoning a turn always gets once the budget is spent, so the
-    model can still close its reasoning and act. Mirrors ``AsyncTrainingConfig.rollout_thinking_turn_reserve``."""
+    max_answer_tokens: int | None = None
+    """The most a turn may generate past its reasoning cap: a turn's ``max_tokens`` is at most that cap
+    (the level's, or a retry's reserve) plus this. None = ``max_tokens`` alone bounds the turn. Mirrors
+    ``AsyncTrainingConfig.rollout_max_answer_tokens``."""
 
     reasoning_end_token_id: int | None = None
     """The id of the token that closes reasoning, resolved from ``rollout_reasoning_end_token`` by the
-    caller that owns the tokenizer. The ``episode`` scope counts a turn's reasoning as the sampled ids
-    up to and including it; the ``turn`` scope never reads it."""
+    caller that owns the tokenizer: a turn's reasoning is counted as the sampled ids up to and including
+    it, the count ``episode/thinking_cap_turns`` reads. None = no count."""
 
     capture_token_ids: bool = False
     """Request per-token logprobs so the sampled generation token ids can be captured (needs the
@@ -108,7 +121,8 @@ class RolloutConfig:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     """Chat-template variables sent with every request (``chat_template_kwargs``), e.g. Qwen3.x's
     ``preserve_thinking`` so reasoning the env carries stays rendered across a later user message. Never
-    the reasoning effort, which travels top-level (``generation_control_fields``)."""
+    the per-episode keys: the reasoning effort travels top-level and the level's thinking budget is added
+    per request (``generation_control_fields``)."""
 
     model_name: str | None = None
     """Model name for /v1/chat/completions. Optional — vllm-serve uses the loaded model when omitted."""

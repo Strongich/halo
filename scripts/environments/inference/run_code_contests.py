@@ -10,7 +10,9 @@ solution `language`, and reports `success@1` / `success@k` bucketed by the adapt
 and reward aggregation are shared with the other eval scripts via :mod:`src.environments.eval_runner`.
 `--eval_protocol` names the evaluation contract (`harness`: the configured budgets; `leaderboard`: one
 graded program, no scratchpad), and on a benchmark that stamps contest dates
-`--start_date` / `--end_date` / `--platform` select the problems scored.
+`--start_date` / `--end_date` / `--platform` select the problems scored. A problem whose only tests are
+its statement's examples (a Codeforces row whose official tests are the statement's samples) is left
+out and counted unless `--include_examples_only`.
 
 The server must serve the model with tool calling enabled (e.g. vLLM
 `--tool-call-parser qwen3_xml --enable-auto-tool-choice`). A solution counts as solved when it passes
@@ -58,7 +60,6 @@ from src.environments.envs.tasks.coding.code_contests import (
     DEFAULT_EVAL_PROTOCOL,
     DEFAULT_REASONING_EFFORT,
     EVAL_PROTOCOLS,
-    REASONING_EFFORT_PROFILES,
     CodeContestsEnvironment,
     without_eval_protocol_pins,
 )
@@ -116,12 +117,14 @@ def refuse_flag_owned_env_kwargs(env_kwargs: dict) -> None:
 
 
 def resolve_selection(args: argparse.Namespace, adapter: CodeDatasetAdapter) -> ContestSelection:
-    """The contest window and platforms the run scores, validated against the adapter before any row
-    is read: an unparsable day, an empty window, an unknown platform, or a bound the dataset cannot
-    apply exits."""
+    """The contest window, platforms and examples-only choice the run scores, validated against the adapter
+    before any row is read: an unparsable day, an empty window, an unknown platform, a bound the dataset
+    cannot apply, or ``--include_examples_only`` on an adapter that marks no problem examples-only exits."""
+    if args.include_examples_only and adapter.examples_only is None:
+        raise SystemExit(f"--include_examples_only on --adapter {args.adapter}: it marks no problem examples-only")
     platforms = parse_list_flag("platform", args.platform) if args.platform is not None else ()
     try:
-        selection = ContestSelection.parse(args.start_date, args.end_date, platforms)
+        selection = ContestSelection.parse(args.start_date, args.end_date, platforms, args.include_examples_only)
         adapter.require_selectable(selection)
     except ValueError as exc:
         raise SystemExit(f"--start_date/--end_date/--platform on --adapter {args.adapter}: {exc}") from exc
@@ -258,6 +261,13 @@ def parse_args() -> argparse.Namespace:
         )
         + "). Default: every platform.",
     )
+    examples_only = ", ".join(sorted(name for name, a in CODE_DATASET_ADAPTERS.items() if a.examples_only))
+    p.add_argument(
+        "--include_examples_only",
+        action="store_true",
+        help="Also score problems whose only tests are the statement's examples, which a program printing a "
+        f"constant passes for many (adapters that mark them: {examples_only}). Default: left out and counted.",
+    )
     p.add_argument(
         "--eval_protocol",
         default=None,
@@ -297,9 +307,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reasoning_effort",
         default=None,
-        choices=[*sorted(REASONING_EFFORT_PROFILES), NO_REASONING_EFFORT],
+        choices=[*sorted(CodeContestsEnvironment.REASONING_EFFORT_PROFILES), NO_REASONING_EFFORT],
         help=f"Solver reasoning effort, passed to the model's chat template (low/medium/high), or "
-        f"{NO_REASONING_EFFORT}: no level and no thinking budget, for a non-thinking model. Default: the "
+        f"{NO_REASONING_EFFORT}: no level and no thinking budget, for a non-thinking model. "
+        f"{NO_REASONING_EFFORT} sends no reasoning_effort, so a thinking template keeps its default: "
+        f"Qwen3/3.5/3.6 still think unless enable_thinking=false reaches the template (vLLM "
+        f"--default-chat-template-kwargs). Default: the "
         f"training config's under --training_config (a null there is {NO_REASONING_EFFORT}), else "
         f"{DEFAULT_REASONING_EFFORT}. Sets the default --max_tokens unless --max_tokens or "
         f"--training_config is given.",
@@ -310,7 +323,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Max tokens per generation. Default: the training config's rollout_max_tokens under "
         "--training_config, else the effort profile's thinking budget ("
-        + ", ".join(f"{level}={p['thinking_tokens']}" for level, p in REASONING_EFFORT_PROFILES.items())
+        + ", ".join(
+            f"{level}={p['thinking_tokens']}" for level, p in CodeContestsEnvironment.REASONING_EFFORT_PROFILES.items()
+        )
         + ", or a reasoning_effort_profiles override in --env_kwargs)"
         + f" plus {SOLUTION_HEADROOM_TOKENS} solution headroom; under --reasoning_effort {NO_REASONING_EFFORT}, "
         f"the training rollout's default {DEFAULT_ROLLOUT_MAX_TOKENS}.",
@@ -329,7 +344,8 @@ def build_examples(
     args: argparse.Namespace, adapter: CodeDatasetAdapter, selection: ContestSelection
 ) -> list[dict[str, Any]]:
     """Compose the raw contest rows ``selection`` admits into eval examples via the chosen adapter,
-    bucketed by its group field and named by its id field.
+    bucketed by its group field and named by its id field. The examples-only problems it leaves out
+    among the rows read are counted in the log.
 
     Loading goes through the adapter's own ``load`` when it has one (LiveCodeBench and ICPC-Eval
     cannot be read with a plain ``load_dataset``), otherwise the standard HF split loader.
@@ -340,7 +356,8 @@ def build_examples(
         else load_hf_split(args.dataset, args.config, args.split)
     )
     examples = []
-    for row in adapter.scored_rows(rows, selection):
+    left_out: list[Any] = []
+    for row in adapter.scored_rows(rows, selection, left_out):
         examples.append(
             {
                 "prompt": adapter.format_prompt(row),
@@ -351,6 +368,11 @@ def build_examples(
         )
         if args.num_examples and len(examples) >= args.num_examples:
             break
+    if left_out:
+        logger.info(
+            "Left out %d problems graded only on their statement's examples (--include_examples_only scores them)",
+            len(left_out),
+        )
     if not examples:
         raise SystemExit(
             f"{args.dataset} ({args.adapter}) yielded no gradable problem; check the adapter, config, split "
@@ -377,7 +399,7 @@ def main() -> None:
     env_kwargs = json.loads(args.env_kwargs)
     refuse_flag_owned_env_kwargs(env_kwargs)
     contract = load_training_contract(args.training_config)
-    trained_env = contract.env_config_dict() if contract is not None else {}
+    trained_env = contract.env_config.to_env_config() if contract is not None else {}
     env_type = resolve_setting(
         args.env_type, contract.env_config.environment_type if contract else None, DEFAULT_ENV_TYPE
     )
@@ -386,38 +408,40 @@ def main() -> None:
             f"{args.training_config} trains environment_type={env_type!r}, not a coding env {CODING_ENV_TYPES}"
         )
     env_config = resolve_env_config(args, trained_env, env_kwargs)
-    reasoning_effort, max_turns = env_config["reasoning_effort"], env_config["max_turns"]
+    reasoning_effort = env_config["reasoning_effort"]
     env = resolve_environment(env_type, env_config)
-    # A judge or reward-model term is probed before any episode runs, as the trainer does at launch.
-    env.verify_backend()
-    examples = build_examples(args, adapter, selection)
-    client = create_openai_client(base_url=args.base_url, api_key_override=args.api_key)
+    try:
+        # A judge or reward-model term is probed before any episode runs, as the trainer does at launch.
+        env.verify_backend()
+        examples = build_examples(args, adapter, selection)
+        client = create_openai_client(base_url=args.base_url, api_key_override=args.api_key)
 
-    # Without a training config the flag's effort level sets the generation budget unless --max_tokens
-    # overrides it: too small a budget truncates the chain of thought before any solution and scores
-    # the problem 0.
-    rollout = rollout_config_from_args(
-        args,
-        contract,
-        default_temperature=DEFAULT_TEMPERATURE,
-        default_max_tokens=default_max_tokens(env, args.reasoning_effort),
-    )
-    logger.info("reasoning_effort=%s, max_tokens=%d", reasoning_effort, rollout.max_tokens)
-
-    traj_path = run_trajectory_path(args, env, selection)
-
-    results = asyncio.run(
-        collect_results(
-            env,
-            examples,
-            client,
-            rollout=rollout,
-            num_samples=args.num_samples,
-            max_workers=args.max_workers,
-            collect_trajectories=bool(traj_path),
+        # Without a training config the flag's effort level sets the generation budget unless --max_tokens
+        # overrides it: too small a budget truncates the chain of thought before any solution and scores
+        # the problem 0.
+        rollout = rollout_config_from_args(
+            args,
+            contract,
+            default_temperature=DEFAULT_TEMPERATURE,
+            default_max_tokens=default_max_tokens(env, args.reasoning_effort),
         )
-    )
-    env.close()
+        logger.info("reasoning_effort=%s, max_tokens=%d", reasoning_effort, rollout.max_tokens)
+
+        traj_path = run_trajectory_path(args, env, selection)
+
+        results = asyncio.run(
+            collect_results(
+                env,
+                examples,
+                client,
+                rollout=rollout,
+                num_samples=args.num_samples,
+                max_workers=args.max_workers,
+                collect_trajectories=bool(traj_path),
+            )
+        )
+    finally:
+        env.close()
     scope = ", ".join(part for part in (args.adapter, selection.label, f"{env.eval_protocol} protocol") if part)
     report(
         results,
@@ -432,7 +456,6 @@ def main() -> None:
         traj_path=traj_path,
         env_type=env_type,
         split=args.split,
-        max_turns=max_turns,
         rollout=rollout,
         num_samples=args.num_samples,
         meta_extra=contest_meta(args.adapter, selection, env, reasoning_effort, env_config),

@@ -5,11 +5,12 @@ from typing import Literal
 
 from transformers import TrainingArguments
 
-from src.args.validation import RangeValidatedConfig
+from src.args.mixins import DatasetNumProcArguments
+from src.args.validation import RangeValidatedConfig, present, require_finite, require_int
 
 
 @dataclass
-class ClassificationConfig(RangeValidatedConfig, TrainingArguments):
+class ClassificationConfig(DatasetNumProcArguments, RangeValidatedConfig, TrainingArguments):
     r"""TrainingArguments for [`ClassificationTrainer`]; per-field docs are in each field's ``help`` metadata."""
 
     max_length: int | None = field(
@@ -23,10 +24,6 @@ class ClassificationConfig(RangeValidatedConfig, TrainingArguments):
     disable_dropout: bool = field(
         default=True,
         metadata={"help": "Whether to disable dropout in the model."},
-    )
-    dataset_num_proc: int | None = field(
-        default=None,
-        metadata={"help": "Number of processes to use for processing the dataset."},
     )
     remove_unused_columns: bool = field(
         default=False,
@@ -116,8 +113,17 @@ class ClassificationConfig(RangeValidatedConfig, TrainingArguments):
 
     def _validate_ranges(self) -> None:
         super()._validate_ranges()
+        owner = type(self).__name__
+        require_finite(owner, focal_gamma=self.focal_gamma, label_smoothing=self.label_smoothing)
         if self.focal_gamma < 0:
             raise ValueError(f"focal_gamma must be >= 0, got {self.focal_gamma}")
+        # alpha_t = alpha*y + (1-alpha)*(1-y): outside [0, 1] one class's loss is negated.
+        if self.focal_alpha is not None:
+            require_finite(owner, focal_alpha=self.focal_alpha)
+            if not 0.0 <= self.focal_alpha <= 1.0:
+                raise ValueError(f"focal_alpha must be in [0, 1], got {self.focal_alpha}")
+        # A non-positive length is legal: it resolves to the model's context window at launch.
+        require_int(owner, **present(max_length=self.max_length))
         if not (0.0 <= self.label_smoothing < 1.0):
             raise ValueError(f"label_smoothing must be in [0, 1), got {self.label_smoothing}")
         if not (0.0 < self.multi_label_threshold < 1.0):

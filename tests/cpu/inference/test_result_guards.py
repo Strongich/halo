@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """An all-failed inference run must exit non-zero, on every script that writes a batch of results.
 
-The script here reached the end of a totally failed run and reported success:
+Unguarded, the script here would reach the end of a totally failed run and report success:
 
 * ``reward_model/rm_scoring.py`` cannot guard on ``if not rewards``: ``rewards`` is pre-seeded from
   the rows a previous run already wrote, so one resumed row makes the list truthy and the guard can
@@ -18,6 +18,7 @@ import types
 
 import pandas as pd
 import pytest
+from openai.types.chat import ChatCompletionMessage
 
 from scripts.inference.reward_model import _common as rm_common
 from scripts.inference.reward_model import rm_scoring
@@ -105,7 +106,7 @@ class _LiveClient:
 
     def __init__(self):
         async def _create(**_kwargs):
-            message = types.SimpleNamespace(model_dump=lambda exclude=None: {"role": "assistant", "content": "hi"})
+            message = ChatCompletionMessage(role="assistant", content="hi")
             return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
 
         self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=_create))

@@ -19,10 +19,12 @@ allowed-tools:
 # Distributed-training failure triage
 
 Diagnose a hang / OOM / NaN-loss / DeepEP fault / NCCL timeout. Every helper and
-env var below matches `src/diagnostics/debugging.py` **exactly** — do not
-invent flags. The full symptom→cause→fix table and helper-enable recipes are in
-**[playbook.md](playbook.md)**; read it before giving a verdict on anything
-non-trivial. User-facing guide: `agent-docs/reference/debugging.md`.
+env var below matches its owner **exactly** — `src/diagnostics/debugging.py` (consistency checks,
+py-spy capture), `src/diagnostics/profiling.py` (`cuda_memory_history`, `log_cuda_memory`),
+`src/env.py` (`DIST_NCCL_TIMEOUT_MINUTES`), `src/models/patches/attention.py`
+(`model_fa4_backward_nan_prone`) — do not invent flags. The full symptom→cause→fix table and
+helper-enable recipes are in **[playbook.md](playbook.md)**; read it before giving a verdict on
+anything non-trivial. User-facing guide: `agent-docs/reference/debugging.md`.
 
 **First, classify the symptom**, then follow the matching branch.
 
@@ -36,8 +38,8 @@ the others never reach.
 1. Dump every rank's stack — the rank *not* in a collective is the culprit:
    `python scripts/profiling/py_spy_diag.py dump` from a shell in the training container attaches
    py-spy to every torchrun rank. No launch-time setup, so it works on a job already hung; one file
-   per rank under `$TMPDIR/halo_diag_stacks`. The container must have `--cap-add=SYS_PTRACE`, else
-   py-spy fails with `Permission denied`.
+   per rank under `$TMPDIR/halo_diag_stacks`. Attaching needs `--cap-add=SYS_PTRACE` unless the
+   host's `kernel.yama.ptrace_scope` is 0, else py-spy fails with `Permission denied`.
 2. Suspect a shape/value divergence upstream of the stuck collective →
    `HALO_TP_CONSISTENCY_CHECK=1` + `assert_tensor_shape_consistent(t, group=..., label=...)`.
 3. An EP job that stops at startup with `ValueError: parallelism config failed on … First (rank 0):
@@ -46,8 +48,9 @@ the others never reach.
 
 ### OOM (CUDA out of memory)
 
-1. Find *what* holds memory: `profiler_record_memory_snapshot: true` (or `cuda_memory_history(...)`)
-   → `.pickle` onto <https://pytorch.org/memory_viz> for the per-allocation flame graph.
+1. Find *what* holds memory: `enable_torch_profiler: true` + `profiler_record_memory_snapshot: true`
+   (or `cuda_memory_history(...)`) → `.pickle` onto <https://pytorch.org/memory_viz> for the
+   per-allocation flame graph.
 2. Reduce levers, cheapest first: **gradient checkpointing** on; lower
    `per_device_train_batch_size`; lower `max_length` / seq len; switch to a
    parallelism that lowers DP (CP/TP). GC is refused for Zaya in every mode (cuDNN CCA fault)
@@ -73,8 +76,7 @@ the others never reach.
   (`ep_size > 2` with `nvlink_domain_size > ep_group_size`, e.g. ep4 on an 8-GPU domain): startup
   raises `ValueError: parallelism config failed on … First (rank 0): expert_parallel_size=N on a
   single M-GPU NVLink domain forms K concurrent >2-rank DeepEP dispatch groups …` before any model load
-  (`_validate_single_domain_multigroup_ep`, `parallelism_config.py`);
-  `EpIntrospectionMixin._setup_ep_gradient_checkpointing` re-checks a hand-built config. Run anyway,
+  (`_validate_single_domain_multigroup_ep`, `parallelism_config.py`), hand-built configs included. Run anyway,
   their combine barriers race FSDP2's DP-wide NCCL (`elastic` faults, `legacy` deadlocks). **Fix: use
   ep_size=2 or ep_size = nvlink_domain_size** (one group per domain). For finer sharding
   combine EP with **ETP** (`ep4+etp2`) — TP leaves `ep_group_size` untouched.

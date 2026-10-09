@@ -9,27 +9,31 @@ from typing import Any
 
 from src.environments.base import (
     ANSWER_KEY,
-    CUT_IN_TOOL_CALL_KEY,
+    CUT_TOOL_CALLS_KEY,
     EPISODE_ERROR_KEY,
     EPISODE_TOOL_BUDGETS_KEY,
+    LAST_TURN_KEY,
     TOOL_CALL_COUNTS_KEY,
     AsyncBaseEnvironment,
     BaseEnvironment,
     EpisodeGrade,
     Trajectory,
+    require_count,
     require_magnitudes,
 )
-from src.environments.sandbox.base import SANDBOX_FAULTS, SandboxAgentFault, SandboxInfraError
+from src.environments.sandbox.base import SandboxFault
 from src.environments.tools.definitions import (
+    TOOL_CALL_REFUSALS,
     NativeTool,
     NativeToolCall,
     NativeToolRegistry,
     NativeToolResult,
-    ToolArgumentError,
     ToolBudgetExhausted,
+    ToolDisabled,
+    refused_unrun,
 )
 from src.inference.response import ENGINE_CUT_FINISH_REASONS
-from src.rewards.matching import validate_answer
+from src.rewards.graders.matching import validate_answer
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +52,20 @@ def validate_tool_budgets(budgets: dict[str, int] | None, registry: NativeToolRe
             raise ValueError(
                 f"tool_budgets names {name!r}, which is not a registered tool: {sorted(registry.names())}"
             )
-        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
-            raise ValueError(f"tool_budgets[{name!r}] must be an int >= 0, got {cap!r}")
+        require_count(f"tool_budgets[{name!r}]", cap, 0)
         validated[name] = cap
     return validated
+
+
+def tool_accounting_info(budgets: dict[str, int]) -> dict[str, Any]:
+    """The per-episode tool counters a protocol seeds at reset, which the base's accounting books every
+    call into, and the episode's copy of the per-tool ``budgets``."""
+    return {
+        "total_tool_calls": 0,
+        "successful_tool_calls": 0,
+        TOOL_CALL_COUNTS_KEY: {},
+        EPISODE_TOOL_BUDGETS_KEY: dict(budgets),
+    }
 
 
 def admit_tool_call(
@@ -64,33 +78,31 @@ def admit_tool_call(
 ) -> dict[str, Any]:
     """Admit one call before it runs, under either protocol: bind its arguments (against the handler
     that will run), then spend one of the episode's calls on the tool. Refuses
-    (:class:`ToolArgumentError`, :class:`ToolBudgetExhausted`) without counting, so a call the handler
-    could never run does not consume the budget; runs synchronously before any await so concurrent
-    calls in one turn cannot both pass a one-call cap."""
+    (:class:`ToolArgumentError`, :class:`ToolBudgetExhausted`, :class:`ToolDisabled` under a cap of 0)
+    without counting, so a call the handler could never run does not consume the budget; runs synchronously
+    before any await so concurrent calls in one turn cannot both pass a one-call cap."""
     bound = tool.bind(arguments, for_async=for_async)
     cap = env._tool_budget_exhausted(trajectory, tool.name)
     if cap is not None:
-        raise ToolBudgetExhausted(tool.budget_exhausted_message(cap, env._tool_budgets_left(trajectory)))
+        raise (ToolDisabled if cap == 0 else ToolBudgetExhausted)(tool.budget_exhausted_message())
     env._count_tool_call(trajectory, tool.name)
     return bound
 
 
-def tool_call_outcome(
-    name: str, outcome: str | Exception
-) -> tuple[str, bool, SandboxInfraError | SandboxAgentFault | None]:
-    """A call's observation, whether it succeeded, and the sandbox fault it ended on, from what tool
-    ``name`` returned or raised (admission included), under either protocol.
+def tool_call_outcome(name: str, outcome: str | Exception) -> tuple[str, bool, SandboxFault | None]:
+    """A call's observation as plain text, whether it succeeded, and the sandbox fault it ended on, from
+    what tool ``name`` returned or raised (admission included), under either protocol.
 
-    A refusal (:class:`ToolBudgetExhausted`, :class:`ToolArgumentError`) is expected control flow,
-    logged without a traceback: an env with a 2-submission cap in a 15-turn episode refuses by design.
+    A refusal (:data:`TOOL_CALL_REFUSALS`) is expected control flow, logged without a traceback: an env
+    with a 2-submission cap in a 15-turn episode refuses by design.
     A sandbox fault is booked and logged by type in the accounting. Any other exception is a broken
     tool, logged with its traceback: the graded tools run here too, and a submit handler that dies on
     a malformed payload would otherwise grade 0 with nothing anywhere saying why.
     """
     if not isinstance(outcome, Exception):
-        return outcome, True, None
-    fault = outcome if isinstance(outcome, SANDBOX_FAULTS) else None
-    if isinstance(outcome, ToolBudgetExhausted | ToolArgumentError):
+        return str(outcome), True, None
+    fault = outcome if isinstance(outcome, SandboxFault) else None
+    if isinstance(outcome, TOOL_CALL_REFUSALS):
         logger.debug("Tool %r refused the call: %s", name, outcome)
     elif fault is None:
         logger.warning("Tool %r raised during execution", name, exc_info=outcome)
@@ -116,9 +128,22 @@ class NativeToolUseEnvironment(BaseEnvironment):
         "nothing was recorded. Make the call again, keeping your reasoning out of its arguments."
     )
     EMPTY_TURN_NUDGE = (
-        "Your previous turn ended without a tool call or an answer, so nothing was recorded. Make "
-        "your tool call now, or give your final answer, with the best solution you have."
+        "Your previous turn ended without a tool call or an answer (a call written inside your reasoning "
+        "is not run), so nothing was recorded. Make your tool call now, or give your final answer, with the "
+        "best solution you have."
     )
+    # The same facts for an instance whose registry holds no tool: a nudge asking for a tool call there
+    # is an instruction the model cannot follow, and the turn that answers it is trained.
+    TOOLLESS_LENGTH_CUTOFF_NUDGE = (
+        "Your previous turn was cut off before you gave your answer, so nothing was recorded. Give your "
+        "final answer now with the best solution you have."
+    )
+    TOOLLESS_EMPTY_TURN_NUDGE = (
+        "Your previous turn ended without an answer (text written inside your reasoning is not read), so "
+        "nothing was recorded. Give your final answer now with the best solution you have."
+    )
+    # A cut the driver flags as inside a call is told the same: there is no call to make again.
+    TOOLLESS_LENGTH_CUTOFF_IN_CALL_NUDGE = TOOLLESS_LENGTH_CUTOFF_NUDGE
 
     def __init__(
         self,
@@ -159,18 +184,24 @@ class NativeToolUseEnvironment(BaseEnvironment):
         """Get tools in OpenAI format for the rollout engine's generation request."""
         return self.registry.to_openai_tools()
 
+    def _unproductive_turn_nudge(self, nudge_attr: str) -> str | None:
+        """The protocol's nudge, or its ``TOOLLESS_`` counterpart when the registry holds no tool, so a
+        tool-less environment is never told to make a tool call."""
+        if not self.registry.names():
+            nudge_attr = f"TOOLLESS_{nudge_attr}"
+        return super()._unproductive_turn_nudge(nudge_attr)
+
+    def _final_answer(self, trajectory: Trajectory) -> str | None:
+        """The text answer that completed the episode, where one did."""
+        return trajectory.info.get("final_response") if trajectory.info.get("completed") else None
+
     def _reset_single(self, prompt: str | list[dict[str, str]], context: dict[str, Any] | None = None) -> Trajectory:
         """Initialize episode with task prompt."""
         return self._init_trajectory(
             prompt,
             context,
             system_prompt=self.system_prompt,
-            extra_info={
-                "total_tool_calls": 0,
-                "successful_tool_calls": 0,
-                TOOL_CALL_COUNTS_KEY: {},
-                EPISODE_TOOL_BUDGETS_KEY: dict(self.tool_budgets),
-            },
+            extra_info=tool_accounting_info(self.tool_budgets),
         )
 
     @staticmethod
@@ -180,9 +211,9 @@ class NativeToolUseEnvironment(BaseEnvironment):
         return _ACTIVE_TRAJECTORY.get()
 
     @staticmethod
-    def _coerce_tool_calls(tool_calls_data: list[Any]) -> list[NativeToolCall]:
-        """Normalize a context's raw tool-call payload (OpenAI dicts and/or already-parsed calls)."""
-        return [NativeToolCall.from_openai_format(tc) if isinstance(tc, dict) else tc for tc in tool_calls_data]
+    def _coerce_tool_calls(tool_calls_data: list[dict[str, Any]]) -> list[NativeToolCall]:
+        """Parse a context's raw OpenAI-format tool-call payload."""
+        return [NativeToolCall.from_openai_format(tc) for tc in tool_calls_data]
 
     def _unknown_tool_result(self, tc: NativeToolCall) -> NativeToolResult:
         """Build the error result for a tool call naming a tool not in the registry.
@@ -200,13 +231,16 @@ class NativeToolUseEnvironment(BaseEnvironment):
 
     def _result_from_call(self, tc: NativeToolCall, outcome: str | Exception) -> NativeToolResult:
         """Build a NativeToolResult from a success payload or caught exception (:func:`tool_call_outcome`,
-        observation truncated). A sandbox fault rides on the result, so the accounting books it by type."""
+        observation truncated). A refusal, at admission or by the handler, is marked ``refused`` (a disabled
+        tool's error is not one, :func:`refused_unrun`); a sandbox fault rides on the result, so the accounting
+        books it by type."""
         content, success, fault = tool_call_outcome(tc.name, outcome)
         return NativeToolResult(
             tool_call_id=tc.id,
             name=tc.name,
             content=self._truncate_observation(content),
             success=success,
+            refused=refused_unrun(outcome),
             sandbox_fault=fault,
         )
 
@@ -271,11 +305,11 @@ class NativeToolUseEnvironment(BaseEnvironment):
         for result in results:
             trajectory.add_message(result.to_message())
 
-        # Nothing this turn could execute: mark the assistant message so the trainer never rewards it
-        # (an episode that recovers must not reinforce the invented call). Read off ``unknown_tool``,
-        # never the error text — a tool whose backend answers "Tool not found: x" failed for real, and
-        # dropping that turn would hide a broken tool as a model mistake.
-        if results and all(r.unknown_tool for r in results):
+        # Nothing this turn could execute (an invented tool, a call refused unrun): mark the assistant message so
+        # the trainer never rewards it and the next turn retries on the recovery reserve. Read off the flags, never
+        # the reply text — a tool whose backend answers "Tool not found: x" failed for real, and dropping that turn
+        # would hide a broken tool as a model mistake.
+        if results and all(r.unknown_tool or r.refused for r in results):
             self._flag_calls_rejected(trajectory)
 
         # Executed calls (post per-turn cap), so this cannot disagree with total_tool_calls.
@@ -300,10 +334,12 @@ class NativeToolUseEnvironment(BaseEnvironment):
     ) -> tuple[Trajectory, float, bool, bool, dict[str, Any]]:
         """Handle a turn that called no tool, shared by the sync and async steps: an engine-cut turn
         and a turn that ended on nothing recover, anything else is the model's final text answer."""
+        last_turn = bool(ctx.get(LAST_TURN_KEY))
         if ctx.get("finish_reason") in ENGINE_CUT_FINISH_REASONS:
-            return self._handle_length_cutoff(trajectory, in_tool_call=bool(ctx.get(CUT_IN_TOOL_CALL_KEY)))
+            in_call = bool(ctx.get(CUT_TOOL_CALLS_KEY))
+            return self._handle_length_cutoff(trajectory, in_tool_call=in_call, last_turn=last_turn)
         if not action.strip():
-            return self._handle_empty_turn(trajectory)
+            return self._handle_empty_turn(trajectory, last_turn=last_turn)
         return self._finalize_text_response(trajectory, action)
 
     def _tool_use_shaping(self, trajectory: Trajectory) -> float:
@@ -340,7 +376,7 @@ class NativeToolUseEnvironment(BaseEnvironment):
         ctx = context or trajectory.info.get("context") or {}
 
         validator = ctx.get("validator")
-        if validator and callable(validator):
+        if callable(validator):
             return EpisodeGrade(1.0 if validator(trajectory) else 0.0)
 
         expected = ctx.get(ANSWER_KEY)

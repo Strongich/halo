@@ -39,6 +39,7 @@ import keyword
 import logging
 import math
 import os
+import re
 import sys
 from collections.abc import Callable
 from typing import NamedTuple
@@ -56,17 +57,20 @@ from src.checkpoint.format import (
     HF_STREAM_PART_PREFIX,
     WEIGHT_FILE_IGNORE_PATTERNS,
     copy_checkpoint_aux_files,
+    is_tie_reconcile_key,
 )
 from src.checkpoint.shard_writer import StageShardWriter
 from src.checkpoint.tool_io import (
+    header_numel,
     iter_checkpoint_shard_entries,
     preflight_resource_warning,
     reject_in_place_conversion,
     stored_tensor_nbytes,
-    stored_tensor_numel,
 )
 from src.log import configure_cli_logging
+from src.models.loading.config_levels import config_ties_word_embeddings
 from src.models.loading.dtype import DTYPE_BY_NAME
+from src.models.loading.model_preparation import concrete_model_class, resolve_auto_model_class
 from src.models.moe_balancing import is_balancing_state_key
 
 configure_cli_logging()
@@ -100,21 +104,14 @@ def _parse_model_spec(spec: str) -> tuple[str, float | None]:
     return spec, None
 
 
-def _weight_map(model_dir: str) -> dict[str, str]:
-    """Map every parameter name to the safetensors file holding it (single-file or sharded).
-
-    Keys come from the shards themselves rather than the index's ``weight_map``, so a checkpoint
-    whose index has drifted from its files still merges the tensors that are actually there.
-    """
-    return {key: shard for shard, _reader, key in iter_checkpoint_shard_entries(model_dir)}
-
-
 class _TensorReader:
     """Lazy per-key tensor reader over a checkpoint's safetensors, caching open file handles."""
 
     def __init__(self, model_dir: str):
         self.model_dir = model_dir
-        self.weight_map = _weight_map(model_dir)
+        # Keys come from the shards themselves rather than the index's ``weight_map``, so a checkpoint
+        # whose index has drifted from its files still merges the tensors that are actually there.
+        self.weight_map = {key: shard for shard, _reader, key in iter_checkpoint_shard_entries(model_dir)}
         self._handles: dict[str, object] = {}
 
     def keys(self) -> set[str]:
@@ -129,15 +126,14 @@ class _TensorReader:
 
     def numel(self, key: str) -> int:
         """Element count of ``key`` from the safetensors header alone — no tensor read."""
-        return stored_tensor_numel(self._handle(key), key)
+        return header_numel(self._handle(key).get_slice(key))
+
+    def shape(self, key: str) -> tuple[int, ...]:
+        """Shape of ``key`` from the safetensors header alone — no tensor read."""
+        return tuple(self._handle(key).get_slice(key).get_shape())
 
     def _handle(self, key: str):
-        # The RAM preflight sizes the reference key set (the base's, under task_arithmetic/ties)
-        # against model[0] ahead of the merge loop's own coverage check, so the refusal is raised
-        # here: a bare KeyError there names neither the model lacking the key nor why it was wanted.
-        path = self.weight_map.get(key)
-        if path is None:
-            raise KeyError(f"key {key!r} missing from {self.model_dir} (model mismatch)")
+        path = self.weight_map[key]
         handle = self._handles.get(path)
         if handle is None:
             handle = safe_open(path, framework="pt", device="cpu")
@@ -145,13 +141,84 @@ class _TensorReader:
         return handle
 
 
-def _reference_keys(method: str, readers: list[_TensorReader], base_reader: _TensorReader | None) -> list[str]:
+def _reference_keys(readers: list[_TensorReader], base_reader: _TensorReader | None) -> list[str]:
     """The key set to merge over. ``task_arithmetic``/``ties`` task vectors are relative to the base,
-    so iterate the base key set: iterating model[0] would drop any parameter present in the base (and
-    other models) but absent from model[0] (an untied ``lm_head.weight``, say), yielding an
-    incomplete, unloadable merged checkpoint. ``linear``/``slerp`` have no base, so use model[0]."""
-    source = base_reader if (method in ("task_arithmetic", "ties") and base_reader is not None) else readers[0]
-    return sorted(source.keys())
+    so iterate the BASE key set — iterating model[0] would silently drop any parameter present in the
+    base (and other models) but absent from model[0] (e.g. an untied ``lm_head.weight``), yielding an
+    incomplete, unloadable merged checkpoint. ``linear``/``slerp`` take no base (the knob gate
+    refuses one) → use model[0]."""
+    return sorted((base_reader if base_reader is not None else readers[0]).keys())
+
+
+def _excused_base_keys(
+    reference: list[str], readers: list[_TensorReader], config_source: str, *, trust_remote_code: bool
+) -> set[str]:
+    """The base keys no merged model stores and the shipped model never reads from a checkpoint.
+
+    Under ``task_arithmetic``/``ties`` the reference is the base's key set, and a Hub base stores
+    tensors its fine-tunes lack because their load rebuilt or dropped them. Judged against the config
+    the merge ships (``config_source``'s) and the class it loads through, two kinds qualify: the tied
+    head (:func:`_tied_head_key`), and keys the class drops at load
+    (``_keys_to_ignore_on_load_unexpected``: Qwen3.5/3.6's ``mtp.*``, GLM-4.7-Flash's
+    ``model.layers.47.*``), which every export of a fine-tune leaves out. The merge leaves them out too.
+    """
+    base_only = {key for key in reference if not any(key in reader.weight_map for reader in readers)}
+    if not base_only:
+        return set()
+    config = AutoConfig.from_pretrained(config_source, trust_remote_code=trust_remote_code)
+    model_class = concrete_model_class(resolve_auto_model_class(config), config)
+    patterns = getattr(model_class, "_keys_to_ignore_on_load_unexpected", None) or ()
+    # Matched as transformers matches them: searched anywhere in the key.
+    load_ignored = {key for key in base_only if any(re.search(pattern, key) for pattern in patterns)}
+    return load_ignored | _tied_head_key(reference, base_only, readers, config)
+
+
+def _tied_head_key(reference: list[str], base_only: set[str], readers: list[_TensorReader], config) -> set[str]:
+    """The tied half of the base's head/embedding pair when the merged models rebuild it, else nothing.
+
+    A save under ``tie_word_embeddings`` writes the embedding alone and transformers rebuilds the head
+    from it at load, while some Hub checkpoints store both halves. A base of that kind carries a head
+    none of its fine-tunes do, and that head is the merged embedding again rather than a missing
+    tensor, provided every merged model stores the other half and the shipped config ties the pair at
+    both of its levels: a text-only class reads the text sub-config's flag, a multimodal wrapper its
+    own. The pair is the one ``reconcile_tie_word_embeddings`` compares.
+    """
+    pair = [key for key in reference if is_tie_reconcile_key(key)]
+    tied_away = [key for key in pair if key in base_only]
+    kept = [key for key in pair if all(key in reader.weight_map for reader in readers)]
+    if len(pair) != 2 or len(tied_away) != 1 or len(kept) != 1:
+        return set()
+    if not (config_ties_word_embeddings(config) and getattr(config, "tie_word_embeddings", False)):
+        return set()
+    return set(tied_away)
+
+
+def _check_key_coverage(reference: set[str], contributors: list[_TensorReader], excused: set[str]) -> None:
+    """Refuse a contributor whose tensors do not match the merge's reference, before any output exists.
+
+    A reference key a contributor lacks has nothing to merge from it, and a key it carries beyond the
+    reference is never visited, so the merged checkpoint would silently drop it. A base key the
+    shipped model rebuilds or drops at load (``excused``) is neither. A shape that differs between
+    contributors has no merge either; read from the headers here rather than discovered mid-write.
+    """
+    for reader in contributors:
+        missing = sorted(reference - reader.keys())
+        extra = sorted(reader.keys() - reference - excused)
+        if missing or extra:
+            raise ValueError(
+                f"{reader.model_dir} does not carry the merge's reference key set (the base's under "
+                f"task_arithmetic/ties, else the first model's): it lacks {len(missing)} tensor(s) "
+                f"{missing[:5]}, which have nothing to merge from it, and carries {len(extra)} more "
+                f"{extra[:5]}, which the merged checkpoint would silently drop. A head saved untied "
+                f"(lm_head.weight present) in one model and tied in another differs this way; a base "
+                f"may store more than its fine-tunes only where the shipped config ties that head or "
+                f"its model class drops the keys at load (_keys_to_ignore_on_load_unexpected). Merge "
+                f"checkpoints of one parameter layout."
+            )
+    for key in sorted(reference):
+        shapes = {reader.model_dir: reader.shape(key) for reader in contributors}
+        if len(set(shapes.values())) > 1:
+            raise ValueError(f"shape mismatch for {key!r} across the merged checkpoints: {shapes}")
 
 
 # --- per-tensor merge ops (all compute in float32, caller casts the result) ---
@@ -345,24 +412,15 @@ def merge_models(
             reject_in_place_conversion(source, output_dir)
     readers = [_TensorReader(p) for p in paths]
     base_reader = _TensorReader(base_model) if base_model else None
+    contributors = [*readers, *([base_reader] if base_reader is not None else [])]
 
-    # Reference key set to merge over; every contributing model must then provide each key/shape.
-    ref_keys = _reference_keys(method, readers, base_reader)
-
-    # Symmetric coverage: the per-key loop raises on a reference key a model lacks, but an extra key
-    # is never visited. The realistic case is an untied head, since reconcile_tie_word_embeddings flips
-    # tie_word_embeddings only for the model whose lm_head diverged, so the merge would drop it.
-    reference = set(ref_keys)
-    for reader in [*readers, *([base_reader] if base_reader is not None else [])]:
-        extra = sorted(reader.keys() - reference)
-        if extra:
-            raise ValueError(
-                f"{reader.model_dir} carries {len(extra)} tensor(s) absent from the merge's reference "
-                f"key set, which would be silently dropped from the merged checkpoint: {extra[:5]}"
-                f"{' …' if len(extra) > 5 else ''}. The models do not share a parameter layout — a "
-                f"common cause is one being saved untied (lm_head.weight present) and another tied. "
-                f"Merge checkpoints with identical key sets."
-            )
+    # Reference key set to merge over, minus the base keys the shipped model rebuilds or drops at load;
+    # every contributor must then provide exactly these keys, at one shape.
+    aux_source = tokenizer_source or base_model or paths[0]
+    ref_keys = _reference_keys(readers, base_reader)
+    excused = _excused_base_keys(ref_keys, readers, aux_source, trust_remote_code=trust_remote_code)
+    ref_keys = [key for key in ref_keys if key not in excused]
+    _check_key_coverage(set(ref_keys), contributors, excused)
 
     # Created past the last input gate, so a refused merge leaves no directory behind.
     os.makedirs(output_dir, exist_ok=True)
@@ -379,7 +437,6 @@ def merge_models(
     # Peak RAM is the costliest key, every contributor's copy as stored plus the method's fp32 working
     # set over it (an integer pass-through key counted as if merged), and the writer's pending output
     # shard. On disk the artifact is one input's size.
-    contributors = [*readers, *([base_reader] if base_reader is not None else [])]
     working_bytes_per_element = spec.fp32_copies(len(readers)) * torch.float32.itemsize
     costliest_key_bytes = max(
         (
@@ -398,9 +455,6 @@ def merge_models(
 
     for i, key in enumerate(ref_keys):
         tensors = [r.get(key) for r in readers]
-        shapes = {tuple(x.shape) for x in tensors}
-        if len(shapes) != 1:
-            raise ValueError(f"shape mismatch for {key!r}: {shapes}")
 
         # Integer/bool entries are structure, not weights (DeepSeek-V4's int64 tid2eid, expert-count
         # buffers), and averaging them into bf16 would corrupt the model. Pass through when they
@@ -434,7 +488,7 @@ def merge_models(
     if verbose:
         logger.info(f"  wrote merged weights to {output_dir}")
     _copy_aux_files(
-        tokenizer_source or base_model or paths[0],
+        aux_source,
         output_dir,
         dtype,
         verbose,
@@ -518,7 +572,7 @@ def main() -> int:
     parser.add_argument("--base_model", default=None, help="Base for task_arithmetic / ties.")
     add_dtype_arg(parser)
     # Knob defaults stay None here and resolve in merge_models(), so a knob a method ignores raises;
-    # the help text renders each op signature's own default rather than a copy of it.
+    # the help text renders the method table's default rather than a copy of it.
     parser.add_argument(
         "--density",
         type=float,

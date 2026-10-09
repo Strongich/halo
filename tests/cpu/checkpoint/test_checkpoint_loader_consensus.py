@@ -10,12 +10,13 @@ tests exercise the single-process decision logic and, via monkeypatched consensu
 - The constructed-from-checkpoint skip and the TP+DP refusal never consume the checkpoint, so
   they must be decided BEFORE the per-rank read — at 100B+ scale that read is a host OOM, not a
   slowdown. The genuine pure-TP reload distributes each tensor into the live DTensor placements.
-- FSDP2 optimizer restore: a shard without its topology meta warm-restarts rather than loading
-  ungated. The terminal ``set_optimizer_state_dict`` outcome is pinned on a real two-rank group in
-  ``test_optimizer_restore_failure.py``.
+- FSDP2 optimizer restore: a shard without its topology meta is refused as torn rather than loaded
+  ungated or warm-restarted. The terminal ``set_optimizer_state_dict`` outcome is pinned on a real
+  two-rank group in ``test_optimizer_restore_failure.py``.
 """
 
 import os
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -23,17 +24,20 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from peft.utils import SAFETENSORS_WEIGHTS_NAME as ADAPTER_WEIGHTS_NAME
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
+from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
 import src.distributed.checkpoint.loader as loader_mod
 import src.distributed.checkpoint.optimizer as optimizer_mod
 import src.distributed.checkpoint.peft as peft_mod
+from src.checkpoint.format import ModuleLayoutView
 from src.distributed.checkpoint.context import CheckpointLoadContext
 from src.distributed.checkpoint.loader import CheckpointLoader
 from src.distributed.checkpoint.optimizer import OptimizerShardStore
 from src.distributed.checkpoint.peft import restore_adapters
+from tests.common.models import TINY_QWEN3_MOE_CONFIG
 
 
 class _Recorder:
@@ -153,7 +157,7 @@ def _dtensor_model():
 def _simulate_non_rank0(monkeypatch, decisions):
     """A non-zero rank's view: no local rank-0 work, rank 0's broadcast answers replayed in call
     order — (1) sharded-resume rejection, (2) readability probe, (3) constructed-from-checkpoint,
-    and on the genuine load (4) rank 0's matched key count."""
+    and on the genuine load (4) rank 0's on-disk and live-name key counts."""
     monkeypatch.setattr(loader_mod, "is_global_main_process", lambda: False)
     answers = iter(decisions)
     monkeypatch.setattr(loader_mod, "broadcast_from_rank0", lambda local: next(answers))
@@ -202,7 +206,7 @@ def test_tp_distributes_the_checkpoint_into_the_live_dtensor(tmp_path, single_ra
     trained weights instead of skipping."""
     model = _dtensor_model()
     save_file({"fc.weight": torch.ones(4, 4)}, os.path.join(tmp_path, "model.safetensors"))
-    _simulate_non_rank0(monkeypatch, decisions=[False, True, False, 1])
+    _simulate_non_rank0(monkeypatch, decisions=[False, True, False, (1, 1)])
     loader = CheckpointLoader(_ctx(model, is_tp_mode=True))
 
     loader.load_model(str(tmp_path), model)
@@ -229,12 +233,38 @@ def test_tp_plain_non_rank0_still_reads_for_the_genuine_load(tmp_path, monkeypat
     non-zero rank on the genuine load path must still read its node's copy."""
     model = _TinyModel()
     save_file({"fc.weight": torch.ones(4, 4)}, os.path.join(tmp_path, "model.safetensors"))
-    _simulate_non_rank0(monkeypatch, decisions=[False, True, False, 1])
+    _simulate_non_rank0(monkeypatch, decisions=[False, True, False, (1, 1)])
     loader = CheckpointLoader(_ctx(model, is_tp_mode=True))
 
     loader.load_model(str(tmp_path), model)
 
     assert torch.equal(model.fc.weight, torch.ones(4, 4))
+
+
+def test_a_node_copy_short_of_an_expert_is_refused_before_any_write(tmp_path, monkeypatch):
+    """One fused live tensor stands for every per-expert key of a layer, so a node copy that lost an
+    expert's tensors spells the same live names as rank 0's. The on-disk key count is what tells them
+    apart, and it must be agreed before the copy: past it, this rank alone would fail stacking the
+    short expert list while its peers wait at the trailing barrier."""
+    full, short = tmp_path / "full", tmp_path / "short"
+    torch.manual_seed(0)
+    Qwen3MoeForCausalLM(Qwen3MoeConfig(**{**TINY_QWEN3_MOE_CONFIG, "num_hidden_layers": 1})).save_pretrained(full)
+    model = Qwen3MoeForCausalLM.from_pretrained(full)
+    before = {name: param.detach().clone() for name, param in model.named_parameters()}
+    state = load_file(str(full / "model.safetensors"))
+    lost = next(key for key in state if ".experts.1.up_proj." in key)
+    short.mkdir()
+    save_file({key: tensor for key, tensor in state.items() if key != lost}, str(short / "model.safetensors"))
+    shutil.copy(full / "config.json", short)
+    # Rank 0 reads the whole copy: every disk key, and the same live names the short copy maps to.
+    rank0_counts = (len(state), len(ModuleLayoutView(model, state, state.get).keys))
+    _simulate_non_rank0(monkeypatch, decisions=[False, True, False, rank0_counts])
+
+    with pytest.raises(RuntimeError, match="per-node copy is incomplete"):
+        CheckpointLoader(_ctx(model, is_tp_mode=True)).load_model(str(short), model)
+
+    for name, param in model.named_parameters():
+        assert torch.equal(param, before[name]), f"{name}: a refused reload must not half-apply the checkpoint"
 
 
 def test_tp_hand_sliced_param_takes_its_rank_slice(tmp_path):
@@ -333,13 +363,14 @@ def test_fsdp2_resume_with_matching_keys_reaches_the_load(tmp_path, monkeypatch)
     assert set(applied.calls[0][0][1]) == {"fc.weight"}
 
 
-def test_optimizer_shards_without_meta_warm_restart(tmp_path, monkeypatch):
+def test_optimizer_shards_without_meta_are_refused_as_torn(tmp_path, monkeypatch):
     """A shard with no ``optimizer_meta.pt`` cannot be gated — neither the rank-count nor the
-    fingerprint check has anything to compare — so it must warm-restart, not load ungated.
+    fingerprint check has anything to compare — and it is not a weights-only checkpoint either.
 
-    Reachable two ways: a kill in the window between the shard save's write and its
-    meta write, and a user who follows "delete every optimizer_shard_*.pt AND optimizer_meta.pt" by
-    halves. Loading ungated silently maps another topology's moments onto this run's params.
+    Reachable two ways: a kill in the window between the shard save's write and its meta write, and
+    a user who follows "delete every optimizer_shard_*.pt AND optimizer_meta.pt" by halves. Loading
+    ungated silently maps another topology's moments onto this run's params; warm-restarting resumes
+    an interrupted save as if it were complete. Both are refused unless the run opted in.
     """
     model = _TinyModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -350,10 +381,16 @@ def test_optimizer_shards_without_meta_warm_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(optimizer_mod, "set_optimizer_state_dict", restore)
     monkeypatch.setattr(OptimizerShardStore, "_warm_restart", lambda self, ckpt, msg: warm_restarts(ckpt, msg))
 
-    OptimizerShardStore(_ctx(model, optimizer, fsdp_wrapped=True)).load(str(tmp_path))
+    with pytest.raises(RuntimeError, match="optimizer_meta.pt is missing beside the per-rank optimizer shards"):
+        OptimizerShardStore(_ctx(model, optimizer, fsdp_wrapped=True)).load(str(tmp_path))
+    assert restore.calls == [], "ungated shards were restored"
+    assert warm_restarts.calls == [], "an interrupted save was warm-restarted as if complete"
 
-    assert len(restore.calls) == 0, "ungated shards were restored"
-    assert len(warm_restarts.calls) == 1
+    opted_in = _ctx(model, optimizer, fsdp_wrapped=True)
+    opted_in.allow_optimizer_warm_restart = True
+    OptimizerShardStore(opted_in).load(str(tmp_path))
+    assert restore.calls == [], "ungated shards were restored under the opt-in"
+    assert len(warm_restarts.calls) == 1, "the opt-in must take the warm restart"
 
 
 def test_a_non_sharded_resume_refuses_per_rank_optimizer_shards(tmp_path):
@@ -403,7 +440,8 @@ def test_a_meta_write_failure_defers_to_the_collective(tmp_path, monkeypatch):
     real_save = torch.save
 
     def failing_meta_save(obj, f, *args, **kwargs):
-        if str(f).endswith("optimizer_meta.pt"):
+        # The meta is staged beside its final name, so match the name wherever it sits.
+        if "optimizer_meta.pt" in os.path.basename(str(f)):
             raise OSError("No space left on device")
         return real_save(obj, f, *args, **kwargs)
 
@@ -416,6 +454,9 @@ def test_a_meta_write_failure_defers_to_the_collective(tmp_path, monkeypatch):
         loader.save(str(tmp_path))
 
     assert os.path.exists(os.path.join(tmp_path, "optimizer_shard_00000.pt")), "the shard write itself succeeded"
+    assert not [name for name in os.listdir(tmp_path) if "optimizer_meta" in name], (
+        "a failed meta write left a file that could vouch for the shards"
+    )
 
 
 def _scheduler(model):

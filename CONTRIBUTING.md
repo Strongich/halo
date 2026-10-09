@@ -58,6 +58,12 @@ Once your PR path is approved, the normal bar applies (full detail in
 - **Tests ship with behavior — and must not be slop.** A test must *fail when the behavior breaks*; no
   tautologies, smoke-only "didn't raise" checks, vacuous `assert x is not None`, or mock-the-thing-under-test.
   See the anti-slop test guide in [`agent-docs/contributing/README.md`](agent-docs/contributing/README.md).
+- **Follow the test conventions.** A CPU test ends in `raise SystemExit(pytest.main([__file__, "-v"]))`
+  and a GPU test runs under `gpu_test_main` (`tests/common/harness.py`); a CPU test never re-declares
+  its `cpu` marker in `pytestmark` (the marker comes from its path), neither edits `sys.path`, and a
+  CPU test never imports a GPU script (put a shared fixture in `tests/common/`).
+  `tests/cpu/conventions/` fails the suite on a violation. Never hardcode
+  `--master_port`; the launcher picks a free one.
 - **Proof of value.** No-op/refactor → bitwise-identical loss (fixed seed); behavior change → an e2e
   test; perf → before/after tokens/s/GPU + peak memory. The PR template has a checkbox per case.
 - **Keep it focused.** A diff over **~2,000 lines** is hard to review and will be deferred — split it.

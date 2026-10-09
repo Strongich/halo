@@ -45,6 +45,18 @@ def configure_root_logging() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def info_logger(name: str) -> logging.Logger:
+    """The module logger ``name`` with its own level at INFO, for a module whose INFO records matter.
+
+    :func:`configure_root_logging` pins the root to WARNING, so a plain child logger drops every INFO
+    record. Plain logging rather than accelerate's adapter: entry points that initialize no
+    accelerate state (the S3 CLI, ``scripts/inference/*``) reach these modules too.
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    return logger
+
+
 def configure_cli_logging(verbose: bool = False) -> None:
     """Set the root logger level for a standalone ``scripts/`` entry point.
 
@@ -65,7 +77,6 @@ def warn_once(
     key: Hashable,
     message: str,
     *args: Any,
-    exc_info: bool = False,
 ) -> bool:
     """Log ``message`` at WARNING the first time ``key`` is seen, and return whether it did.
 
@@ -75,5 +86,5 @@ def warn_once(
     if key in seen:
         return False
     seen.add(key)
-    logger.warning(message, *args, exc_info=exc_info)
+    logger.warning(message, *args)
     return True

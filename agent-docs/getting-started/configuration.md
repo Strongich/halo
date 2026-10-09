@@ -10,7 +10,7 @@ python scripts/training/sft.py examples/sft/qwen3/qwen3-4b-ultrachat.yaml
 
 `H4ArgumentParser` (`src/training/parser.py`) extends `HfArgumentParser` with:
 
-- **Toolkit defaults**, applied unless explicitly set in the YAML or on the CLI: `use_liger_kernel: true`, `bf16: true`, `logging_nan_inf_filter: false`. The `bf16` default yields to an explicitly-enabled `fp16`, and `mixed_precision` is re-derived after defaults and CLI overrides so it always matches the final flags.
+- **Toolkit defaults**, applied unless explicitly set in the YAML or on the CLI: `use_liger_kernel: true`, `bf16: true`, `logging_nan_inf_filter: false`. Each is a value the YAML did not write, handed to every config declaring the field before it is built, so `TrainingArguments` derives `mixed_precision` from it. The `bf16` default yields to an explicitly-enabled `fp16`.
 
     Upstream's `logging_nan_inf_filter: true` reads a device scalar back to the host per micro-batch and logs the running average in place of a NaN loss: a per-step sync plus a hidden divergence.
 
@@ -28,25 +28,33 @@ must be in --key=value form".
 
 An override matching no field on any of the script's config dataclasses fails loudly, as does an
 unknown YAML key. `--field=None`, `--field=null` and `--field=none` all clear any Optional field
-instead of setting the literal string — including container unions like
-`report_to: None | str | list[str]`, the standard way to silence logging on a smoke run. Two
-carve-outs: a `Literal` whose choices include the string `"none"` gets the string
-(`--moe_balancing=none`), and an optional bool refuses the spelling outright (`--bf16=none` raises —
-clearing a precision flag silently is exactly the failure the parser exists to prevent).
+instead of setting the literal string, container unions included. Three carve-outs: a `Literal`
+whose choices include the string `"none"` gets the string (`--moe_balancing=none`); a field whose
+default spells "no value" as a string of its own gets that string — `--report_to=none` reaches
+transformers as `"none"`, no integrations, the standard way to silence logging on a smoke run, where
+`None` would come out of its `__post_init__` as `[None]`, which the Trainer refuses; and an optional
+bool refuses the spelling outright (`--bf16=none` raises — clearing a precision flag silently is
+exactly the failure the parser exists to prevent).
 
 Setting a value on a field with no confident string cast — dict-typed fields, lists of containers
-(`rollout_server_configs: list[dict]`), and unions with a container member (`--report_to=wandb`) —
-still requires the YAML.
+(`rollout_server_configs: list[dict]`), and unions with a container member (`dataset: str | list[str]`,
+`--report_to=wandb`) — still requires the YAML.
 
-Overrides are applied with `setattr`, so `__post_init__` does not re-run. Configs carrying numeric or
-cross-field guards inherit `RangeValidatedConfig` (`src/args/validation.py`) and put those guards in
-`_validate_ranges()`; the parser re-runs them through `__post_override__` after applying overrides,
-so a CLI value is held to exactly the bounds a YAML value is.
+Each override is cast to its field's type and merged over the YAML, and every config dataclass is
+built once from the merged values: each `__post_init__` — transformers', TRL's and the toolkit's —
+derives its state from, and validates, the final configuration. `--gradient_accumulation_steps=1`
+over a YAML's `8` therefore also re-derives GRPO's `steps_per_generation` and
+`generation_batch_size`, and a CLI value meets exactly the guards a YAML value does.
 
 ```bash
 python scripts/training/sft.py examples/sft/qwen3/qwen3-4b-ultrachat.yaml \
     --learning_rate=0.00001 --num_train_epochs=2 --output_dir=checkpoints/experiment-v2
 ```
+
+Without a YAML, the whole config is flags parsed by argparse: `--key value` works and an unknown flag
+is a usage error. Each flag reaches every config dataclass that declares it, as a YAML key does
+(`pad_token` sits on the script args and on TRL's config), and an unset field keeps each dataclass's
+own default.
 
 ## Liger kernels
 
@@ -61,7 +69,7 @@ python scripts/training/sft.py examples/sft/qwen3/qwen3-4b-ultrachat.yaml \
 - **Unwrapped MoE experts** — `swiglu` off, even when requested, where Halo does not wrap the routed experts (`ep_size: 1` with `use_grouped_gemm: false`, or a family with no EP layer class) and upstream liger-kernel holds the flag, which its MoE appliers use to install `LigerExperts` (input gradient wrong on Blackwell in the pinned release). The flag goes whole, so upstream's dense, shared-expert and vision SwiGLU on such a model run eager too ([Routed experts](../optimization/liger-kernels.md#routed-experts)).
 
 - **TP** (`tp_size > 1`) — `cross_entropy` and `fused_linear_cross_entropy` off; the `lm_head` logits are DTensor-sharded across the vocab dim, so a fused softmax would see a partial vocab.
-- **CP or PP** (`cp_size > 1` or `pp_size > 1`; PP is [not yet available in this release](../parallelism/pipeline-parallelism.md)) — same two off: the CP wrapper or the last pipeline stage computes the loss outside the model's forward, so the fused path never fires and its memory saving does not exist.
+- **CP** (`cp_size > 1`) — same two off: the CP wrapper computes the loss outside the model's forward, so the fused path never fires and its memory saving does not exist.
 
 `fused_linear_cross_entropy` is otherwise opt-in, defaulting on only for DeepSeek-V4, GLM-4 MoE Lite, and Zaya. Override individual kernels with `liger_kernel_config`:
 
@@ -188,10 +196,10 @@ Start with the gradop config; if OOM, try the full one. A hand-written accelerat
 |---|---|---|---|
 | `adamw_torch_fused` | PyTorch fused AdamW | 12 B over fp32 params (`bf16: false`) | `bf16: false` runs |
 | (auto with `bf16: true`) | AdamWBF16 (stochastic rounding) | 6 B | The default under `bf16: true` |
-| `muon` | Muon (Newton-Schulz) | ~4 B on 2D params | Faster convergence on matrix params |
+| `muon` | Muon (Newton-Schulz) | ~4 B on 2D params | Orthogonalized updates on matrix params |
 | `flash_adamw` | FlashAdamW (quantized states) | ~5 B | Maximum memory savings, drop-in AdamW |
 
-AdamWBF16 replaces `adamw_torch_fused`/`adamw_torch` automatically when `bf16: true`, except under accelerate-managed DDP. `bf16_optimizer` (default `null` = that auto rule) overrides it either way: `true` is the opt-in under DDP, `false` runs the stock AdamW over the params as loaded (bf16 masters with round-to-nearest under `bf16: true`, not fp32 — fp32 masters come from `fp32_non_ep_params` (non-expert params) and `fp32_experts` (EP experts), or `bf16: false`). The stock AdamW is refused where plain-tensor experts sit beside FSDP2 DTensors (any `ep_group_size > 1`, or EP-wrapped experts at `ep_size: 1` with `fsdp_shard_ep1_experts: false`), unless `fp32_non_ep_params` is set, which routes to a per-tensor-type grouped AdamW with fp32 masters on the non-expert params only. `true` alongside `optim: muon` or `flash_adamw` raises — both name an optimizer, and one would silently win. FlashAdamW ships in both training images; on a bare host install the `flash-optimizers` extra (`uv pip install -e ".[flash-optimizers]"`). See [BF16 Optimizer](../optimization/bf16-optimizer.md#compatibility), [Muon](../optimization/muon-optimizer.md), [FlashAdamW](../optimization/flash-adamw.md).
+AdamWBF16 replaces `adamw_torch_fused`/`adamw_torch` automatically when `bf16: true`, except under accelerate-managed DDP. `bf16_optimizer` (default `null` = that auto rule) overrides it either way: `true` is the opt-in under DDP, `false` runs the stock AdamW over the params as loaded (bf16 masters with round-to-nearest under `bf16: true`, not fp32 — fp32 masters come from `fp32_non_ep_params` (non-expert params), `fp32_router` and `fp32_experts` (EP routers and experts), or `bf16: false`). The stock AdamW is refused where plain-tensor experts sit beside FSDP2 DTensors (any `ep_group_size > 1`, or EP-wrapped experts at `ep_size: 1` with `fsdp_shard_ep1_experts: false`), unless `fp32_non_ep_params` is set, which routes to a per-tensor-type grouped AdamW with fp32 masters on the non-expert params only. `true` alongside `optim: muon` or `flash_adamw` raises — both name an optimizer, and one would silently win. FlashAdamW ships in both training images; on a bare host install the `flash-optimizers` extra (`uv pip install -e ".[flash-optimizers]"`). See [BF16 Optimizer](../optimization/bf16-optimizer.md#compatibility), [Muon](../optimization/muon-optimizer.md), [FlashAdamW](../optimization/flash-adamw.md).
 
 ## Low-precision compute
 
@@ -217,7 +225,7 @@ CLI flags under `torchrun` (also settable in YAML):
 | `--ep_lazy_loading` | Lazy safetensors loading for EP paths (default `true`); each rank reads only its expert slice |
 | `--max_concurrent_loading` | Ranks loading per node. Left unset it adapts to the node — `min(4, max(1, local_world_size // 2))`, so 4 on an 8-GPU node and 2 on a 4-GPU tray; any explicit value is used verbatim (`1` for CPU-RAM-constrained hosts, `0` for all-parallel) |
 
-EP is orthogonal to data parallelism; only TP, CP, and ETP reduce it — `data_parallel_size = (world_size / pp_size) / max(tp_size, cp_size, expert_tp_size)`. See [Parallelism](../parallelism/README.md) for supported and rejected combinations.
+EP is orthogonal to data parallelism; only TP, CP, and ETP reduce it — `data_parallel_size = world_size / max(tp_size, cp_size, expert_tp_size)`. See [Parallelism](../parallelism/README.md) for supported and rejected combinations.
 
 ## Environment variables
 

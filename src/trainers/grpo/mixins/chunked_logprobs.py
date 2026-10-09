@@ -26,8 +26,8 @@ from src.distributed.expert_parallel.dispatcher import bump_forward_generation
 from src.distributed.runtime import materialize_dtensor, rank_consensus
 from src.distributed.tensor_parallel.state_dict import tp_plan_shards_params
 from src.models.head_transform import IDENTITY_HEAD_TRANSFORM, HeadTransform, resolve_head_transform
-from src.models.loading.config_levels import text_config
 from src.models.modality import config_declares_multimodality
+from src.models.patches.attention import effective_attn_implementation
 from src.models.structure import base_transformers_model
 from src.trainers.mixins.validation import evaluation_runs
 
@@ -112,11 +112,7 @@ def dense_row_spans(attention_mask: torch.Tensor) -> list[tuple[int, int]]:
 def uses_fa4(model) -> bool:
     """Whether ``model`` runs FlashAttention-4. The chunked forward then trims to a dense per-row call
     for exact RoPE positions and rank-uniform collective counts (see ``_dense_last_hidden_state``)."""
-    config = getattr(model, "config", None)
-    if config is None:
-        return False
-    impl = getattr(text_config(config), "_attn_implementation", None) or getattr(config, "_attn_implementation", None)
-    return impl == "flash_attention_4"
+    return effective_attn_implementation(getattr(model, "config", None)) == "flash_attention_4"
 
 
 def rows_forward_densely(model, batch_size: int) -> bool:
@@ -237,14 +233,13 @@ def _selective_logprob_entropy_forward(
     n_rows, _ = hidden.shape
     vocab_size, _ = weight.shape
     inv_t = 1.0 / temperature
-    seq_chunk_size = _SEQ_CHUNK
 
     logprobs = torch.empty((n_rows,), device=device, dtype=torch.float32)
     log_z = torch.empty((n_rows,), device=device, dtype=torch.float32)
     entropy = torch.zeros((n_rows,), device=device, dtype=torch.float32)
 
-    for seq_start in range(0, n_rows, seq_chunk_size):
-        seq_end = min(seq_start + seq_chunk_size, n_rows)
+    for seq_start in range(0, n_rows, _SEQ_CHUNK):
+        seq_end = min(seq_start + _SEQ_CHUNK, n_rows)
         n_chunk = seq_end - seq_start
         hidden_chunk = hidden[seq_start:seq_end]
         targets_chunk = targets[seq_start:seq_end]
@@ -423,7 +418,7 @@ class ChunkedLogprobsCore:
     """Trainer-agnostic chunked-logprob machinery: the batched implementation, the FA4 per-row dense
     forward, and the FSDP2-safe redirection. Subclasses provide ``_get_last_hidden_state`` (the
     backbone forward), ``self.temperature`` and ``self.accelerator``; the construction-time head-path
-    check also reads ``self.model``, ``self._use_chunked_grpo_logprobs`` and ``self._pp_runtime``.
+    check also reads ``self.model`` and ``self._use_chunked_grpo_logprobs``.
     """
 
     def _check_full_logits_fit(self, width: LogitsWidth | None) -> None:
@@ -514,11 +509,7 @@ class ChunkedLogprobsCore:
         if labels.shape != input_ids.shape:
             raise ValueError("CP GRPO scoring needs labels aligned with the full input row")
 
-        lm_head = unwrapped_model.get_output_embeddings()
-        self._assert_output_embeddings_unadapted(unwrapped_model, lm_head)
-        weight = materialize_dtensor(lm_head.weight)
-        bias = materialize_dtensor(getattr(lm_head, "bias", None))
-        head_transform = self._head_transform(unwrapped_model)
+        weight, bias, head_transform = self._scoring_head(unwrapped_model)
 
         # One CP-divisible backbone forward per loss graph also keeps the legacy attention's
         # full-position hooks stable through gradient-checkpoint recomputation.
@@ -530,6 +521,15 @@ class ChunkedLogprobsCore:
             shifted_hidden, weight, shifted_labels, bias, self.temperature, head_transform
         )
         return logps, shifted_labels
+
+    def _scoring_head(self, unwrapped_model) -> tuple[torch.Tensor, torch.Tensor | None, HeadTransform]:
+        """The output embedding's weight and bias, materialized off any DTensor, and the verified head
+        transform: what every chunked sweep scores with."""
+        lm_head = unwrapped_model.get_output_embeddings()
+        self._assert_output_embeddings_unadapted(unwrapped_model, lm_head)
+        weight = materialize_dtensor(lm_head.weight)
+        bias = materialize_dtensor(getattr(lm_head, "bias", None))
+        return weight, bias, self._head_transform(unwrapped_model)
 
     def _assert_output_embeddings_unadapted(self, unwrapped_model, lm_head) -> None:
         """Reject a PEFT tuner on the output embedding rather than ignore its delta.
@@ -567,19 +567,16 @@ class ChunkedLogprobsCore:
         """Verify the policy's head path at construction when the chunked sweep will score it, so a
         family it cannot reproduce is refused before the first rollout rather than at the first loss
         forward. Pure local computation on the class and config: every rank reaches the same verdict.
-        Under PP the sweep never runs; the last stage verifies the same contract when it is built."""
-        if self._use_chunked_grpo_logprobs and self._pp_runtime is None:
+        PP never gets here with the sweep on (offline GRPO refuses ``use_chunked_grpo_logprobs`` under
+        PP); its last stage verifies the same contract when it is built."""
+        if self._use_chunked_grpo_logprobs:
             self._head_transform(self.accelerator.unwrap_model(self.model))
 
     def _chunked_logps_impl(
         self, unwrapped_model, input_ids, attention_mask, logits_to_keep, batch_size, compute_entropy
     ):
         batch_size = batch_size or input_ids.size(0)
-        lm_head = unwrapped_model.get_output_embeddings()
-        self._assert_output_embeddings_unadapted(unwrapped_model, lm_head)
-        weight = materialize_dtensor(lm_head.weight)
-        bias = materialize_dtensor(getattr(lm_head, "bias", None))
-        head_transform = self._head_transform(unwrapped_model)
+        weight, bias, head_transform = self._scoring_head(unwrapped_model)
         dense = rows_forward_densely(unwrapped_model, batch_size)
 
         def sweep(hidden, completion_ids):

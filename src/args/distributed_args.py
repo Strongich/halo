@@ -1,18 +1,20 @@
 """Combined distributed training arguments for EP, CP, and TP parallelism."""
 
 from dataclasses import dataclass, field
-from typing import Literal
 
+from src.args.validation import RangeValidatedConfig, present, require_int
 from src.checkpoint.format import DEFAULT_MAX_SHARD_SIZE
+from src.distributed.parallelism_config import EPBufferBackend, EPScope, LowpPrecision, PPSchedule
 
 
 @dataclass
-class DistributedArguments:
+class DistributedArguments(RangeValidatedConfig):
     """
     Combined arguments for all parallelism modes: EP, CP, and TP.
 
-    ParallelismConfig validates combinations and raises on incompatible ones
-    (e.g. TP+CP). See agent-docs/parallelism/ for the support matrix.
+    ParallelismConfig validates ranges and combinations and raises on incompatible ones
+    (e.g. TP+CP); this class refuses only a value that is not an int at all. See
+    agent-docs/parallelism/ for the support matrix.
     """
 
     expert_parallel_size: int = field(
@@ -27,7 +29,7 @@ class DistributedArguments:
         },
     )
 
-    ep_scope: Literal["auto", "node", "global"] = field(
+    ep_scope: EPScope = field(
         default="auto",
         metadata={
             "help": "EP scope for multi-node training. "
@@ -73,9 +75,10 @@ class DistributedArguments:
         default=False,
         metadata={
             "help": "Resume only. When restoring per-rank optimizer shards that match this run's "
-            "topology fails on any rank (an unreadable shard, a CUDA OOM while applying it), continue "
-            "with a freshly initialized optimizer (weights, step and LR schedule still resume) instead "
-            "of raising on every rank. Off by default: a warm restart resets the optimizer moments "
+            "topology fails on any rank (an unreadable shard, a CUDA OOM while applying it), or the "
+            "checkpoint holds the optimizer half of an interrupted save, continue with a freshly "
+            "initialized optimizer (weights, step and LR schedule still resume) instead of raising on "
+            "every rank. Off by default: a warm restart resets the optimizer moments "
             "mid-run. A changed parallelism layout and a checkpoint saved without optimizer state are "
             "not failures; see agent-docs/reference/checkpoints.md for every resume outcome."
         },
@@ -173,7 +176,7 @@ class DistributedArguments:
         },
     )
 
-    lowp_precision: Literal["bf16", "fp8", "fp4", "mxfp4"] = field(
+    lowp_precision: LowpPrecision = field(
         default="bf16",
         metadata={
             "help": "Low-precision matmul compute (mixed precision: bf16/fp32 master weights with "
@@ -239,7 +242,7 @@ class DistributedArguments:
         },
     )
 
-    ep_buffer_backend: Literal["auto", "elastic", "legacy"] = field(
+    ep_buffer_backend: EPBufferBackend = field(
         default="auto",
         metadata={
             "help": "DeepEP transport backend for the EP all-to-all. 'auto' (default) == 'elastic': "
@@ -316,7 +319,7 @@ class DistributedArguments:
         },
     )
 
-    pipeline_schedule: Literal["1f1b", "gpipe"] = field(
+    pipeline_schedule: PPSchedule = field(
         default="1f1b",
         metadata={
             "help": "PP-only, and PP is not yet available in this release: at pipeline_parallel_size=1 "
@@ -485,3 +488,25 @@ class DistributedArguments:
             "Safe to leave off when the model is loaded in bf16 — forward/backward run in bf16 anyway."
         },
     )
+
+    def __post_init__(self):
+        self._validate_ranges()
+
+    def _validate_ranges(self) -> None:
+        super()._validate_ranges()
+        # ParallelismConfig's range checks read a bool as 0 or 1 and pass a fraction into the rank math.
+        require_int(
+            type(self).__name__,
+            **present(
+                expert_parallel_size=self.expert_parallel_size,
+                expert_tensor_parallel_size=self.expert_tensor_parallel_size,
+                context_parallel_size=self.context_parallel_size,
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                pipeline_microbatches=self.pipeline_microbatches,
+                nvlink_domain_size=self.nvlink_domain_size,
+                lowp_keep_first_blocks=self.lowp_keep_first_blocks,
+                lowp_keep_last_blocks=self.lowp_keep_last_blocks,
+                max_concurrent_loading=self.max_concurrent_loading,
+            ),
+        )

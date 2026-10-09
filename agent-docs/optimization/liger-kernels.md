@@ -46,7 +46,9 @@ The Bailing families are `trust_remote_code`, so their modeling module does not 
 Their patch is registered on the shared hook over `transformers.dynamic_module_utils.get_class_in_module`
 (`src/models/patches/remote_code_hooks.py`, wrapped once for every registrant), the funnel every remote
 class loads through, and fires on the module defining the declared classes
-(`src/kernels/liger/remote_modules.py`).
+(`src/kernels/liger/remote_modules.py`). Laguna is native to transformers, but its released repos also ship
+their own modeling file through `auto_map`, which the shipped recipes load; its spec names that file's
+classes too, so either load takes the same swaps.
 
 Ling 3.0's KDA layers already run `fla`'s fused gated norm, short convolutions and delta-rule recurrence;
 only the attention/MoE norms and the GLU MLPs are left to fuse.
@@ -60,8 +62,8 @@ advertise is inert here. The spec's `gated_rms_norm` role therefore binds `flash
 `FusedRMSNormGated`, already a hard dependency for this roster's delta-rule and short-convolution kernels.
 It rides the same `rms_norm` flag, so one knob turns both norm kernels off.
 
-Measured on a B300 over `[1, 8192, 32, 128]` (262144 rows × 128) forward and backward (2026-10-03, commit
-0bc3a22a5, Blackwell image): **2.7–6.3×** (1.79–1.98 ms eager → 0.32–0.66 ms fused).
+Measured on a B300 over `[1, 8192, 32, 128]` (262144 rows × 128) forward and backward (Blackwell
+image): **2.7–6.3×** (1.79–1.98 ms eager → 0.32–0.66 ms fused).
 
 The kernel keeps the reduction, the weight multiply and the gate in fp32, as GLM-5's module does. The Qwen
 modules round the normalized activation to storage dtype *before* the weight multiply, so the fused path is
@@ -226,17 +228,15 @@ resolved applier's signature does not accept is dropped, with a warning naming i
 | `rms_norm` | On | Fused RMS normalization. Also covers a family's gated (GDN) norm where its spec declares one — one knob, both norm kernels |
 | `swiglu` | On | Auto-off where the applier's own default is `False` (GptOss, whose upstream applier has no SwiGLU patch block; Qwen3-VL), and where an **upstream** applier's expert-FFN swap is replaced by an EP wrapper, which runs Halo's own fused GLU combine instead. A toolkit spec patches the dense and shared-expert MLPs, which survive EP — see below. Forced off, even when requested, wherever upstream's swap would reach [routed experts Halo does not wrap](#routed-experts) |
 | `geglu` | On | Gemma 4. Served by the toolkit's spec on the always-on dense `Gemma4TextMLP`, which survives the EP wrapper, so it is **not** forced off under EP |
-| `cross_entropy` | On | Keeps logits for metrics. Always the toolkit's scoped patch. Force-off under TP, CP and PP, and defaulted off when the config explicitly requests `fused_linear_cross_entropy` (the two are mutually exclusive; setting both explicitly raises) |
-| `fused_linear_cross_entropy` | **Off** (On for Zaya, DeepSeek-V4 and GLM-4.7-Flash) | Fuses lm_head + CE, no logits materialization. Mutually exclusive with `cross_entropy`. Force-off under TP, CP and PP, and [under a multimodal wrapper](#fused-loss-under-a-multimodal-wrapper) |
+| `cross_entropy` | On | Keeps logits for metrics. Always the toolkit's scoped patch. Force-off under TP and CP, and defaulted off when the config explicitly requests `fused_linear_cross_entropy` (the two are mutually exclusive; setting both explicitly raises) |
+| `fused_linear_cross_entropy` | **Off** (On for Zaya, DeepSeek-V4 and GLM-4.7-Flash) | Fuses lm_head + CE, no logits materialization. Mutually exclusive with `cross_entropy`. Force-off under TP and CP, and [under a multimodal wrapper](#fused-loss-under-a-multimodal-wrapper) |
 
-Precedence is generic defaults < per-model defaults < user keys, and user keys win **except** the TP/CP/PP
+Precedence is generic defaults < per-model defaults < user keys, and user keys win **except** the TP/CP
 force-offs ([below](#ep--cp--tp-behavior)), the wrapper force-off and the [routed-experts](#routed-experts)
 force-off, which overwrite an explicit `true`.
 
 Per-model defaults are read off each applier's own signature (`_PER_MODEL_DEFAULTS`), derived from the spec's
-`flce_default`, set by the three large-vocab families above and nothing else. An applier accepting
-`fused_linear_cross_entropy` but not `cross_entropy` also defaults FLCE on, since the generic FLCE-off default
-would reduce it to a no-op.
+`flce_default`, set by the three large-vocab families above and nothing else.
 
 Two library defaults are overridden: TRL's `use_liger_kernel=False` (toolkit → `True`, via
 `_TOOLKIT_DEFAULTS` in `src/training/parser.py`), and Liger's `fused_linear_cross_entropy=True,
@@ -282,25 +282,21 @@ This is a soft gate: an explicit `swiglu`/`geglu` in `liger_kernel_config` survi
 under the wrapper. RoPE, RMSNorm and CE/FLCE stay active under EP — FLCE touches only `lm_head` + the loss,
 which EP does not wrap.
 
-**TP, CP and PP force `cross_entropy` and `fused_linear_cross_entropy` off**, at one decision site,
+**TP and CP force `cross_entropy` and `fused_linear_cross_entropy` off**, at one decision site,
 `liger_parallelism_overrides`, logged as a warning when either was explicitly enabled.
 
 Under **TP**, `lm_head` is `ColwiseParallel`-sharded into DTensor logits split over the vocab dim, where a
 fused CE would softmax a partial vocab slice and produce a wrong loss.
 
-**CP and PP** compute their loss *outside* the model's forward and never pass labels into it: the Ulysses
-wrapper calls the model with `labels=None` and computes a boundary-aware fp32 CE itself, and a pipeline stage
-is driven with `input_ids`/`attention_mask` only. Liger's `skip_logits` gate never fires, and FLCE would
-report as applied while the full logits plane materializes anyway.
+**CP** computes its loss *outside* the model's forward and never passes labels into it: the Ulysses
+wrapper calls the model with `labels=None` and computes a boundary-aware fp32 CE itself. Liger's
+`skip_logits` gate never fires, and FLCE would report as applied while the full logits plane
+materializes anyway.
 
 `cross_entropy` goes with it because upstream Liger's appliers install it by rebinding
-`torch.nn.functional.cross_entropy` **process-wide**, the exact function both external losses call. The
+`torch.nn.functional.cross_entropy` **process-wide**, the exact function the external loss calls. The
 toolkit's own CE patch is scoped ([above](#supported-models)) but is force-off here too so both branches
 behave alike.
-
-Pipeline parallelism ([not yet available in this release](../parallelism/pipeline-parallelism.md)) would
-lose nothing: its shipped loss seam runs head + cross-entropy together over one token chunk at a time
-(`fused_causal_lm_token_loss`), leaving no full logits plane for FLCE to save.
 
 **The GRPO trainers get a warning, not a force-off.** Their objectives compute per-token log-probs outside
 the model's forward and never pass `labels`, so an applied FLCE (explicit, or a [per-model default](#configuration)) is
@@ -357,7 +353,7 @@ The EP MoE layer's own clamped-SwiGLU is independent of Liger: every path — pe
 
 ## Benchmarks
 
-Both measured 2026-10-03 at commit 0bc3a22a5 on the Blackwell image.
+Both measured on the Blackwell image.
 
 **Dense — 1× B300 (SM103), Qwen3-8B, GC on, seq 16384, batch 1:** Liger+CE gives 15,966 vs 11,746
 tokens/s/GPU (**+36%**) at 64.6 vs 78.6 GiB peak (**−14 GiB**).

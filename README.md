@@ -37,13 +37,13 @@ On 8× B300, Halo trains gpt-oss-20b at up to 3.5× the throughput of stock TRL 
 
 - **Parallelism is added to the existing model.** EP wraps MoE blocks, CP wraps attention, and TP/ETP shard weights in place. There is no separate distributed implementation of the model.
 
-- **The distributed stack is built on PyTorch.** FSDP2, DTensor, and DeviceMesh provide the underlying primitives, while DeepEP handles the all-to-all communication for Expert Parallelism. EP, CP, TP, and ETP are set independently, and EP combines with CP, TP, or ETP across GPUs and nodes.
+- **The distributed stack is built on PyTorch.** FSDP2, DTensor, and DeviceMesh provide the underlying primitives, while DeepEP handles the all-to-all communication for Expert Parallelism. EP, CP, TP, and ETP each have their own setting; EP combines with CP, TP, or ETP across GPUs and nodes, and other pairings are rejected at config time.
 
 - **Training methods share the same infrastructure.** Pre-training, SFT, preference optimization, distillation, and RL use the same parallelism and checkpointing code, so new methods don't need their own distributed implementation.
 
 - **Performance optimizations are integrated.** Halo includes DeepEP V2, FlashAttention 4, Liger, Grouped GEMM, padding-free packing, and AdamWBF16, with implementations and fallbacks for Blackwell, Hopper, and older GPUs.
 
-- **RL is asynchronous, with a clean Transformers ↔ vLLM/SGLang split.** Multi-turn environment rollouts run as Ray actors against a vLLM or SGLang server and overlap training through a prefetch queue; the trainer pushes updated weights to the server over native NCCL. There is no Megatron backend and no veRL dependency — the training side stays plain Transformers, with the same parallelism and checkpointing stack. See [Async GRPO with Environments](human-docs/training-methods/async-grpo-environments.md).
+- **RL is asynchronous, with a clean Transformers ↔ vLLM/SGLang split.** Multi-turn environment rollouts run as Ray actors against vLLM or SGLang servers; with two or more servers, a prefetch queue overlaps the next round's generation with training. The trainer pushes updated weights to the servers over native NCCL. There is no Megatron backend and no veRL dependency — the training side stays plain Transformers, with the same parallelism and checkpointing stack. See [Async GRPO with Environments](human-docs/training-methods/async-grpo-environments.md).
 
 </br>
 
@@ -51,6 +51,10 @@ On 8× B300, Halo trains gpt-oss-20b at up to 3.5× the throughput of stock TRL 
 
 <!-- Newest first. This feed and GitHub Releases are Halo's changelog. -->
 
+- **2026-10-08 — Halo 1.1.0.** Hardening release: exact resume with fail-loud checkpoint checks,
+  multi-node runs on per-node disks, faster MoE training (atomic-free permute, fused GLU),
+  FlexAttention on sliding-window layers, context parallelism for offline GRPO, and composable reward
+  terms (generative judges, served reward models) with per-turn length controls for async GRPO.
 - **2026-08-20 — Halo 1.0.0.** First public release: EP / CP / TP / ETP on native HuggingFace models
   (LLM and VLM), 15 MoE families, pre-training through multi-turn RL with vLLM or SGLang rollouts,
   FlashAttention-4, DeepEP V2, DeepGEMM, and the bf16 `AdamW` optimizer.
@@ -71,7 +75,7 @@ docker pull public.ecr.aws/whitecircle/halo:blackwell
 docker pull public.ecr.aws/whitecircle/halo:hopper
 ```
 
-Versioned tags (`:blackwell-1.0.0`, `:hopper-1.0.0`) pin the release. There is
+Versioned tags (`:blackwell-1.1.0`, `:hopper-1.1.0`) pin the release. There is
  no `latest` tag, since the images are architecture-specific. The RL
 inference images are published alongside them (`:vllm-0.26.0`, `:sglang-0.5.17`).
 
@@ -99,7 +103,7 @@ halo launch sft examples/sft/qwen3_5/qwen3.5-35b-a3b-ultrachat-ep.yaml -n 8
 halo launch sft examples/sft/qwen3/qwen3-4b-ultrachat.yaml \
     -a launcher-configs/accelerate/fsdp2_gradop_config.yaml -n 8
 
-# all training methods (SFT, SMPO, DPO, online-GRPO, environmental-GRPO, ...)
+# all training methods (sft, smpo, dpo, rlvr, environmental-grpo, ...)
 halo launch --list
 ```
 
@@ -213,11 +217,9 @@ A typical run is: **pick an `examples/` config → `halo launch <method> <config
 
 ## Benchmarks
 
-Benchmarks below were run on B300, 8 GPUs unless a row says otherwise, on 2026-10-03 at commit 0bc3a22a5 with
-the Blackwell image (the EP8 and 16k EP8+CP8 figures on 2026-10-05 at commit 0e9a51172); the 256k-context
-row and the FA4 kernel figure are from v1.0.0. The stock TRL baseline uses `trl.SFTTrainer` with Transformers
-v5 and FSDP2 ZeRO-3, with the same model, data, bf16 precision, FlashAttention 4, Liger kernels, and grouped
-GEMM.
+Benchmarks below were run on 8× B300 with the Blackwell image unless a row says otherwise. The stock TRL
+baseline uses `trl.SFTTrainer` with Transformers v5 and FSDP2 ZeRO-3, with the same model, data, bf16
+precision, FlashAttention 4, Liger kernels, and grouped GEMM.
 
 | Result | Configuration |
 |---|---|
@@ -226,7 +228,7 @@ GEMM.
 | **16,447 tok/s/GPU at 1,908 TFLOPS** | Qwen3.5-35B-A3B, 4k, batch 4, EP2 — the highest achieved TFLOPS of any EP>1 run benchmarked. |
 | **Up to 256k context** | gpt-oss-20b; dense EP1 is 2.1× faster than TRL at 64k and 1.28× at 256k. EP8+CP8 and dense CP-only run at about half TRL's per-GPU memory. |
 | **25–76 GiB/GPU on the same 16k workload** | EP8+CP8: 24.6 GiB at 7,149 tok/s/GPU. Dense EP1: 75.8 GiB at 20,690 tok/s/GPU. |
-| **2.56× Grouped GEMM** | Qwen3-30B-A3B, 2× B300, EP2, 8k, batch 4, GC on; 4.58× at batch 1. |
+| **2.45× Grouped GEMM** | Qwen3-30B-A3B, 2× B300, EP2, 8k, batch 4, GC on; 4.10× at batch 1. |
 | **3.6–3.9× FA4 kernel throughput** | FA4 vs FA2 on the isolated kernel (B2×S8192, head_dim 128); up to 2.3× end-to-end on dense Qwen3-4B at 32k (1× B300). |
 
 Full results and methodology: [Performance](human-docs/performance.md)
@@ -235,12 +237,12 @@ Full results and methodology: [Performance](human-docs/performance.md)
 
 ## Parallelism
 
-EP, CP, TP, and ETP are configured independently:
+Each axis has its own flag. EP combines with one of CP, TP, or ETP; any other pairing is rejected at config time:
 
 ```bash
 --expert_parallel_size=N          # MoE experts across GPUs (DeepEP)
 --context_parallel_size=N         # long sequences (Ulysses attention)
---tensor_parallel_size=N          # attention weights (DTensor)
+--tensor_parallel_size=N          # model weights (DTensor; attention only on MoE)
 --expert_tensor_parallel_size=N   # expert-FFN sharding (MoE, experimental)
 ```
 
@@ -325,13 +327,13 @@ Halo builds on a lot of great open-source work, in particular:
 - **[vLLM](https://github.com/vllm-project/vllm)** — the rollout/serving engine behind online and
   environmental RL.
 - **[PyTorch](https://pytorch.org)** — DTensor, FSDP2, and `torch.distributed`.
-- **[SGLang](https://github.com/sgl-project/sglang)** — generation and NCCL weight synchronization for
-  online and multi-turn RL.
+- **[SGLang](https://github.com/sgl-project/sglang)** — the alternative rollout engine, with NCCL weight
+  synchronization, for multi-turn environment RL.
 - **[SDPG](https://arxiv.org/abs/2606.04036)**, led by researchers at UCLA — self-distilled policy
   gradient for online reinforcement learning.
 
-DeepEP and Flash Attention are vendored as git submodules under [`vendors/`](vendors/) and retain
-their upstream licenses; the build pins live in the [`Dockerfile`](Dockerfile).
+DeepEP is vendored as a git submodule under [`vendors/`](vendors/) and retains its upstream license;
+the build pins, Flash Attention's included, live in the [`Dockerfile`](Dockerfile).
 See [`pyproject.toml`](pyproject.toml) for the full dependency set.
 
 Halo is built and maintained by **[White Circle](https://whitecircle.com)**.

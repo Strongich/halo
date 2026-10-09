@@ -6,10 +6,9 @@ These recipes assume **N × 8-GPU nodes on an RDMA fabric** (InfiniBand/RoCE or 
 
 ## torchrun
 
-One `torchrun` per node, incrementing `--node_rank`. The config sets the parallelism layout — it ships `expert_parallel_size: 16` / `ep_scope: global`, cross-node EP across both nodes — and every field overrides on the command line:
+One `torchrun` per node, incrementing `--node_rank`. The config sets the parallelism layout — it ships `expert_parallel_size: 16` / `ep_scope: global`, cross-node EP across both nodes — and every parallelism field overrides on the command line:
 
 - **Node-local EP + DP:** `--expert_parallel_size=8 --ep_scope=node`.
-- **PP+EP** — pipeline parallelism is [not yet available in this release](pipeline-parallelism.md). For cross-node depth use cross-node EP, node-local EP + DP, or EP+TP.
 
 ```bash
 # Node 0 (master): --node_rank=0 ; Node 1: --node_rank=1
@@ -72,7 +71,7 @@ export DIST_STORE_TIMEOUT_HOURS=4    # default; bounds c10d-store waits (main-fi
 export NCCL_SOCKET_IFNAME=<your fast NIC>  # multi-homed node: `ib0` on IB, the ENA iface on AWS
 # The image bakes the InfiniBand / RoCE defaults: NCCL_IB_HCA=mlx5, NCCL_IB_DISABLE=0,
 # NCCL_NET_GDR_LEVEL=2 (GPU Direct RDMA for inter-node EP), NCCL_P2P_LEVEL=NVL (NVLink intra-node P2P),
-# NCCL_DEBUG=WARN, and CUDA_DEVICE_MAX_CONNECTIONS=1 (keeps more than one EP dispatch group per NVLink domain from deadlocking, no throughput
+# NCCL_DEBUG=WARN, and CUDA_DEVICE_MAX_CONNECTIONS=1 (the setting EP is validated with, no throughput
 # cost — agent-docs/infrastructure/deepep.md#environment-variables; the driver latches it at cuInit,
 # so a launch outside the image must export it before the process starts).
 # On IB, leave NCCL_NET_PLUGIN unset: the OFI plugin yields to NCCL's built-in IB transport. Set

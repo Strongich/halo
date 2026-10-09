@@ -78,11 +78,11 @@ Use a 5–10× higher learning rate than full fine-tuning (`5e-5` vs `5e-6`).
 > [!WARNING]
 > **Parallelism limits**
 >
-> - Attention LoRA works under FSDP/DDP, CP, EP and ETP; it **raises** at construction under TP, EP+TP and PP, and under offline GRPO with CP (full fine-tuning only).
+> - Attention LoRA works under FSDP/DDP, CP, EP and ETP; it **raises** at construction under TP and EP+TP, and under offline GRPO with CP (full fine-tuning only).
 > - On any MoE model, expert names (`gate_up_proj`, `gate_proj`, `up_proj`, `down_proj`, the `gate_proj_gmm` / `up_proj_gmm` grouped spellings, and the `experts` / `mlp.experts` containers) are peeled out of `lora_target_modules` into native grouped adapters.
 > - That peel warns: plain `nn.Linear` MLPs sharing those names (dense prefix layers, shared experts) are adapted by neither half. `use_dora` and `lora_target_parameters` are rejected on that path, and `expert_tp_size > 1` rejects expert LoRA.
 > - A `use_peft: true` that would build no adapter raises rather than silently full-finetuning.
-> - QLoRA **raises** under EP/TP/PP/grouped-GEMM-MoE loaders — use it with plain DDP/FSDP, or CP on a **dense** model.
+> - QLoRA **raises** under EP/TP/grouped-GEMM-MoE loaders — use it with plain DDP/FSDP, or CP on a **dense** model.
 > - Full matrix: [PEFT](../optimization/peft.md).
 
 Merge adapters after training:
@@ -153,8 +153,9 @@ or `tee` that cannot be set up is warned on that rank, and the run continues wit
 
 ## 6. CLI overrides
 
-Any YAML field can be overridden as `--key=value`; CLI wins, and an unknown or repeated flag raises
-before training starts ([rules](configuration.md#cli-overrides)).
+Any scalar YAML field can be overridden as `--key=value`; CLI wins, and an unknown or repeated flag
+raises before training starts. Container-typed fields such as `dataset` stay in the YAML
+([rules](configuration.md#cli-overrides)).
 
 ```bash
 torchrun --nproc_per_node=8 scripts/training/sft.py examples/sft/qwen3/qwen3-4b-ultrachat.yaml \

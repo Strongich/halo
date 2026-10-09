@@ -5,7 +5,8 @@ Tests for Ray actors with local Ray (no GPU/vLLM required).
 Run with:
     python tests/cpu/environments/test_ray_actors.py
 
-These tests use Ray in local mode and mock the vLLM HTTP calls.
+One test starts a local Ray instance; the rest drive the actors off-cluster with the engine's HTTP
+calls stubbed.
 """
 
 import ast
@@ -24,9 +25,10 @@ import ray
 
 from src.configs.async_training_config import AsyncTrainingConfig
 from src.environments import ray_actors
-from src.environments.base import Trajectory
+from src.environments.base import CUT_TOOL_CALLS_KEY, Trajectory
 from src.environments.envs.protocols.native import AsyncNativeToolUseEnvironment, NativeToolUseEnvironment
 from src.environments.envs.tasks.coding.code_contests import CodeContestsEnvironment
+from src.environments.episode import step_context_from_generation
 from src.environments.ray_actors import (
     EnvironmentActor,
     RolloutConfig,
@@ -99,13 +101,7 @@ def test_rollout_manager_round_robins_across_servers():
 
 
 async def test_rollout_manager_start_shutdown():
-    """Test RolloutManager start and shutdown with Ray.
-
-    Note: Async Ray actors don't work in local_mode, so we skip the actual
-    actor creation test when local_mode would be used.
-    """
-    # Skip test if we can only use local mode (async actors not supported)
-    # This test requires a real Ray cluster or non-local mode
+    """RolloutManager start and shutdown on a local Ray instance."""
     try:
         if ray.is_initialized():
             ray.shutdown()
@@ -143,37 +139,33 @@ async def test_rollout_manager_start_shutdown():
         assert not manager._started
         assert len(manager._actors) == 0
         assert manager._actor_pause_clock is None
-
-    except ray.exceptions.RaySystemError as e:
-        if "Async actor" in str(e):
-            print("  Skipping: Async actors not supported in local mode")
-            return
-        raise
     finally:
         ray.shutdown()
 
 
 class _Spawner:
-    """Stands in for a ``@ray.remote`` class: records each spawn, refuses an affinity it was not given."""
+    """Stands in for a ``@ray.remote`` class: records each spawn with the scheduling strategy it was placed under."""
 
-    def __init__(self, name: str, spawned: list[str]):
-        self.name, self.spawned = name, spawned
+    def __init__(self, name: str, spawned: list[tuple[str, object]], strategy: object = None):
+        self.name, self.spawned, self.strategy = name, spawned, strategy
 
-    def options(self, **kwargs):
-        raise AssertionError(f"{self.name} placed with a scheduling strategy that could not be built")
+    def options(self, *, scheduling_strategy):
+        return _Spawner(self.name, self.spawned, scheduling_strategy)
 
     def remote(self, *args):
-        self.spawned.append(self.name)
+        self.spawned.append((self.name, self.strategy))
         return SimpleNamespace()
 
 
-def _manager_on_a_fake_cluster(monkeypatch, strategy) -> tuple[ray_actors.RolloutManager, list[str]]:
-    spawned: list[str] = []
+async def test_the_pool_and_its_clock_prefer_this_node_and_spill_off_a_busy_one(monkeypatch):
+    """The actors and their pause clock are placed under a soft affinity to this node that also spills when
+    the node is merely saturated: ``soft`` alone pins every actor to a live, busy training node, which stalls."""
+    spawned: list[tuple[str, object]] = []
     runtime = SimpleNamespace(get_node_id=lambda: "node")
     monkeypatch.setattr(
         ray_actors, "ray", SimpleNamespace(is_initialized=lambda: True, get_runtime_context=lambda: runtime)
     )
-    monkeypatch.setattr(ray_actors, "NodeAffinitySchedulingStrategy", strategy)
+    monkeypatch.setattr(ray_actors, "NodeAffinitySchedulingStrategy", lambda **kwargs: kwargs)
     monkeypatch.setattr(ray_actors, "EnvironmentActor", _Spawner("actor", spawned))
     monkeypatch.setattr(ray_actors, "_RemoteEnginePauseClock", _Spawner("clock", spawned))
     manager = ray_actors.RolloutManager(
@@ -183,31 +175,11 @@ def _manager_on_a_fake_cluster(monkeypatch, strategy) -> tuple[ray_actors.Rollou
         server_urls=["http://localhost:8000"],
         rollout_config=ray_actors.RolloutConfig(),
     )
-    return manager, spawned
 
+    await manager.start()
 
-async def test_a_ray_without_the_affinity_spills_the_actors_with_a_warning(monkeypatch, caplog):
-    """Affinity is a placement preference, so a Ray that cannot build it still starts the pool, but
-    says so: the actors may then land on any node, where a loopback server URL reaches nothing."""
-
-    def unsupported(**kwargs):
-        raise TypeError("__init__() got an unexpected keyword argument '_spill_on_unavailable'")
-
-    manager, spawned = _manager_on_a_fake_cluster(monkeypatch, unsupported)
-    with caplog.at_level(logging.WARNING, logger=ray_actors.__name__):
-        await manager.start()
-    assert spawned == ["clock", "actor", "actor"]
-    assert "node affinity unavailable" in caplog.text and "_spill_on_unavailable" in caplog.text
-
-
-async def test_an_unexpected_affinity_failure_is_not_swallowed(monkeypatch):
-    def broken(**kwargs):
-        raise RuntimeError("the raylet is gone")
-
-    manager, spawned = _manager_on_a_fake_cluster(monkeypatch, broken)
-    with pytest.raises(RuntimeError, match="raylet"):
-        await manager.start()
-    assert spawned == []
+    affinity = {"node_id": "node", "soft": True, "_spill_on_unavailable": True}
+    assert spawned == [("clock", affinity), ("actor", affinity), ("actor", affinity)]
 
 
 # Test: RolloutConfig
@@ -217,15 +189,11 @@ def test_rollout_config_defaults():
     """Fields RolloutConfig must NOT carry, and picklability (the actors receive it pickled).
 
     The default VALUES are pinned against their ``AsyncTrainingConfig`` counterparts in
-    ``tests/cpu/config/test_rollout_config_mirror.py``. Echoing them here as well was the second
-    source of truth that let the two sides drift 32x on ``max_tokens``.
+    ``tests/cpu/config/test_rollout_config_mirror.py``.
     """
     config = RolloutConfig()
 
     # Must NOT have removed fields
-    assert not hasattr(config, "top_k")
-    assert not hasattr(config, "min_p")
-    assert not hasattr(config, "repetition_penalty")
     assert not hasattr(config, "max_concurrent_per_actor")
 
     # RolloutConfig should be fully picklable (no unpicklable callables)
@@ -234,9 +202,6 @@ def test_rollout_config_defaults():
     assert restored.temperature == config.temperature
     assert restored.max_retries == config.max_retries
     assert restored.model_name == config.model_name
-
-
-# Test: Error Handling
 
 
 # Test: Bounded Concurrency and Positional Mapping (fake actor pool, no Ray)
@@ -416,9 +381,10 @@ def test_build_payload_sends_only_supported_params_and_env_tools():
     assert payload["temperature"] == 0.9 and payload["top_p"] == 0.8 and payload["max_tokens"] == 512
     # Env tools are attached and in OpenAI function format.
     assert payload["tools"] and payload["tools"][0]["type"] == "function" and "function" in payload["tools"][0]
-    # model is omitted when model_name is unset, and no unsupported sampling knob leaks through.
+    # model is omitted when model_name is unset, and no unsupported sampling knob leaks through (the
+    # sampler filters each request carries are pinned in tests/cpu/grpo/test_rollout_backend_selection.py).
     assert "model" not in payload
-    for leaked in ("top_k", "min_p", "repetition_penalty", "frequency_penalty"):
+    for leaked in ("frequency_penalty", "presence_penalty"):
         assert leaked not in payload
 
 
@@ -589,7 +555,148 @@ async def test_a_turn_that_used_its_whole_cap_is_a_cut_even_when_vllm_says_tool_
     )
 
 
-# Test: stateful-env session cleanup across rollouts (leak fix)
+_PARTIAL_CALL = {
+    "id": "c1",
+    "type": "function",
+    "function": {"name": "calculate", "arguments": '{"expression": "1+ # still reasoning'},
+}
+
+
+@pytest.mark.parametrize(
+    ("backend", "choice"),
+    [
+        ("vllm", {"finish_reason": "tool_calls"}),
+        ("sglang", {"stop_reason": FINISH_REASON_LENGTH}),
+    ],
+)
+async def test_a_call_cut_at_the_cap_reaches_the_env_as_a_cut_call_on_either_engine(backend, choice):
+    """vLLM labels a turn its cap cut inside a call ``tool_calls``, SGLang spells the cut ``stop_reason``;
+    either way the transport reads a length cut, and the salvaged call travels as a cut call, never as one
+    to run."""
+    actor = _make_actor("native_math")
+    session = _FakeChatCompletionsSession(
+        {
+            "choices": [{"message": {"content": "Computing", "tool_calls": [_PARTIAL_CALL]}, **choice}],
+            "usage": {"completion_tokens": 4300},
+        }
+    )
+    config = RolloutConfig(backend=backend, max_retries=0, max_tokens=4300)
+    generation = await actor._generate(session, "server:8000", [{"role": "user", "content": "2+2?"}], config)
+
+    ctx = step_context_from_generation(None, generation)
+    assert ctx[CUT_TOOL_CALLS_KEY] == [_PARTIAL_CALL] and "tool_calls" not in ctx
+
+
+class _FakeEngineSession(_FakeChatCompletionsSession):
+    """Serves the canned completion and vLLM's ``/detokenize``, recording the ids each decode asked for."""
+
+    def __init__(self, body: dict, *, decoded: str = "", decode_status: int = 200):
+        super().__init__(body)
+        self._decoded, self._decode_status, self._url = decoded, decode_status, ""
+        self.decoded: list[list[int]] = []
+
+    def post(self, url, json):  # noqa: A002 — aiohttp's own keyword
+        self._url = url
+        if url.endswith("/detokenize"):
+            self.decoded.append(json["tokens"])
+        return self
+
+    async def __aenter__(self):
+        if self._url.endswith("/detokenize"):
+            return SimpleNamespace(status=self._decode_status, json=self._decode, text=self._text)
+        return await super().__aenter__()
+
+    async def _decode(self):
+        return {"prompt": self._decoded}
+
+
+_END = 99
+_CUT_IDS = [11, _END, 12, _END, 21, 22, 23]
+# The same ids where SGLang reports them, ``[logprob, id, text]`` per sampled token.
+_SGLANG_CUT_META = {"output_token_logprobs": [[-0.1, i, f"t{i}"] for i in _CUT_IDS]}
+_WRITTEN = "<tool_call>\n<function=calculate>\n<parameter=expression>\n1+ # still reasoning, so let me"
+
+
+def _cut_turn_body(backend_choice: dict) -> dict:
+    logprobs = {"content": [{"token": f"token_id:{i}", "logprob": -0.1} for i in _CUT_IDS]}
+    message = {"content": "", "tool_calls": [_PARTIAL_CALL]}
+    return {
+        "choices": [{"message": message, "logprobs": logprobs, **backend_choice}],
+        "usage": {"completion_tokens": len(_CUT_IDS)},
+    }
+
+
+async def test_a_call_cut_at_the_cap_reaches_the_judge_as_the_policy_wrote_it():
+    """vLLM's parser keeps only the name and the closed arguments of a call cut at the cap; the turn's ids past its
+    reasoning close are decoded and travel as that cut call's arguments, so the judge reads the whole call."""
+    actor = _make_actor("native_math")
+    session = _FakeEngineSession(_cut_turn_body({"finish_reason": "tool_calls"}), decoded=_WRITTEN)
+    config = RolloutConfig(
+        max_retries=0, max_tokens=len(_CUT_IDS), capture_token_ids=True, reasoning_end_token_id=_END
+    )
+    generation = await actor._generate(session, "server:8000", [{"role": "user", "content": "2+2?"}], config)
+
+    assert session.decoded == [[21, 22, 23]], "only the ids past the last reasoning close are decoded"
+    written = {**_PARTIAL_CALL, "function": {"name": "calculate", "arguments": _WRITTEN}}
+    assert step_context_from_generation(None, generation)[CUT_TOOL_CALLS_KEY] == [written]
+
+
+@pytest.mark.parametrize(
+    ("backend", "choice", "decode_status", "end"),
+    [
+        ("vllm", {"finish_reason": "tool_calls"}, 500, _END),
+        ("vllm", {"finish_reason": "tool_calls"}, 200, 7),
+        ("sglang", {"stop_reason": FINISH_REASON_LENGTH, "meta_info": _SGLANG_CUT_META}, 200, _END),
+    ],
+    ids=["decode-fails", "no-reasoning-close-in-the-ids", "sglang"],
+)
+async def test_a_cut_call_keeps_the_parsers_salvage_where_it_cannot_be_decoded(backend, choice, decode_status, end):
+    """A failed decode, ids holding no reasoning close, or SGLang (its ids captured, but the decode reads vLLM's
+    ``/detokenize`` answer) leave the salvaged call as it came, still booked as a cut call."""
+    actor = _make_actor("native_math")
+    session = _FakeEngineSession(_cut_turn_body(choice), decoded=_WRITTEN, decode_status=decode_status)
+    config = RolloutConfig(
+        backend=backend, max_retries=0, max_tokens=len(_CUT_IDS), capture_token_ids=True, reasoning_end_token_id=end
+    )
+    generation = await actor._generate(session, "server:8000", [{"role": "user", "content": "2+2?"}], config)
+
+    assert step_context_from_generation(None, generation)[CUT_TOOL_CALLS_KEY] == [_PARTIAL_CALL]
+    assert session.decoded == ([[21, 22, 23]] if decode_status != 200 else [])
+
+
+async def test_the_actor_keeps_a_cut_call_on_its_turn_without_running_or_resending_it():
+    """Through the real episode loop: the call a turn was writing when its cap cut it lands on that turn's
+    message, survives the pickle the Ray object store makes of the result, never runs, and is absent from
+    what the engine is sent next."""
+    actor = _make_actor("native_math", {"max_turns": 5})
+
+    async def _fake_client():
+        return None
+
+    actor._get_http_client = _fake_client
+    sent: list[list[dict]] = []
+
+    async def _fake_generate(client, url, messages, config, reasoning_effort=None, reasoning_budget=None):
+        sent.append(messages)
+        if len(sent) == 1:
+            return TurnGeneration("Computing", [_PARTIAL_CALL], "", 4300, finish_reason=FINISH_REASON_LENGTH)
+        return TurnGeneration("final answer: 4", [], "", 5)
+
+    actor._generate = _fake_generate
+    result = await actor.run_episode("2+2?", {"answer": "4"}, "http://x", RolloutConfig(max_retries=1))
+
+    assert len(sent) == 2 and result.error is None
+    cut_turn = next(m for m in sent[1] if m["role"] == "assistant")
+    assert cut_turn == {"role": "assistant", "content": "Computing"}
+    assert "still reasoning" not in json.dumps(sent[1])
+    assert result.trajectory.info["total_tool_calls"] == 0
+    shipped = pickle.loads(pickle.dumps(result))
+    turns = [m for m in shipped.trajectory.messages if m.role == "assistant"]
+    assert [m.cut_tool_calls for m in turns] == [[_PARTIAL_CALL], None]
+    assert [m.tool_calls for m in turns] == [None, None]
+
+
+# Test: stateful-env session cleanup across rollouts
 
 
 async def test_actor_releases_session_when_episode_errors():
@@ -715,6 +822,47 @@ async def test_run_episode_generation_tokens_sum_across_turns():
     # Per-EPISODE total = 10 + 20 + 30 = 60. A per-turn/last-turn/mean bug would give 30 or 20, not 60.
     assert result.generation_tokens == 60
     assert result.generation_tokens == sum(per_turn)
+
+
+async def test_each_assistant_turn_records_the_levels_cap_and_the_reasoning_it_sampled():
+    """``episode/thinking_cap_turns`` reads each turn's own pair: the cap the turn's level set — not the narrower
+    one the output budget may have put on the request — beside the reasoning the turn sampled through
+    its close. Drives the real loop in run_episode (native_math): 400-token turns with a 100-token
+    reasoning cap under a 1050-token episode budget, so the third request is narrowed to 350 and 50."""
+    end = 151668
+    actor = _make_actor("native_math", {"max_turns": 5})
+
+    async def _fake_client():
+        return None
+
+    actor._get_http_client = _fake_client
+    caps_sent: list[tuple[int, int | None]] = []
+    reasoning = [[1] * 30 + [end, 2], [1] * 60 + [end], [1] * 5 + [end]]
+    sampled = [350, 350, 6]
+
+    async def _fake_generate(client, url, messages, config, reasoning_effort=None, reasoning_budget=None):
+        i = len(caps_sent)
+        caps_sent.append((config.max_tokens, config.max_thinking_tokens))
+        if i < 2:
+            tc = [{"id": f"c{i}", "function": {"name": "calculate", "arguments": '{"expression": "1+1"}'}}]
+            return TurnGeneration("", tc, "r", sampled[i], token_ids=reasoning[i])
+        return TurnGeneration("final answer: 4", [], "r", sampled[i], token_ids=reasoning[i])
+
+    actor._generate = _fake_generate
+    config = RolloutConfig(
+        max_retries=1,
+        max_tokens=400,
+        max_thinking_tokens=100,
+        max_episode_tokens=1050,
+        capture_token_ids=True,
+        reasoning_end_token_id=end,
+    )
+    result = await actor.run_episode("2+2?", {"answer": "4"}, "http://x", config)
+
+    assert caps_sent == [(400, 100), (400, 100), (350, 50)], "the setup no longer narrows the third request"
+    turns = [m for m in result.trajectory.messages if m.role == "assistant"]
+    assert [(m.thinking_cap, m.reasoning_tokens) for m in turns] == [(100, 31), (100, 61), (100, 6)]
+    assert result.generation_tokens == sum(sampled)
 
 
 # Test: concurrent CodeContests episodes grade against their OWN tests
@@ -906,8 +1054,7 @@ def test_is_client_error():
     assert not _is_client_error(ConnectionError("Connection refused"))
 
     # 429 (rate limit) and 408 (request timeout) are 4xx but transient — they MUST be
-    # retried, not given up on. A `"status 4" in str(exc)` substring test gave up
-    # immediately the instant the engine was briefly overloaded.
+    # retried, not given up on.
     assert not _is_client_error(_http(429, "Too Many Requests"))
     assert not _is_client_error(_http(408, "Request Timeout"))
 
@@ -974,6 +1121,9 @@ def test_async_training_config_to_rollout_config():
     config = AsyncTrainingConfig(
         rollout_temperature=0.9,
         rollout_top_p=0.8,
+        rollout_top_k=40,
+        rollout_min_p=0.02,
+        rollout_repetition_penalty=1.05,
         rollout_max_tokens=2048,
         model_name="test-model",
         request_timeout=60.0,
@@ -984,16 +1134,12 @@ def test_async_training_config_to_rollout_config():
     rc = config.get_rollout_config()
     assert rc.temperature == 0.9
     assert rc.top_p == 0.8
+    assert (rc.top_k, rc.min_p, rc.repetition_penalty) == (40, 0.02, 1.05)
     assert rc.max_tokens == 2048
     assert rc.model_name == "test-model"
     assert rc.request_timeout == 60.0
     assert rc.max_retries == 5
     assert rc.retry_base_wait == 2.0
-
-    # Verify removed fields don't exist on AsyncTrainingConfig
-    assert not hasattr(config, "rollout_top_k")
-    assert not hasattr(config, "rollout_min_p")
-    assert not hasattr(config, "rollout_repetition_penalty")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from typing import Any, ClassVar, Literal
 
 from src.args.common_script_args import CommonScriptArguments
 from src.args.mixins import (
+    DEFAULT_ANSWER_FIELD,
     AdvantageShapingArguments,
     ChunkedLogprobsArguments,
     GRPOEarlyStopArguments,
@@ -12,8 +13,15 @@ from src.args.mixins import (
     RLRRArguments,
     SDPGArguments,
 )
-from src.rewards.spec import JudgeTerm, RewardModelTerm, RewardTerm, parse_reward_terms, sources_of
-from src.rewards.verifiable import AccuracyTerm, FormatTerm
+from src.rewards.graders.verifiable import AccuracyTerm, FormatTerm
+from src.rewards.terms import (
+    JudgeTerm,
+    RewardModelTerm,
+    RewardTerm,
+    parse_reward_terms,
+    refuse_veto_judges,
+    sources_of,
+)
 
 # The reward sources the RLVR arm admits: its two graders plus the externally scored terms.
 RLVR_REWARD_SOURCES = sources_of(AccuracyTerm, FormatTerm, JudgeTerm, RewardModelTerm)
@@ -26,26 +34,30 @@ class RLVROnlineGRPOScriptArguments(
     AdvantageShapingArguments,
     GRPOEarlyStopArguments,
     RLRRArguments,
-    SDPGArguments,
     CommonScriptArguments,
+    SDPGArguments,
 ):
     """Arguments for RLVR (Reinforcement Learning with Verifiable Rewards) Online GRPO.
 
-    The reward is the ``rewards`` list of terms (:mod:`src.rewards.spec`): the ``accuracy`` and
+    The reward is the ``rewards`` list of terms (:mod:`src.rewards.terms`): the ``accuracy`` and
     ``format`` graders, a generative ``judge``, a served ``reward_model`` — each ``weight * score ** exponent``.
 
     RLRR (arXiv:2601.23058, :class:`RLRRArguments`) replaces the group-normalized advantages with
     relative-ranking ones, so the trainer refuses it beside the std floor or the degenerate-group drop.
     """
 
-    # The tunables ``use_sdpg`` gates: the shared block plus the RLVR-only advantage gate.
+    PROJECT_NAME: ClassVar[str] = "rlvr-online-grpo"
+
+    # The tunables ``use_sdpg`` gates, each under the name the trainer takes it by: the shared block
+    # plus the advantage gate, declared here rather than on SDPGArguments because the offline
+    # self-distillation arm has no advantages to gate on.
     SDPG_TUNABLES: ClassVar[tuple[str, ...]] = (
         *(f.name for f in fields(SDPGArguments)),
         "opd_positive_advantage_only",
     )
 
     answer_field: str = field(
-        default="answer",
+        default=DEFAULT_ANSWER_FIELD,
         metadata={"help": "Field in the dataset containing the ground truth answer for verification"},
     )
     system_prompt: str | None = field(
@@ -69,10 +81,12 @@ class RLVROnlineGRPOScriptArguments(
     rewards: list[dict[str, Any]] = field(
         default_factory=lambda: [{"source": "accuracy"}],
         metadata={
-            "help": "Reward terms, each {source, name?, weight?, exponent?, ...}: sources 'accuracy' "
-            "(last \\boxed{} equals the answer), 'format' (pattern), 'judge' (model, requirements, "
-            "reasoning_effort, ...) and 'reward_model' (url, model, backend, ...). Each term is one "
-            "TRL reward function named after it, weighted by its weight; see agent-docs/training-methods/grpo/rewards.md."
+            "help": "Reward terms, each {source, name (required for judge/reward_model), weight?, exponent?, ...}: "
+            "sources 'accuracy' (last \\boxed{} equals the answer), 'format' (pattern), 'judge' (model, "
+            "requirements, view, on_error, reasoning_effort, ...; a veto judge listing checks is refused here, "
+            "having no objective to gate) and 'reward_model' (url, model, backend, view, on_error, ...). Each "
+            "term is one TRL reward function named after it, weighted by its weight; see "
+            "agent-docs/training-methods/grpo/rewards.md."
         },
     )
 
@@ -91,26 +105,23 @@ class RLVROnlineGRPOScriptArguments(
     )
 
     def build_sdpg_kwargs(self) -> dict:
-        """SDPG trainer kwargs from these args (empty when SDPG is disabled).
-
-        :class:`SDPGArguments` declares every tunable under the name the trainer takes it by, so the
-        block forwards itself; the two entries outside that mapping stay explicit.
-        """
+        """SDPG trainer kwargs from these args (empty when SDPG is disabled)."""
         if not self.use_sdpg:
             return {}
         return {
-            **{f.name: getattr(self, f.name) for f in fields(SDPGArguments)},
+            **{name: getattr(self, name) for name in self.SDPG_TUNABLES},
             # process_for_rlvr normalizes the answer column to "answer", so use that, not answer_field.
             "sdpg_answer_field": "answer",
-            # Declared here rather than on SDPGArguments: the gate is RLVR-only (the offline
-            # self-distillation arm has no advantages to gate on).
-            "opd_positive_advantage_only": self.opd_positive_advantage_only,
         }
 
     @property
     def reward_terms(self) -> tuple[RewardTerm, ...]:
-        """The typed reward terms of ``rewards``, parsed and validated (also at parse time)."""
-        return parse_reward_terms(self.rewards, RLVR_REWARD_SOURCES)
+        """The typed reward terms of ``rewards``, parsed and validated (also at parse time). A veto
+        judge (one listing ``checks``) gates an environment objective, which this arm's independent
+        TRL reward functions have none of, so it is refused."""
+        terms = parse_reward_terms(self.rewards, RLVR_REWARD_SOURCES)
+        refuse_veto_judges(terms, where="the online arm")
+        return terms
 
     def _validate_hint_template(self) -> None:
         # With use_sdpg off a null template is a value set beside the closed gate, which the script's
@@ -120,10 +131,4 @@ class RLVROnlineGRPOScriptArguments(
 
     def _validate_ranges(self) -> None:
         super()._validate_ranges()
-        if not self.rewards:
-            raise ValueError("rewards must list at least one reward term")
-        self.reward_terms  # noqa: B018  parse at config time so a bad term fails before any server is touched
-
-    def __post_init__(self):
-        self._apply_default_project_name("rlvr-online-grpo")
-        self._validate_ranges()
+        self.reward_terms  # noqa: B018  parse at config time so a bad or empty list fails before any server is touched

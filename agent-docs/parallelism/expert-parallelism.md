@@ -65,12 +65,12 @@ EP surface. The table is pinned against the classes by
 | Bailing MoE / Ling | transient balancing bias — routing runs entirely inside the hub gate, so bias-update balancing requires the native `expert_bias` slot and raises rather than falling back to a trainer-only side-buffer ([MoE balancing modes](../training-methods/callbacks.md#moe-balancing-modes)) | `_supports_transient_balancing_bias` |
 | Gemma 4 MoE | routing replay | `_supports_routing_replay` |
 | Gemma 4 MoE | `fp32_non_ep_params` — refused at load ([Precision control](#precision-control)) | `_supports_fp32_non_ep_params` |
-| Inkling | RL weight sync — the hub namespace is WeightConverters-only, so a server loading hub names would silently skip every synced tensor | `_supports_weight_sync` |
+| Inkling | RL weight sync — no sync into either pinned engine's Inkling loader validated | `_supports_weight_sync` |
 | Zaya | gradient checkpointing | `_supports_gradient_checkpointing` |
 | Zaya | routing replay | `_supports_routing_replay` |
 | Cohere2 MoE | RL weight sync — no end-to-end sync validated against either pinned server | `_supports_weight_sync` |
-| Cohere2 MoE | lazy loading — the Command A+ index spells the vision tower `model.vision_tower.vision_model.*`, a from_pretrained-only conversion the lazy loader does not apply | `_supports_lazy_loading` |
-| GLM-5 Next | RL weight sync — the live tree spells the KDA/hyper-connection tensors differently from the hub namespace a server reads, and no pinned rollout engine loads `glm5_next` | `_supports_weight_sync` |
+| Cohere2 MoE | lazy loading — no lazy load of the Command A+ checkpoint has been checked against `from_pretrained` | `_supports_lazy_loading` |
+| GLM-5 Next | RL weight sync — neither pinned rollout engine registers `glm5_next` | `_supports_weight_sync` |
 
 A second class of weight-sync restriction sits outside that table, keyed on the model type **and**
 the engine. Each client declares the model types its pinned release cannot take an online update for
@@ -95,7 +95,7 @@ division. `ParallelismConfig.validate_against_model_config` raises off `config.j
 `EPConfig.finalize_expert_assignment` re-checks it once the EP groups exist.
 
 `ep_group_size` must divide the NVLink domain (node-local). Under `ep_scope="global"` the bound is
-the **stage** world (`world_size / pp_size`), and divisibility alone is not enough: the group must
+the world, and divisibility alone is not enough: the group must
 also tile that world as equal contiguous per-domain blocks
 ([Multi-Node](multi-node.md#node-local-vs-cross-node-ep)).
 
@@ -124,10 +124,10 @@ Gradient checkpointing on or off does not change this, and `CUDA_DEVICE_MAX_CONN
 into the images) does not cover it.
 
 `ParallelismConfig._validate_single_domain_multigroup_ep` **rejects the shape at config
-construction**, before the model loads; `EpIntrospectionMixin._setup_ep_gradient_checkpointing` is a
-second gate after load. Deferring the cross-replica average does not help here: on one domain FSDP2
-still shards the non-expert params over every rank (`is_deferred_dp` engages only across domains),
-so its reduce-scatter spans the whole domain while each combine spans a subset.
+construction**, before the model loads, hand-built configs included. Deferring the cross-replica
+average does not help here: on one domain FSDP2 still shards the non-expert params over every rank
+(`is_deferred_dp` engages only across domains), so its reduce-scatter spans the whole domain while
+each combine spans a subset.
 
 Safe single-node pure-EP shapes — one group, or 2-rank groups:
 
@@ -154,7 +154,7 @@ That sweep covers every shape holding more than one EP group, the single-node on
 `ep2+tp2`) included. Mechanism:
 [Multi-Node → deferred cross-replica sync](multi-node.md#deferred-cross-replica-sync).
 
-`CUDA_DEVICE_MAX_CONNECTIONS=1`, baked into the images, keeps the supported multi-group shapes (`ep2`, `ep4+etp2` on 8 GPUs) from deadlocking the DeepEP combine against FSDP2's collectives, at no
+`CUDA_DEVICE_MAX_CONNECTIONS=1`, baked into the images, is the setting the EP suites are validated with, at no
 measurable throughput cost ([DeepEP → Environment variables](../infrastructure/deepep.md#environment-variables)).
 
 ## Quick start
@@ -207,11 +207,8 @@ lossy and the error grows with rank count — worth enabling for many-rank / mul
 Training checkpoints keep these masters in fp32 and exports write them bf16
 ([What gets saved](../reference/checkpoints.md#what-gets-saved)).
 
-Configured masters keep their checkpoint values before the wrappers adopt them, for a fresh stage
-as well as a resume. One shared selector (`src/distributed/loading/precision.py`) covers routers,
-expert banks and non-EP parameters; FSDP-managed EP1 experts still ignore `fp32_experts`. A resolved
-full-finetune resume additionally requires complete master coverage. The same construction policy
-applies with CP, attention TP and ETP; it does not widen persistent FP32 buffers into the master set.
+Construction restores their checkpoint values before the wrappers adopt them, through one shared
+selector (`src/distributed/expert_parallel/fp32_masters.py`): [Load precision](../models/README.md#load-precision).
 
 `fp32_non_ep_params: true` unconditionally implies `fp32_router: true`: every family except Gemma 4
 keeps its router inside the EP wrapper, which that upcast skips, so the implication keeps every
@@ -308,8 +305,8 @@ each forward.
 **Gradient clipping** is custom because experts are distributed
 (`_compute_global_grad_norm`, `src/trainers/mixins/grad_sync.py`): local expert grad-norm² per rank → TP shard
 norms batch-`all_reduce(SUM)`ed via `._local_tensor` → expert norms `all_reduce(SUM)`ed over the
-expert-TP group, then the **dispatch** group, then across replica groups divided by `num_ep_groups`
-→ `sqrt(expert² + non_expert² + tp_shard²)`.
+expert-TP group, then the **dispatch** group → `sqrt(expert² + non_expert² + tp_shard²)`. Replicas
+across EP groups need no reduce: the clip runs the deferred sweep first, which leaves them identical.
 
 ## Determinism
 
@@ -327,9 +324,8 @@ steps. Under torch's deterministic-algorithms mode, which HF's `Trainer` turns o
 (`src/distributed/expert_parallel/dispatcher.py`): a prologue kernel places each received token by
 source rank and token index. The `legacy` V1 buffer places tokens by prefix sums already and needs
 nothing. The rest of the EP path is deterministic as is: grouped GEMM, the fused GLU, the atomic-free
-permute, the combine, and `ep_size == 1`, which has no dispatch. The per-expert loop's
-(`use_grouped_gemm: false`) `index_add_` is deterministic only because torch's mode swaps in its
-deterministic kernel.
+permute, the combine, the per-expert loop (`use_grouped_gemm: false`), whose every `index_add_` call
+writes each row at most once, and `ep_size == 1`, which has no dispatch.
 
 DeepEP asserts at every dispatch and combine, on both buffers, that deterministic mode does not run
 beside `torch.utils.deterministic.fill_uninitialized_memory`, which defaults to on whether or not the
@@ -363,7 +359,7 @@ backward still calls `buffer.combine()` / `buffer.dispatch()` for the gradient c
 
 That cache lives on an `EPCheckpointScope` (`src/distributed/expert_parallel/gc_scope.py`) created
 per checkpoint invocation and entered by both passes, not on the layer: concurrent frames stay
-separate (a pipeline stage would keep several microbatches in flight), and a `no_grad` reference or teacher pass
+separate, and a `no_grad` reference or teacher pass
 cannot reach a scope it did not create. The recompute signal is the scope's pass counter, not grad
 mode, so replay works in both checkpoint modes — but the two modes are still **not**
 interchangeable.
@@ -372,9 +368,7 @@ interchangeable.
 lazily, when backward first needs a discarded tensor; nothing imposes a common order across ranks,
 they desynchronize, and DeepEP's barrier times out — `cudaErrorLaunchFailure`, an unrecoverable
 abort, not a raised error. Measured on 2 GPUs: reentrant is grad-exact (worst relative gradient
-error 4.3e-05 vs no checkpointing, across all 155 parameters), non-reentrant aborts. (Pipeline
-parallelism — [not yet available](pipeline-parallelism.md) — would invert the rule: its schedule
-serializes each microbatch's backward, and the shipped config-time gates already encode that.)
+error 4.3e-05 vs no checkpointing, across all 155 parameters), non-reentrant aborts.
 
 Under [routing replay](../training-methods/grpo/async-grpo/objective.md#routing-replay)
 the recompute reads the frame's saved expert selection. Expert-load counters record only a scope's
@@ -428,8 +422,13 @@ each rank's expert slice straight from safetensors
 (`src/distributed/expert_parallel/lazy_loader.py`). The shell carries the **run's** dtype, not the
 checkpoint config's. Float parameters stream at that dtype; a float buffer keeps its stored dtype unless the
 family's fp32 pins name it (GLM-5 Next's `e_score_correction_bias`), which then loads fp32, as `from_pretrained`
-loads it. Configured parameter masters instead stream/fuse directly at FP32, independent of the
-shell's dtype or whether this is the first stage or a resume.
+loads it. Configured parameter masters are read and fused at FP32 instead
+([Load precision](../models/README.md#load-precision)).
+
+A per-expert checkpoint (a per-expert hub, or `unfuse_moe_experts.py` output) is read local-only and
+fused per rank. Under `text_only_model` every key of the multimodal checkpoint drops its
+`language_model.` segment, a per-expert one included, which is how the fuser finds the text-only
+class's fused parameter it feeds.
 
 The eager fallback replays only selected masters after HF construction, using the same checkpoint
 mapping and expert layout. FP32-stored masters need a **second read**; BF16 safetensors masters
@@ -511,8 +510,9 @@ holds:
 
 - `ep_group_size != world_size`, `expert_tp_size > 1`, or CP;
 - native expert LoRA or `merge_expert_lora_on_save`;
-- a `model_type` no EP layer class claims, or whose EP layer exports the hub namespace through
-  transformers' save-side revert (Step-3.7 Flash; the merge streams key by key and cannot apply it);
+- a `model_type` no EP layer class claims, or a load that converted names the gathered save reverts
+  through transformers' save-side revert (Step-3.7 Flash, a SigLIP tower, a vendor namespace; the
+  merge streams key by key and cannot apply it);
 - a non-shared multi-node filesystem;
 - **no EP layers at all** (dense, or an MoE without EP wrappers): every save would be an ordinary
   gathered checkpoint while a planned merge waits for shards that never appear.
@@ -528,7 +528,7 @@ so the trained weights load at model construction. The training scripts repoint 
 the checkpoint, and the checkpoint loader raises when the live model was constructed from anything
 else, rather than silently continuing on stale weights.
 
-The loader then restores adapters and extra trained params; optimizer, scheduler and balancing
+The loader then restores adapters; optimizer, scheduler and balancing
 biases resume from trainer state. A `merge_expert_lora_on_save` checkpoint is the exception to the
 repoint: it resumes from the base plus its `resume_adapter/`
 ([Merge-on-save checkpoints](../reference/checkpoints.md#merge-on-save-checkpoints)). An unmerged
@@ -542,8 +542,8 @@ replicas from rank 0. All ranks must enter the collectives even though only one 
 
 ## Limitations
 
-**Trainers.** Every trainer supports EP (`_supports_ep`, default `True`, never overridden), and the
-same flag gates the `ep_size == 1` grouped-GEMM wrappers. The families whose EP layer declares
+**Trainers.** Every trainer supports EP, and the `ep_size == 1` grouped-GEMM wrappers with it.
+The families whose EP layer declares
 `_supports_weight_sync = False` narrow this — online and async GRPO raise at construction for
 each of them ([Per-family EP restrictions](#per-family-ep-restrictions)). Matrix:
 [Trainer Compatibility](../reference/trainer-architecture.md#trainer-compatibility).
@@ -553,8 +553,7 @@ restrictions. A `ep_group_size > 1` run that patches **zero** MoE layers raises 
 dense model under EP or pure ETP is rejected.
 
 **Axis combinations.** EP composes with TP, CP and ETP; EP+TP+ETP, EP+TP+CP and EP+CP+ETP are
-refused by the [allowlist](README.md#supported-combinations), and PP shapes are
-[not yet available in this release](pipeline-parallelism.md). EP-specific topology rejections sit on
+refused by the [allowlist](README.md#supported-combinations). EP-specific topology rejections sit on
 top: single-domain multi-group EP with `ep_size > 2`
 ([above](#single-domain-multi-group-ep-races-and-hangs)), multi-domain multi-group EP+TP / EP+ETP,
 and EP+CP on anything but a node-local EP group filling the NVLink domain.
@@ -566,12 +565,12 @@ and EP+CP on anything but a node-local EP group filling the NVLink domain.
 | QLoRA / `load_in_4bit` | rejected — the EP loaders materialize plain de-quantized weights, losing `Params4bit` | `model_loading.py` |
 | fp32 training (`bf16: false`) | rejected at `expert_parallel_size > 1` — DeepEP's buffer carries 2-byte tokens; FP32 storage comes from the `fp32_*` masters ([Precision control](#precision-control)) | `model_loading.py` |
 | `use_peft` / LoRA | attention adapters are fine; a PEFT `LoraLayer` **inside** an EP layer is rejected — expert LoRA must go through the native grouped adapters | `_validate_lora_ep_compatibility` |
-| expert LoRA | rejected with `expert_tp_size > 1` at config time, before the checkpoint downloads (`EPConfig` re-checks hand-built configs at group construction); rejected under [TP](tensor-parallelism.md#limitations) and PP, and alongside `save_sharded_ep`; a `merge_lora` gather under ETP raises | `_validate_expert_tp`, `_validate_lora_tp_compatibility`, `_validate_pipeline_parallel`, `saving.py` |
+| expert LoRA | rejected with `expert_tp_size > 1` at config time, before the checkpoint downloads (`EPConfig` re-checks hand-built configs at group construction); rejected under [TP](tensor-parallelism.md#limitations) and alongside `save_sharded_ep`; a `merge_lora` gather under ETP raises | `_validate_expert_tp`, `_validate_lora_tp_compatibility`, `ep_save.py` |
 | `use_grouped_gemm: false` | drops the wrappers at `ep_size == 1`; peeled expert-LoRA targets then raise rather than silently vanish | `_validate_expert_lora_realized` |
 | `fsdp_reshard_after_forward` | rejected — the backward all-gather can race the DeepEP combine | `_validate_fsdp_settings` |
 | `use_hsdp` | rejected — EP already shards over the EP group | `_validate_hsdp` |
 | `bf16_optimizer: false` with a stock AdamW `optim` | rejected at optimizer build ([why](../optimization/bf16-optimizer.md#usage)); `fp32_non_ep_params: true`, `muon` and `flash_adamw` build | `mixins/base.py` |
-| `ref_model` (explicit) | rejected — the reference is never parallelized, so its log-probs would not match the policy | `_validate_reference_model` |
+| `ref_model` (explicit) | warned — the reference is never parallelized, so every rank holds a whole dense replica; its log-probs match the policy's up to kernel numerics | `warn_unparallelized_reference` |
 | `init_from_scratch` | rejected — no sharded random init | `model_loading.py` |
 | `accelerate launch` | rejected — EP requires `torchrun`; the same rejection covers a grouped-GEMM MoE at `ep_size == 1` | `model_loading.py`, `ParallelismValidationMixin` |
 | `save_sharded_ep` | needs a single EP group spanning the world; every rejection is listed under [Checkpointing](#checkpointing) | `validate_ep_sharded_save` |

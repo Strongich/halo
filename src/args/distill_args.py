@@ -1,6 +1,7 @@
 """Script arguments for off-policy teacher distillation."""
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from src.args.common_script_args import CommonScriptArguments
 from src.args.mixins import ConversationRenderArguments
@@ -8,6 +9,8 @@ from src.args.mixins import ConversationRenderArguments
 
 @dataclass
 class DistillScriptArguments(ConversationRenderArguments, CommonScriptArguments):
+    PROJECT_NAME: ClassVar[str] = "llm_distillation"
+
     teacher_model: str | None = field(
         default=None,
         metadata={"help": "Name or path of the teacher model for distillation"},
@@ -28,11 +31,7 @@ class DistillScriptArguments(ConversationRenderArguments, CommonScriptArguments)
 
     def _validate_ranges(self) -> None:
         """Require ``teacher_model``: an empty value reaches the loader as a blank model id and only
-        fails there, and the CLI override path bypasses ``__post_init__``."""
+        fails there."""
         super()._validate_ranges()
         if not self.teacher_model:
             raise ValueError("teacher_model must be specified for distillation")
-
-    def __post_init__(self):
-        self._apply_default_project_name("llm_distillation")
-        self._validate_ranges()

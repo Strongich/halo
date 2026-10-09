@@ -104,11 +104,44 @@ def test_wrapper_layout_input_is_refused(artifacts, tmp_path):
         reattach_vision_tower(base_dir, base_dir, str(tmp_path / "out2"), trust_remote_code=False)
 
 
+def _relabelled_export(export_dir: str, target: str, relabel) -> str:
+    """``export_dir``'s config over its tensors with every key passed through ``relabel``."""
+    os.makedirs(target)
+    tensors = load_file(os.path.join(export_dir, "model.safetensors"))
+    save_file({relabel(key): value for key, value in tensors.items()}, os.path.join(target, "model.safetensors"))
+    AutoConfig.from_pretrained(export_dir).save_pretrained(target)
+    return target
+
+
+@pytest.mark.parametrize(
+    ("relabel", "match"),
+    [
+        (lambda key: key.replace("model.", "model.language_model.", 1), "would nest the wrapper prefix"),
+        (
+            lambda key: key.replace("model.norm.", "model.visual.norm.", 1),
+            "address no module of the base's text tower",
+        ),
+    ],
+    ids=["wrapper_prefixed", "stray_module"],
+)
+def test_an_export_whose_keys_do_not_match_its_config_is_refused(artifacts, tmp_path, relabel, match):
+    """A text-only config over keys the text-only class does not spell — the wrapper layout a stock
+    ``save_pretrained`` of a text-only load writes, or a module the base's text tower lacks — would be
+    re-prefixed onto no slot of the wrapper class, and the served checkpoint would reload its text
+    tower randomly initialized under a reported success."""
+    base_dir, export_dir = artifacts
+    relabelled = _relabelled_export(export_dir, str(tmp_path / "relabelled"), relabel)
+    out = tmp_path / "out5"
+    with pytest.raises(ValueError, match=match):
+        reattach_vision_tower(relabelled, base_dir, str(out), trust_remote_code=False)
+    assert not out.exists(), "a refused re-attachment must not create its output directory"
+
+
 def test_a_base_storing_its_text_tower_under_another_prefix_is_refused(artifacts, tmp_path):
     """The export supersedes the base's text tower by key prefix. A base keeping a vendor namespace
     (renamed only inside ``from_pretrained``) has nothing under ``model.language_model.``, so every
-    one of its text tensors was carried over beside the trained ones — two text towers colliding on
-    load — and the run reported success. Refused before the output directory exists."""
+    one of its text tensors would be carried over beside the trained ones — two text towers colliding
+    on load — under a reported success. Refused before the output directory exists."""
     base_dir, export_dir = artifacts
     vendor_base = tmp_path / "vendor_base"
     vendor_base.mkdir()
@@ -127,8 +160,8 @@ def test_a_base_storing_its_text_tower_under_another_prefix_is_refused(artifacts
 
 def test_an_output_aimed_at_the_base_is_refused(artifacts):
     """The base is streamed from while the writer's close sweeps every ``model*.safetensors`` it did
-    not write, so ``--output_dir`` equal to a local ``--model_id`` replaced the base checkpoint with
-    the wrapper artifact and reported success."""
+    not write, so ``--output_dir`` equal to a local ``--model_id`` would replace the base checkpoint
+    with the wrapper artifact under a reported success."""
     base_dir, export_dir = artifacts
     before = sorted(os.listdir(base_dir))
     with pytest.raises(ValueError, match="same path"):

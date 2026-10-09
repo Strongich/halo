@@ -34,10 +34,10 @@ correctness test (loss finite + decreasing over ≥2 steps + cross-rank invarian
 `_supports_cp` / `_supports_pp` (`src/trainers/mixins/base.py`, both default `False`) are the class
 attributes that drive the rejections. CP is incompatible with any trainer using `logits_to_keep`,
 global log-prob sums, full-sequence pooling, dual models, or a separate-length teacher or rollout
-sequence; PP additionally rejects PEFT/LoRA, a
-live `ref_model`, `activation_offloading` and reentrant GC at trainer construction. The PP column
-records each class's declared `_supports_pp`; while PP is unavailable it drives no runnable cell,
-so its **Yes** entries carry no correctness-test obligation.
+sequence. The PP trainer gates (PEFT/LoRA, a live `ref_model`, `activation_offloading`, reentrant
+GC) fire only on a hand-built PP config. The PP column records each class's declared
+`_supports_pp`; while PP is unavailable it drives no runnable cell, so its **Yes** entries carry no
+correctness-test obligation.
 
 ## Parallelism-mode matrix (from `CLAUDE.md`)
 
@@ -52,12 +52,10 @@ Pure-EP topology caveat — `ep_size=2` (2-rank groups) or `ep_size = nvlink_dom
 group filling the domain) is supported. Multiple >2-rank dispatch groups in one domain
 (`num_nvlink_domains == 1 and ep_size > 2 and nvlink_domain_size > ep_group_size`, e.g. ep4 on an
 8-GPU domain) are rejected — mechanism and evidence in the `parallelism` skill (`matrix.md`, row
-*Multi-group >2-rank EP on one NVLink domain*). The two enforcement points a test can target:
+*Multi-group >2-rank EP on one NVLink domain*). The enforcement point a test can target:
 `ParallelismConfig._validate_single_domain_multigroup_ep` raises at
-config time (predicate `is_racy_single_domain_multigroup_ep`), and
-`_setup_ep_gradient_checkpointing` (`src/trainers/mixins/ep_introspection.py`) re-checks at
-trainer setup for hand-built configs. Write it as a **rejection** test (CPU config test is
-enough), not a correctness test.
+config time (predicate `is_racy_single_domain_multigroup_ep`), hand-built configs included. Write it
+as a **rejection** test (CPU config test is enough), not a correctness test.
 
 ## REQUIRED rejection tests (combos that MUST raise)
 
@@ -65,15 +63,15 @@ enough), not a correctness test.
 |---|---|
 | EP + TP + ETP (`ep_size>1` AND `tp_size>1` AND `expert_tp_size>1`) | raises at config/init |
 | TP + ETP (`tp_size>1` AND `expert_tp_size>1`, `ep_size==1`) | raises — two shardings of the same ranks |
-| TP + CP (`tp_size>1` AND `cp_size>1`) | raises — DTensor mesh conflicts with CP groups |
-| ETP + CP (`expert_tp_size>1` AND `cp_size>1`) | raises — ETP sub-EP groups break CP seq reconstruction |
-| Any `pipeline_parallel_size > 1` | raises at config time — the schedule engine is not shipped in this release (`parallelism_config_from_args`); constructing `PipelineRuntime` raises `NotImplementedError` |
-| PP + TP, PP + CP (`pp_size>1` with either) | raises — untested on real multi-node hardware (TP); CP-scaled gradients with no error (CP) |
-| PP + EP + TP, PP + EP + CP, PP + EP + ETP (all three `>1`) | raises — outside the allowlist; FSDP mesh conflict (TP), CP-scaled expert gradients (CP), the expert-TP reduce cannot be deferred past the combine (ETP) |
+| TP + CP (`tp_size>1` AND `cp_size>1`) | raises — both partition the same contiguous rank blocks, and Ulysses redistributes heads TP already split |
+| ETP + CP (`expert_tp_size>1` AND `cp_size>1`) | raises — expert-TP partners sum their outputs in token space while CP hands each rank a different chunk |
+| Any `pipeline_parallel_size > 1` | raises at config time in `parallelism_config_from_args`: a `_supports_pp=False` trainer's gate first, then the release gate (the schedule engine is not shipped); constructing `PipelineRuntime` raises `NotImplementedError` |
+| PP + TP, PP + CP (`pp_size>1` with either), on a directly constructed `ParallelismConfig` | raises at the allowlist — untested on real multi-node hardware (TP); CP-scaled gradients with no error (CP) |
+| PP + EP + TP, PP + EP + CP, PP + EP + ETP (all three `>1`), on a directly constructed `ParallelismConfig` | raises — outside the allowlist; FSDP mesh conflict (TP), CP-scaled expert gradients (CP), the expert-TP reduce cannot be deferred past the combine (ETP) |
 | QLoRA + EP | raises |
 | LoRA/PEFT + TP (`tp_size>1`), native EP expert LoRA included | raises at trainer construction — `_validate_lora_tp_compatibility` |
 | Multi-group >2-rank EP on one NVLink domain (`ep_size>2` with `nvlink_domain_size > ep_group_size`) | fails fast (DeepEP combine race) |
-| `_supports_cp=False` trainer with `cp_size>1`, `_supports_pp=False` with `pp_size>1` | rejects at trainer `__init__` |
+| `_supports_cp=False` trainer with `cp_size>1`, `_supports_pp=False` with `pp_size>1` | rejects in `parallelism_config_from_args` (for PP ahead of the release gate), and at trainer `__init__` for a hand-built config |
 
 A rejection test asserts the *reason*, not just that something raised:
 

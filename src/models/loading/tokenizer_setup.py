@@ -17,10 +17,11 @@ from transformers import AutoProcessor, AutoTokenizer, PreTrainedModel, PreTrain
 
 from src.data.pipeline.tokenizer_backend import resolve_tokenizer_backend
 from src.models.loading.config_levels import set_config_field, text_config
+from src.models.structure import resolve_tokenizer
 
 if TYPE_CHECKING:
-    # Annotation only: the entry scripts' argument layer sits above this module, and nothing here
-    # reads the dataclass itself.
+    # Annotation only: the entry scripts' argument layer sits above this loading leaf, and nothing
+    # here reads the dataclass itself.
     from src.args.common_script_args import CommonScriptArguments
 
 logger = get_logger(__name__)
@@ -29,6 +30,10 @@ logger = get_logger(__name__)
 # pinning the run's, for :func:`pristine_model_max_length` to serve back at save time. A plain int on
 # the instance, so the tokenizer stays picklable for the dataset-map fingerprint and the workers.
 _PRISTINE_MODEL_MAX_LENGTH_ATTR = "_halo_pristine_model_max_length"
+
+# Marks a tokenizer whose chat template the run chose (:func:`set_run_chat_template`), which its processor
+# then adopts (:func:`adopt_tokenizer_chat_template`); a template the checkpoint shipped stays each one's.
+_RUN_CHAT_TEMPLATE_ATTR = "_halo_run_chat_template"
 
 # Bound below which a ``model_max_length`` is a real context window. HF's "this tokenizer declares no
 # length" sentinel (``VERY_LARGE_INTEGER``, 1e30) sits above it and is a positive int, so
@@ -39,15 +44,16 @@ UNSET_MODEL_MAX_LENGTH = int(1e9)
 def load_processing_class(path: str, *, trust_remote_code: bool = False):
     """Load the widest processing class: ``AutoProcessor`` for multimodal, else ``AutoTokenizer``, else ``None``.
 
-    Re-save utilities must persist this: saving only the tokenizer for a VLM yields an unloadable
-    checkpoint. Only a directory holding no tokenizer yields ``None``, which every caller reads as
-    nothing to save; any other failure propagates.
+    Re-save utilities MUST persist this — saving only the tokenizer for a VLM yields an unloadable
+    checkpoint. Only "this directory holds no tokenizer" yields ``None``, because every caller reads
+    that as "nothing to save": any other failure must propagate rather than ship a resized model
+    beside the checkpoint's stale tokenizer.
     """
     try:
         return AutoProcessor.from_pretrained(path, trust_remote_code=trust_remote_code)
     except (OSError, ValueError) as e:
-        # The two ways a repo reports having no processor (absent processor config, unrecognized
-        # processing class). This is the ordinary text-only path, hence info rather than a warning.
+        # The two ways "this repo has no processor" is reported (absent processor config,
+        # unrecognized processing class) — the ordinary text-only path, hence info, not a warning.
         logger.info(f"No processor at {path} ({type(e).__name__}: {e}); falling back to the tokenizer.")
         try:
             return AutoTokenizer.from_pretrained(path, trust_remote_code=trust_remote_code)
@@ -59,13 +65,21 @@ def load_processing_class(path: str, *, trust_remote_code: bool = False):
             return None
 
 
-def resolve_peft_processing_class(adapter_dir: str, base_model_path: str, *, trust_remote_code: bool = False):
+def resolve_peft_processing_class(
+    adapter_dir: str, base_model_path: str, *, text_only: bool, trust_remote_code: bool = False
+):
     """Resolve the processing class for a merged / converted PEFT checkpoint.
 
-    Prefer the base model's full processor when the adapter carries only a tokenizer (a VLM adapter
-    directory drops the image preprocessor); keep the adapter's class when it is a full processor.
+    The adapter directory holds the run's own processing class, with its chat template, special tokens
+    and added vocabulary. ``text_only`` (the adapter addresses a multimodal checkpoint's text-only
+    class) ships that run's tokenizer, falling back to the base's only where the adapter saved none.
+    Otherwise the base's full processor wins over an adapter carrying only a tokenizer (a tokenizer-only
+    save of a multimodal checkpoint is unloadable), and an adapter's own full processor is kept.
     """
     adapter_pc = load_processing_class(adapter_dir, trust_remote_code=trust_remote_code)
+    if text_only:
+        chosen = adapter_pc or load_processing_class(base_model_path, trust_remote_code=trust_remote_code)
+        return None if chosen is None else resolve_tokenizer(chosen)
     base_pc = load_processing_class(base_model_path, trust_remote_code=trust_remote_code)
     base_is_full = base_pc is not None and not isinstance(base_pc, PreTrainedTokenizerBase)
     adapter_is_full = adapter_pc is not None and not isinstance(adapter_pc, PreTrainedTokenizerBase)
@@ -104,7 +118,7 @@ def context_window_from_config(config) -> int | None:
 
     Read off the text sub-config, where a composite (VLM) config keeps the position budget. Split out
     of :func:`get_model_context_window` for the config-time gates, which judge a run before any model
-    or tokenizer exists and would otherwise re-spell the lookup.
+    or tokenizer exists and must not re-spell the lookup.
     """
     decoder_config = text_config(config)
     for attr in ("max_position_embeddings", "max_seq_length", "n_positions"):
@@ -139,9 +153,10 @@ def get_model_context_window(model: PreTrainedModel, tokenizer: PreTrainedTokeni
 def is_bounded_length(value: int | None) -> bool:
     """Whether a length knob states a real bound.
 
-    A positive int is a bound; ``None`` and any non-positive value mean unset. Getting it wrong
-    raises nothing: HF resolves ``truncation=True, max_length=None`` against
-    ``tokenizer.model_max_length``, and ``ids[-0:]`` is the whole list.
+    A positive int is a bound; ``None`` and any non-positive value mean "unset". Shared rather than
+    re-spelled per call site because every consequence of getting it wrong is silent: HF resolves
+    ``truncation=True, max_length=None`` against ``tokenizer.model_max_length``, and ``ids[-0:]`` is
+    the whole list.
     """
     return value is not None and value > 0
 
@@ -149,9 +164,9 @@ def is_bounded_length(value: int | None) -> bool:
 def resolve_length_to_context(value: int | None, model: PreTrainedModel, tokenizer: PreTrainedTokenizer) -> int:
     """Return ``value`` when it is a positive length, else the model's context window.
 
-    ``None`` and any non-positive value both mean the model's own limit, so a config writing
-    ``max_length: null`` truncates at the real context window rather than at a small dataclass
-    default.
+    ``None`` and any non-positive value both mean "use the model's own limit" — a config writing
+    ``max_length: null`` opts into truncating at the real context window rather than a small
+    dataclass default.
     """
     if is_bounded_length(value):
         return value
@@ -164,9 +179,10 @@ def sync_special_token_id(model: PreTrainedModel | None, field: str, token_id) -
     """Record a tokenizer special-token id on the model, everywhere the model reads it back.
 
     Writes every config level that declares ``field``, plus the generation config when the head
-    carries one. The per-level write is what makes composite families work: pooling keys on
+    carries one (transformers attaches it only to models that ``can_generate()``). The per-level
+    write is what makes composite families work: pooling keys on
     ``config.get_text_config().pad_token_id``, so a top-level-only write leaves the decoder's id
-    unset (batch > 1 raises) or stale at the checkpoint's value.
+    unset (batch > 1 raises) or stale at the checkpoint's (pooling picks the wrong last token).
     """
     if model is None:
         return
@@ -187,7 +203,7 @@ def setup_model_and_tokenizer(
     tokenizer: PreTrainedTokenizer,
     max_seq_len: int | None = None,
     *,
-    embeddings_sharded: Callable[[PreTrainedModel], bool] = lambda _model: False,
+    embeddings_sharded: Callable[[PreTrainedModel], bool],
 ) -> PreTrainedTokenizer:
     """Apply args-driven tokenizer/model token setup; returns the tokenizer to use.
 
@@ -196,30 +212,30 @@ def setup_model_and_tokenizer(
     tokenizer state (chat template, added special tokens).
 
     ``embeddings_sharded`` says whether a vocabulary grow is impossible because the model's input
-    embedding is a parallelism shard. It is a parameter rather than an import, since sharding lives
-    under ``src.distributed`` and this layer stays sharding-agnostic. It matters only for a run that
-    grows the vocabulary; the default suits a caller that shards nothing.
+    embedding is a parallelism shard — a parameter rather than an import, since what sharding is
+    lives under ``src.distributed`` and this layer stays sharding-agnostic. Asked only about a run
+    that actually grows the vocabulary.
     """
     if max_seq_len is not None:
-        # Recorded once, before the first pin overwrites it (a preference/distillation script runs
-        # this twice against the same tokenizer), so every export can be written with the tokenizer's
-        # own bound; see :func:`pristine_model_max_length`.
+        # Recorded once, before the first pin overwrites it (a script holding a frozen reference —
+        # preference, offline GRPO, self-distillation — runs this seam twice against the same
+        # tokenizer), so every export can be written with the tokenizer's OWN bound — see
+        # :func:`pristine_model_max_length`.
         if not hasattr(tokenizer, _PRISTINE_MODEL_MAX_LENGTH_ATTR):
             setattr(tokenizer, _PRISTINE_MODEL_MAX_LENGTH_ATTR, tokenizer.model_max_length)
         tokenizer.model_max_length = max_seq_len
-    # Added before the special-token roles below, because those read an id back: a token added
+    # Added BEFORE the special-token roles below, because those read an id back: a token added
     # afterwards has none at the time of the read, so ``--pad_token <new>`` with the same token in
     # ``--added_special_tokens`` would pad with an id the model config never recorded.
     if args.added_special_tokens is not None:
-        # Union rather than the transformers default: ``replace_extra_special_tokens=True`` swaps the
-        # whole extra-special list for the request, dropping every control token the checkpoint
-        # shipped (Qwen's 13, GLM's role enders) from ``all_special_ids``, the trainers'
-        # special-token masks and the exported tokenizer_config.json.
+        # UNION, not the transformers default: ``replace_extra_special_tokens=True`` swaps the whole
+        # extra-special list for the request, dropping every control token the checkpoint shipped
+        # (Qwen's 13, GLM's role enders) from ``all_special_ids``, the trainers' special-token masks
+        # and the exported tokenizer_config.json.
         tokenizer.add_special_tokens(
             {"additional_special_tokens": args.added_special_tokens}, replace_extra_special_tokens=False
         )
-        # Grow only: shrinking drops special tokens above len(tokenizer) and the model can no longer
-        # emit a stop token.
+        # Grow only: shrinking drops special tokens above len(tokenizer) and the model can no longer stop.
         if model is not None and len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
             if embeddings_sharded(model):
                 raise ValueError(
@@ -228,9 +244,9 @@ def setup_model_and_tokenizer(
                     f"re-shard. Grow the vocabulary before the run with scripts/before_training/patch_vocab.py."
                 )
             model.resize_token_embeddings(len(tokenizer))
-    # The tokenizer write is conditional, the model write is not: a preference/distillation script
-    # runs this once per model against the same tokenizer, so a shared guard would skip the second
-    # sync and leave that model's config on the checkpoint's eos.
+    # The tokenizer write is conditional, the MODEL write is not: a script holding a frozen reference
+    # runs this seam once per model against the SAME tokenizer, so a shared guard would skip the
+    # second sync and leave that model's config on the checkpoint's eos.
     if args.eos_token is not None:
         if tokenizer.eos_token != args.eos_token:
             tokenizer.eos_token = args.eos_token
@@ -244,13 +260,13 @@ def setup_model_and_tokenizer(
     elif args.pad_token is None and tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
     # Recorded whatever settled it, unlike eos/bos above: pooling reads the pad id back to locate
-    # each row's last content token, so it must equal the id the collator pads with. An unset id
-    # raises at batch > 1; a stale one pools on padding.
+    # each row's last content token, so it must equal the id the collator pads with — none raises at
+    # batch > 1, a stale one pools on padding in silence.
     if tokenizer.pad_token_id is not None:
         sync_special_token_id(model, "pad_token_id", tokenizer.pad_token_id)
         if tokenizer.pad_token_id == tokenizer.eos_token_id and model is not None:
-            # DeepSeek-V4's tokenizer pads with eos while its config ships no pad id, so this is the
-            # first place the consequence can be reported.
+            # A live pairing, not a hypothetical: DeepSeek-V4's tokenizer pads with eos and its config
+            # ships no pad id, so this is the first place the cost can be named.
             logger.info(
                 "Tokenizer pad token IS eos (id %s), so the recorded pad id binds "
                 "nn.Embedding(padding_idx=%s) on the next load and that row's input-embedding gradient "
@@ -267,10 +283,31 @@ def setup_model_and_tokenizer(
             f"cause; both the padding collators and sequence-classification pooling read this id."
         )
     if tokenizer.chat_template is None or (args.chat_template is not None and args.force_chat_template):
-        chat_template = load_chat_template(args.chat_template)
-        tokenizer.chat_template = chat_template
+        set_run_chat_template(tokenizer, load_chat_template(args.chat_template))
 
     return resolve_tokenizer_backend(tokenizer, args.tokenizer_backend)
+
+
+def set_run_chat_template(tokenizer: PreTrainedTokenizerBase, template: str | None) -> None:
+    """Set the chat template the run chose on ``tokenizer``, marked for its processor to adopt."""
+    tokenizer.chat_template = template
+    setattr(tokenizer, _RUN_CHAT_TEMPLATE_ATTR, True)
+
+
+def adopt_tokenizer_chat_template(processing_class) -> None:
+    """Give a processor the chat template the run chose for its tokenizer (:func:`set_run_chat_template`).
+
+    A processor's ``chat_template`` is its own attribute, apart from its tokenizer's: its
+    ``apply_chat_template`` renders with it, and its ``save_pretrained`` writes it over the
+    ``chat_template.jinja`` the tokenizer wrote. A template set on the tokenizer alone would leave the
+    processor training and exporting the checkpoint's original. A no-op for a plain tokenizer and
+    where the run chose no template: a processor keeps the one its checkpoint shipped for it.
+    """
+    if isinstance(processing_class, PreTrainedTokenizerBase):
+        return
+    tokenizer = resolve_tokenizer(processing_class)
+    if getattr(tokenizer, _RUN_CHAT_TEMPLATE_ATTR, False) and tokenizer.chat_template is not None:
+        processing_class.chat_template = tokenizer.chat_template
 
 
 def _length_pinned_tokenizer(processing_class):
@@ -287,10 +324,10 @@ def _length_pinned_tokenizer(processing_class):
 
 @contextlib.contextmanager
 def pristine_model_max_length(processing_class):
-    """Serve the tokenizer's own ``model_max_length`` for the duration of a save.
+    """Serve the tokenizer's OWN ``model_max_length`` for the duration of a save.
 
     The run's budget is pinned onto ``tokenizer.model_max_length`` because HF resolves every
-    ``truncation=True, max_length=None`` call against it, but ``save_pretrained`` writes the live
+    ``truncation=True, max_length=None`` call against it, but ``save_pretrained`` writes the LIVE
     attribute into ``tokenizer_config.json``: unrestored, an SFT run at ``max_length: 40000`` exports
     a 262k-context model whose served context is 40k. The pin is put back on exit, and a run that
     never pinned one has no value to keep off disk.

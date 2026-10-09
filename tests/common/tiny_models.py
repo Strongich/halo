@@ -18,9 +18,13 @@ from transformers import (
     AutoModelForImageTextToText,
     Cohere2MoeConfig,
     Cohere2MoeForCausalLM,
+    Cohere2VisionConfig,
+    Cohere2VisionForConditionalGeneration,
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
+    Gemma4Config,
     Gemma4ForCausalLM,
+    Gemma4ForConditionalGeneration,
     Gemma4TextConfig,
     Glm4MoeLiteConfig,
     Glm4MoeLiteForCausalLM,
@@ -28,15 +32,23 @@ from transformers import (
     Glm5NextForConditionalGeneration,
     GptOssConfig,
     GptOssForCausalLM,
+    InklingConfig,
     InklingForCausalLM,
+    InklingForConditionalGeneration,
     InklingTextConfig,
     LagunaConfig,
     LagunaForCausalLM,
     Lfm2MoeConfig,
     Lfm2MoeForCausalLM,
+    Lfm2VlConfig,
+    Lfm2VlForConditionalGeneration,
+    Mistral3Config,
+    Mistral3ForConditionalGeneration,
     PreTrainedModel,
     Qwen3_5ForCausalLM,
+    Qwen3_5MoeConfig,
     Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeForConditionalGeneration,
     Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
     Qwen3Config,
@@ -61,20 +73,28 @@ from tests.common.models import (
     TINY_COHERE2_MOE_CONFIG,
     TINY_DSV4_CONFIG,
     TINY_GEMMA4_MOE_CONFIG,
+    TINY_GEMMA4_VISION_CONFIG,
     TINY_GLM4_MOE_LITE_CONFIG,
     TINY_GLM5_CONFIG,
     TINY_GLM5_VISION_CONFIG,
     TINY_GPTOSS_CONFIG,
     TINY_INKLING_CONFIG,
+    TINY_INKLING_VISION_CONFIG,
     TINY_LAGUNA_CONFIG,
     TINY_LFM2_MOE_CONFIG,
     TINY_MISTRAL4_CONFIG,
+    TINY_PIXTRAL_VISION_CONFIG,
     TINY_QWEN3_CONFIG,
     TINY_QWEN3_MOE_CONFIG,
     TINY_QWEN35_CONFIG,
     TINY_QWEN35_MOE_CONFIG,
+    TINY_QWEN35_VISION_CONFIG,
+    TINY_SIGLIP2_VISION_CONFIG,
+    TINY_SIGLIP_VISION_CONFIG,
     TINY_STEP3P7_CONFIG,
     TINY_STEP3P7_VISION_CONFIG,
+    TINY_TIED_QWEN3_CONFIG,
+    TINY_TIED_QWEN3_MOE_FIELDS,
     TINY_ZAYA_CONFIG,
 )
 
@@ -88,6 +108,35 @@ DSV4_TID2EID_SEED = 1234
 PINNED_FP32_FAMILIES = ("deepseek_v4", "glm5_next", "inkling_text")
 # The files a synthetic checkpoint copies from its release so ``AutoTokenizer`` loads it offline.
 TOKENIZER_FILE_PREFIXES = ("tokenizer", "special_tokens", "chat_template")
+
+
+def padded_vocab_size(tokenizer) -> int:
+    """``tokenizer``'s vocab rounded up to :data:`VOCAB_PAD_MULTIPLE`, as a release pads it so a TP-sharded
+    embedding and head divide it."""
+    return -(-len(tokenizer) // VOCAB_PAD_MULTIPLE) * VOCAB_PAD_MULTIPLE
+
+
+class _WeightLeaf(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+
+def module_with_weight_keys(paths: list[str]) -> torch.nn.Module:
+    """A module tree whose state dict is exactly ``paths`` (each ending in ``.weight``): the key space a
+    checkpoint-conversion or master-replay test maps disk keys onto, without a model behind it."""
+    root = torch.nn.Module()
+    for path in paths:
+        parent = root
+        parts = path.split(".")
+        for name in parts[:-2]:
+            child = parent._modules.get(name)
+            if child is None:
+                child = torch.nn.Module()
+                parent.add_module(name, child)
+            parent = child
+        parent.add_module(parts[-2], _WeightLeaf())
+    return root
 
 
 def randomize_tid2eid(model, seed: int = DSV4_TID2EID_SEED) -> None:
@@ -112,6 +161,19 @@ def copy_release_tokenizer(repo_id: str, out_dir: Path) -> None:
     for src in tokenizer_dir.iterdir():
         if src.is_file() and src.name.startswith(TOKENIZER_FILE_PREFIXES):
             shutil.copy2(src, out_dir / src.name)
+
+
+def build_tied_qwen3_checkpoint(target_dir: str, tokenizer, *, moe: bool, seed: int) -> None:
+    """Save a random-init :data:`TINY_TIED_QWEN3_CONFIG` model (Qwen3-MoE with ``moe``) at ``tokenizer``'s
+    padded vocab, with that tokenizer, as a checkpoint the production loaders read. Rank 0 only."""
+    torch.manual_seed(seed)
+    fields = {**TINY_TIED_QWEN3_CONFIG, "vocab_size": padded_vocab_size(tokenizer)}
+    if moe:
+        model = Qwen3MoeForCausalLM(Qwen3MoeConfig(**fields, **TINY_TIED_QWEN3_MOE_FIELDS))
+    else:
+        model = Qwen3ForCausalLM(Qwen3Config(**fields))
+    model.to(torch.bfloat16).save_pretrained(target_dir)
+    tokenizer.save_pretrained(target_dir)
 
 
 def build_tiny_mistral4_checkpoint(out_dir: Path, seed: int = 0) -> Path:
@@ -155,8 +217,12 @@ def _causal(config_cls: type, model_cls: type, tiny: dict) -> Callable[[dict], P
     return lambda overrides: model_cls(config_cls(**{**tiny, **overrides}))
 
 
-def _composite(config_cls: type, model_cls: type, text: dict, vision: dict) -> Callable[[dict], PreTrainedModel]:
-    return lambda overrides: model_cls(config_cls(text_config={**text, **overrides}, vision_config=dict(vision)))
+def _composite(
+    config_cls: type, model_cls: type, text: dict, vision: dict, **wrapper
+) -> Callable[[dict], PreTrainedModel]:
+    return lambda overrides: model_cls(
+        config_cls(text_config={**text, **overrides}, vision_config=dict(vision), **wrapper)
+    )
 
 
 def _tiny_deepseek_v4(overrides: dict) -> PreTrainedModel:
@@ -252,6 +318,69 @@ TINY_MOE_FAMILIES: dict[str, TinyFamily] = {
         attention_targets=("o_proj",),
     ),
 }
+# The multimodal wrappers an EP family's text tower ships under, keyed by the wrapper's ``model_type``
+# (GLM-5 Next and Step-3.7 ship no text-only class, so their roster model above is already the
+# wrapper). A ``text_config`` names its ``model_type`` where the wrapper defaults to another family's
+# tower. ``tests/cpu/checkpoint/test_ep_hub_namespace_export.py`` holds the two rosters to every
+# multimodal ``model_type`` the EP registry claims.
+TINY_MOE_VLM_FAMILIES: dict[str, TinyFamily] = {
+    "cohere2_vision": TinyFamily(
+        _composite(
+            Cohere2VisionConfig,
+            Cohere2VisionForConditionalGeneration,
+            {**TINY_COHERE2_MOE_CONFIG, "model_type": "cohere2_moe"},
+            TINY_SIGLIP_VISION_CONFIG,
+            downsample_factor=2,
+            alignment_intermediate_size=64,
+        ),
+        load_class=AutoModelForImageTextToText,
+    ),
+    "gemma4": TinyFamily(
+        _composite(
+            Gemma4Config,
+            Gemma4ForConditionalGeneration,
+            TINY_GEMMA4_MOE_CONFIG,
+            TINY_GEMMA4_VISION_CONFIG,
+            audio_config=None,
+        ),
+        load_class=AutoModelForImageTextToText,
+        ulysses_cp=False,
+    ),
+    "inkling_mm_model": TinyFamily(
+        _composite(InklingConfig, InklingForConditionalGeneration, TINY_INKLING_CONFIG, TINY_INKLING_VISION_CONFIG),
+        load_class=AutoModelForImageTextToText,
+        ulysses_cp=False,
+    ),
+    "lfm2_vl": TinyFamily(
+        _composite(
+            Lfm2VlConfig,
+            Lfm2VlForConditionalGeneration,
+            {**TINY_LFM2_MOE_CONFIG, "model_type": "lfm2_moe"},
+            TINY_SIGLIP2_VISION_CONFIG,
+            projector_hidden_size=64,
+        ),
+        load_class=AutoModelForImageTextToText,
+        ulysses_cp=False,
+    ),
+    "mistral3": TinyFamily(
+        _composite(
+            Mistral3Config,
+            Mistral3ForConditionalGeneration,
+            {**TINY_MISTRAL4_CONFIG, "model_type": "mistral4"},
+            TINY_PIXTRAL_VISION_CONFIG,
+            spatial_merge_size=2,
+            tie_word_embeddings=TINY_MISTRAL4_CONFIG["tie_word_embeddings"],
+        ),
+        load_class=AutoModelForImageTextToText,
+    ),
+    "qwen3_5_moe": TinyFamily(
+        _composite(
+            Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration, TINY_QWEN35_MOE_CONFIG, TINY_QWEN35_VISION_CONFIG
+        ),
+        load_class=AutoModelForImageTextToText,
+        ulysses_cp=False,
+    ),
+}
 # The dense model the family sweeps pair with the MoE roster.
 TINY_DENSE_FAMILY = TinyFamily(_causal(Qwen3Config, Qwen3ForCausalLM, TINY_QWEN3_CONFIG))
 # The dense Qwen3.5 text model (gated DeltaNet and attention layers), which the MoE roster does not carry.
@@ -266,8 +395,7 @@ def tiny_family_model(family: TinyFamily, tokenizer=None, *, overrides: dict | N
     overrides = {**family.text_overrides, **(overrides or {})}
     if tokenizer is not None:
         overrides |= {
-            # Padded as a release vocab is, so a TP-sharded head divides it.
-            "vocab_size": -(-len(tokenizer) // VOCAB_PAD_MULTIPLE) * VOCAB_PAD_MULTIPLE,
+            "vocab_size": padded_vocab_size(tokenizer),
             "pad_token_id": tokenizer.pad_token_id,
             "eos_token_id": tokenizer.eos_token_id,
         }

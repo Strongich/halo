@@ -16,7 +16,7 @@ Runnable launches, SLURM, and troubleshooting live in [Launch Recipes](launch-re
 | ETP | always NVLink-local | `expert_tp_size` divides the domain |
 | CP | always NVLink-local | `cp_size <= nvlink_domain_size` and divides it (Ulysses all-to-all is bandwidth-bound) |
 | PP | — | not yet available in this release ([Pipeline Parallelism](pipeline-parallelism.md)) |
-| DP | automatic | `stage_world_size / max(tp_size, cp_size, expert_tp_size)` |
+| DP | automatic | `world_size / max(tp_size, cp_size, expert_tp_size)` |
 
 EP is **orthogonal** to DP — it routes tokens to experts and returns them to their originating
 ranks, so EP never reduces DP.
@@ -30,12 +30,11 @@ NVLink-wide TP/CP/EP — see [NVL72](#gb200gb300-nvl72-multi-node-nvlink).
 |------|------------|
 | `ep_size` | Number of distinct expert subsets |
 | `ep_group_size` | Full EP process group = `ep_size * expert_tp_size` (auto-computed) |
-| `stage_world_size` | `world_size / pp_size` — one pipeline stage's rank block |
-| `data_parallel_size` | `stage_world_size / max(tp_size, cp_size, expert_tp_size)`; drives DataLoader sharding |
+| `data_parallel_size` | `world_size / max(tp_size, cp_size, expert_tp_size)`; drives DataLoader sharding |
 | `nvlink_domain_size` | GPUs reachable over NVLink (= `gpus_per_node`, or `NVLINK_DOMAIN_SIZE` on NVL72) |
 
-Gradient-sync scope follows the mode — the world, the EP group, or the PP stage plus one reduce along
-the chain for the grad norm ([below](#gradient-synchronization)).
+Gradient-sync scope follows the mode — the world or the EP group
+([below](#gradient-synchronization)).
 
 ## Node-local vs cross-node EP
 
@@ -61,9 +60,9 @@ reachable widths follow from that rule: `ep_group_size = num_domains × d`, wher
 per domain) divides `nvlink_domain_size`. On 4 domains of 8 that admits 4, 8, 16 and 32 only, and
 with many small domains the narrowest cross-node group is `num_domains` wide.
 
-When `ep_group_size < stage_world_size` the EP groups are data-parallel replicas
+When `ep_group_size < world_size` the EP groups are data-parallel replicas
 (`num_ep_groups > 1`); that case, and node-local EP across domains, routes through the deferred sync
-below. The **single global group** (`ep_group_size == stage_world_size`) needs no cross-replica
+below. The **single global group** (`ep_group_size == world_size`) needs no cross-replica
 deferral: every collective already spans the same ranks.
 
 Cross-node EP runs DeepEP's hybrid RDMA dispatch, which has no deterministic mode, so `full_determinism`
@@ -72,7 +71,7 @@ on such a group is refused before the load ([Determinism](expert-parallelism.md#
 ### Deferred cross-replica sync
 
 **Every multi-EP-group topology defers**, single-node ones included. `EPConfig.defer_grad_sync` is
-`num_ep_groups > 1` (or more than one PP rank block) minus the FSDP-managed-expert case:
+`num_ep_groups > 1` minus the FSDP-managed-expert case:
 `fsdp_shard_ep1_experts` at `ep_group_size == 1`, where FSDP2's reduce-scatter over the DTensor
 experts is already the sole sync and deferring on top would double-sync it.
 
@@ -86,7 +85,9 @@ rank whose dispatch delivered no tokens for a layer never enters the collective 
 already waiting in. And an in-backward all-reduce of different membership races each group's
 intra-group DeepEP combine: rank-inconsistent collective order deadlocks.
 
-The sweep contributes every param structurally instead (a missing grad is zero-filled). The hook
+The sweep agrees each bucket's membership over that bucket's reduce group instead: a param some rank
+of the group touched is zero-filled where absent, and one no rank touched keeps no gradient, so the
+optimizer applies no weight decay to it. The TP and QLoRA sweeps agree theirs the same way. The hook
 that survives on a single-group EP run carries no collective: it only divides by
 `world_size / expert_tp_size`.
 
@@ -96,19 +97,16 @@ own: `ParallelismConfig` rejects multi-domain multi-group EP+TP at config time.)
 sweep. It decides that FSDP shards the non-expert params over `process_group` (the EP group) instead
 of the DP world, which is what adds the third leg below.
 
-The sweep lands every grad at the `/world_size` DP average over its rank block — the whole job, or
-the stage's block under PP:
+The sweep lands every grad at the `/world_size` DP average over the whole job:
 
 - expert shards: `all_reduce(SUM)` over the `expert_replica_group`, then
-  `/(world_size / expert_tp_size)`. With one EP group per rank block (a PP stage) there is no replica
-  group and only the divide runs.
+  `/(world_size / expert_tp_size)`.
 
     The ETP factor drops out because expert-TP partners hold slices of one expert and consume the
     same batch, so they are not DP replicas; at `expert_tp_size == 1` the divisor is just
     `world_size`.
 
-- router, replicated EP submodules and plain non-EP params: `all_reduce(AVG)` over the DP scope —
-  the world, or the stage's rank block under PP.
+- router, replicated EP submodules and plain non-EP params: `all_reduce(AVG)` over the world.
 - non-expert FSDP shards, **`is_deferred_dp` only**: `all_reduce(AVG)` over the replica group, since
   the reduce-scatter averaged them within the EP group alone. Everywhere else it already spanned the
   full DP scope, so they are left untouched.
@@ -135,21 +133,18 @@ which moving the cross-replica average out of the backward does not address.
 
 **2 nodes × 8 GPUs (16 total):**
 
-| Config | EP | CP | TP | ETP | PP | EP scope | DP |
-|--------|----|----|----|-----|----|----------|----|
-| Node-local EP+CP | 8 | 8 | 1 | 1 | 1 | node | 2 |
-| Cross-node EP | 16 | 1 | 1 | 1 | 1 | global | 16 |
-| Node-local EP | 8 | 1 | 1 | 1 | 1 | node | 16 |
-| Pure ETP per node | 1 | 1 | 1 | 8 | 1 | node | 2 |
-| EP+TP | 16 | 1 | 2 | 1 | 1 | global | 8 |
-| EP+ETP per domain | 2 | 1 | 1 | 8 | 1 | global | 2 |
-
-The PP column stays 1: `pipeline_parallel_size > 1` is rejected at config time — pipeline
-parallelism is [not yet available in this release](pipeline-parallelism.md).
+| Config | EP | CP | TP | ETP | EP scope | DP |
+|--------|----|----|----|-----|----------|----|
+| Node-local EP+CP | 8 | 8 | 1 | 1 | node | 2 |
+| Cross-node EP | 16 | 1 | 1 | 1 | global | 16 |
+| Node-local EP | 8 | 1 | 1 | 1 | node | 16 |
+| Pure ETP per node | 1 | 1 | 1 | 8 | node | 2 |
+| EP+TP | 16 | 1 | 2 | 1 | global | 8 |
+| EP+ETP per domain | 2 | 1 | 1 | 8 | global | 2 |
 
 Three shapes are narrower than they look; all are rejected at config time, not at runtime:
 
-- **EP+TP across domains must be a SINGLE global EP group** (`ep_size == stage_world_size`,
+- **EP+TP across domains must be a SINGLE global EP group** (`ep_size == world_size`,
   `ep_scope=global`). `ep8+tp2` on 16 GPUs is rejected; `ep16+tp2` is the working shape.
 
     Cross-domain multi-group EP needs FSDP to shard non-expert params over the EP group
@@ -193,26 +188,27 @@ switches to a 2D `(dp_replicate, dp_shard)` mesh that shards within each NVLink 
 replicates across domains, so only one gradient all-reduce crosses RDMA per backward (per step with
 [`fsdp_defer_grad_sync`](data-parallelism.md#deferred-gradient-reduce-fsdp_defer_grad_sync)). See
 [Data Parallelism → HSDP](data-parallelism.md#hsdp-hybrid-sharded-data-parallel). Rejected with EP,
-TP, EP+TP, Expert-TP, and PP.
+TP, EP+TP, and Expert-TP.
 
 **Multi-EP-group expert grad norm:** with `num_ep_groups > 1`, expert grad norms sum within each EP
-group, then average across groups (the `expert_replica_group` all-reduce divided by
-`num_ep_groups`). Non-expert DTensor shards (TP) and full-world FSDP shards are reduced over their
-own tiling group and counted once. The global norm is `sqrt(expert² + non_expert²)`, computed in
-`_compute_global_grad_norm` (`src/trainers/mixins/grad_sync.py`).
+group only. The clip runs the deferred sweep first, so every replica already holds the same averaged
+expert grads and no `expert_replica_group` reduce runs. Non-expert DTensor shards (TP) and
+full-world FSDP shards are reduced over their own tiling group and counted once. The global norm is
+`sqrt(expert² + non_expert²)`, computed in `_compute_global_grad_norm`
+(`src/trainers/mixins/grad_sync.py`).
 
 ## EP+TP mode
 
 TP (DTensor) shards attention within each NVLink domain; EP (DeepEP) distributes experts; FSDP2
 syncs DP across domains. Attention TP leaves `ep_group_size` at `ep_size`, so it adds no expert
-sharding. DP = `stage_world_size / tp_size`. Rules, all checked at config time:
+sharding. DP = `world_size / tp_size`. Rules, all checked at config time:
 
 - `tp_size` divides the NVLink domain, and `ep_size` is a multiple of `tp_size` (`_validate_tp`).
 - **One domain:** the
   [single-domain multi-group rule](expert-parallelism.md#single-domain-multi-group-ep-races-and-hangs)
   applies unchanged, so `ep_size` is 2 or fills the domain. `ep2+tp2` on 8 GPUs (four 2-rank EP
   groups) passes; `ep4+tp2` is rejected like bare `ep4`.
-- **More than one domain:** a **single** EP group spanning the job (`ep_size == stage_world_size`,
+- **More than one domain:** a **single** EP group spanning the job (`ep_size == world_size`,
   which `ep_scope=auto` resolves to `global`); multi-group EP+TP is rejected
   ([why](#configuration-matrix)).
 
@@ -308,6 +304,56 @@ with it so a missing plugin fails instead of falling back; that is what every mu
 - **Multi-homed nodes** — set `NCCL_SOCKET_IFNAME` to the fast NIC (the ENA interface on AWS, `ib0`
   on IB clusters) when the default route is the management network.
 
+## Model loading
+
+Every rank reads the checkpoint itself, so every rank must find the same one. Before the first weight
+read, the policy load (the embedding backbone and the model-id load of SMPO, offline GRPO and the
+teacher-distillation student included) and every frozen reference or teacher load run
+`resolve_model_source` (`src/distributed/loading/model_source.py`):
+
+- The fetch runs main-rank-first under the input-filesystem scope: global rank 0 on a shared input
+  filesystem, each node's local rank 0 under `DIST_INPUT_SHARED_FILESYSTEM=0`. It takes the
+  repository's top-level files at the revision, where a model's config, tokenizer, weights and remote
+  code sit, so the weight formats a repo also ships in subfolders (gpt-oss's `original/` and `metal/`)
+  stay on the Hub. The default
+  embedding backbone is the exception: a sentence-transformers pipeline keeps its modules in
+  subfolders, so it takes the whole repository, `onnx/` and `openvino/` exports included.
+- Every rank then resolves the source on its own node: the local directory, or the snapshot in its
+  Hub cache (`HF_HUB_CACHE`, under `HF_HOME` by default). The verdicts join over the c10d store, so per-node fetch skew
+  waits under `DIST_STORE_TIMEOUT_HOURS`, not the NCCL watchdog.
+- A source some ranks cannot see raises on every rank and names them. The two usual causes are a
+  local checkpoint present on some nodes only, and a shared input declaration over node-local
+  `HF_HOME`, where only global rank 0 fetched.
+- A Hub source loads its weights at the commit the ranks agreed on, straight from the cache, with no
+  further hub request. Per-node caches holding different commits (staged at different times, loaded
+  offline) raise instead of training different weights per node.
+- Every rank's snapshot of that commit must hold the weight files global rank 0's snapshot names:
+  the safetensors index and its shards, or the single weight file. The config and tokenizer reads
+  ahead of the load leave a weightless snapshot in every node's cache, which raises instead of
+  passing for a fetched one.
+- The text-vs-multimodal probe that names the run reads the config earlier, falling back per rank to
+  the model name when the read fails. Its verdict is joined: ranks that disagree (a node missing the
+  source among them) raise on every rank instead of building different model classes.
+
+The weight load itself depends on the loader:
+
+| Loader | Ranks reading at once | A failure on one rank |
+|---|---|---|
+| Lazy EP (`ep_lazy_loading`) | all; each streams its own slice to its GPU, one tensor in host memory at a time | fenced: every rank raises the real reason |
+| Eager `from_pretrained` (DDP/FSDP2, CP, TP on a MoE, the EP fallback, the default embedding backbone) | `max_concurrent_loading` per OS node | joined over the store: the failing rank re-raises its own error, every peer names it; an FP32-master restore failure raises on every rank |
+| Native dense TP (`tp_plan`) | all; each places its own shards (its FP32-master restore: `max_concurrent_loading` per OS node, joined) | not fenced: the load runs DTensor collectives |
+| Frozen reference / teacher, a trainer's model id | all | joined over the store |
+
+The eager join also bounds the wait for a node's last batch by the store timeout. With
+`max_concurrent_loading: 1`, eight serialized loads of a large checkpoint can outlast
+`DIST_NCCL_TIMEOUT_MINUTES`. The lazy EP load needs no batching: its host-memory peak is one tensor
+per rank, and the ranks of a node that read the same shard share its page cache, so a shared mount
+serves each page once per node.
+
+For remote-code families, the lazy meta shell fetches the modeling file at the commit its config was
+read from. transformers' copies into `HF_MODULES_CACHE` land whole (`src/models/patches/remote_code_hooks.py`),
+so ranks sharing that cache never import a half-written module.
+
 ## Verified topologies
 
 What is validated by real multi-node runs, and what is covered only by simulation. Everything else
@@ -319,6 +365,7 @@ over NVLink) — which proves the rank math and the gradient algebra, not the fa
 |---|---|---|
 | 2-node RDMA topologies (Blackwell) — cross-node EP `ep8`/`ep16`, the 8192 tokens/rank Gin dispatch ceiling, node-local `ep8×2` matching single-group `ep16` | ✅ | [DeepEP → AWS EFA](../infrastructure/deepep.md#expert-parallelism-over-aws-efa) |
 | 2-node, 2/4/8 GPUs per node — plain FSDP2 DP, HSDP, node-local multi-group EP (deferred sync), cross-node EP, EP+TP, EP+CP, pure ETP, cross-node EP+ETP | ✅ | real multi-node runs over an EFA fabric |
+| Save + resume on per-node storage (`DIST_OUTPUT_SHARED_FILESYSTEM=0`) | ❌ | two-process CPU simulations only: per-node optimizer shards and meta, one node's torn shard set refused everywhere (`tests/cpu/checkpoint/test_nonshared_fs_resume.py`), an interrupted save passed over by resume detection (`test_interrupted_save_resume.py`) |
 | **Wider layouts** (4-node, 8-node, the 512-GPU layouts in [Large-Scale Scenarios](large-scale-scenarios.md)) | ❌ | rank math only — `ParallelismConfig` is exercised at world 8/16/32, no recorded run |
 | **NVL72 / MNNVL rack-wide domains** | ❌ | simulated domain sizes only; see the warning below and [Scale & Limits](../reference/scale-and-limitations.md) |
 | **InfiniBand/RoCE as a multi-node fabric** | ❌ | EFA only; the IB path is config guidance, not a measurement |

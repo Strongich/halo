@@ -20,7 +20,7 @@ import aiohttp
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from src.configs.rollout_config import RolloutConfig
+from src.configs.rollout_config import VLLM_BACKEND, RolloutConfig
 from src.distributed.nccl.addresses import is_loopback
 from src.environments.base import EPISODE_ERROR_KEY, Trajectory
 from src.environments.engine_wire import build_payload, capture_generation_tokens, capture_routing_mask
@@ -32,20 +32,34 @@ from src.environments.episode import (
     describe_exception,
     generate_turn,
     is_terminal_client_status,
+    recovering_turn,
     step_context_from_generation,
 )
 from src.environments.registry import create_environment
-from src.inference.response import get_finish_reason, get_reasoning_text
+from src.inference.response import FINISH_REASON_LENGTH, get_finish_reason, get_reasoning_text
 from src.log import warn_once
 
 logger = logging.getLogger(__name__)
 
 # Backends already warned that their completions carry no ``usage.completion_tokens`` (once per process).
 _COMPLETION_TOKENS_MISSING_WARNED: set[str] = set()
+# Backends already warned that a cut call's text could not be decoded (once per process).
+_CUT_CALL_DECODE_FAILED_WARNED: set[str] = set()
 
 # The engine-paused seconds a deadline credits: the count now, or an awaitable of the count as of the
 # call (a read of the Ray copy an actor process holds).
 PausedClock = Callable[[], float | Awaitable[float]]
+
+# Ray's plasma socket lives under the temp dir and AF_UNIX paths cap at ~107 bytes: a deep TMPDIR
+# overflows it and crashes ``ray.init``.
+MAX_RAY_TEMP_DIR_LEN = 40
+RAY_FALLBACK_TEMP_DIR = "/tmp/ray"
+
+# In-flight rollouts per actor when ``max_concurrent_rollouts`` is unset. Actors multiplex episodes on
+# one event loop, so the pool size is not the concurrency limit; this oversubscribes it enough to keep
+# the servers fed while a turn is being graded. Documented as the derived default in
+# ``agent-docs/reference/configuration-reference.md``.
+DEFAULT_ROLLOUTS_PER_WORKER = 4
 
 
 class RolloutHTTPError(RuntimeError):
@@ -190,18 +204,6 @@ class _SyncExpiries:
             self.count += 1
 
 
-# Ray's plasma socket lives under the temp dir and AF_UNIX paths cap at ~107 bytes: a deep TMPDIR
-# overflows it and crashes ``ray.init``.
-MAX_RAY_TEMP_DIR_LEN = 40
-RAY_FALLBACK_TEMP_DIR = "/tmp/ray"
-
-# In-flight rollouts per actor when ``max_concurrent_rollouts`` is unset. Actors multiplex episodes on
-# one event loop, so the pool size is not the concurrency limit; this oversubscribes it enough to keep
-# the servers fed while a turn is being graded. Documented as the derived default in
-# ``agent-docs/reference/configuration-reference.md``.
-DEFAULT_ROLLOUTS_PER_WORKER = 4
-
-
 def ray_init_kwargs(**overrides) -> dict:
     """Kwargs for ``ray.init``, with a short-tempdir fallback."""
     # Dashboard off: unused by the RL actors and exposes Ray's jobs-API HTTP surface
@@ -268,7 +270,7 @@ class EnvironmentActor:
     ) -> RolloutResult:
         """Run a complete multi-turn episode."""
         start = time.time()
-        generation_tokens = 0
+        generated = 0
         logp_sum, logp_count = 0.0, 0
         eid = None
         sync_expiries = _SyncExpiries()
@@ -287,22 +289,19 @@ class EnvironmentActor:
                 env,
                 max_tokens=config.max_tokens,
                 max_thinking_tokens=config.max_thinking_tokens,
-                scope=config.thinking_budget_scope,
-                turn_reserve=config.thinking_turn_reserve,
+                max_episode_tokens=config.max_episode_tokens,
+                max_answer_tokens=config.max_answer_tokens,
             )
-            reasoning_spent = 0
 
             for _ in range(env.max_turns):
-                if step.done:
+                # The engine caps this turn: the level's reasoning cap (a retry's share of it after a cut
+                # or empty turn) and the turn total, both narrowed to what the output budget has left;
+                # none once it holds no turn.
+                recovery = recovering_turn(step.trajectory)
+                caps = effort.turn_caps(generated, recovery=recovery)
+                if step.done or caps is None:
                     break
-
-                # The engine caps this turn: the level's budget, or under the episode scope what it has
-                # left, with the turn's total bounded alongside it.
-                turn_config = replace(
-                    config,
-                    max_tokens=effort.turn_max_tokens(reasoning_spent),
-                    max_thinking_tokens=effort.turn_thinking_cap(reasoning_spent),
-                )
+                turn_config = replace(config, **caps)
                 gen = await self._generate_turn(
                     client,
                     server_url,
@@ -312,18 +311,28 @@ class EnvironmentActor:
                     effort.thinking_budget,
                     sync_expiries,
                 )
-                reasoning_spent += effort.spend_of(gen, config.reasoning_end_token_id)
-                generation_tokens += gen.tokens
+                generated += gen.tokens
                 if gen.token_logprobs:
                     logp_sum += sum(gen.token_logprobs)
                     logp_count += len(gen.token_logprobs)
 
-                steps = await episode.step([eid], [gen.text], [step_context_from_generation(context, gen)])
+                step_ctx = step_context_from_generation(
+                    context,
+                    gen,
+                    thinking_cap=effort.turn_thinking_cap(recovery),
+                    reasoning_end_token_id=config.reasoning_end_token_id,
+                    last_turn=effort.turn_caps(generated) is None,
+                )
+                steps = await episode.step([eid], [gen.text], [step_ctx])
                 step = steps[0]
                 length += 1
 
+            if not step.done:
+                # The output budget ran out with the episode open: closed as truncated, priced like a
+                # max_turns overflow — the budget is the episode's, not the driver's fault.
+                step = (await episode.finalize_truncated([eid]))[0]
             traj = env.get_trajectories([eid])[0]
-            effort.stamp(traj, reasoning_spent)
+            effort.stamp(traj, generated)
 
             episode_metrics = env.rollout_metrics(traj) if traj else {}
             if logp_count:
@@ -338,7 +347,7 @@ class EnvironmentActor:
                 # Natural terminal state, not a max_turns truncation; both set done=True.
                 success=bool(traj and traj.done and not traj.truncated),
                 latency=time.time() - start,
-                generation_tokens=generation_tokens,
+                generation_tokens=generated,
                 requests_expired_in_sync=sync_expiries.count,
             )
 
@@ -387,7 +396,7 @@ class EnvironmentActor:
         return await generate_turn(
             partial(self._generate, client, server_url, messages, config, reasoning_effort, reasoning_budget),
             config,
-            retry_on=(asyncio.TimeoutError, aiohttp.ClientError, RuntimeError),
+            retry_on=(TimeoutError, aiohttp.ClientError, RuntimeError),
             giveup=_should_giveup,
             log_prefix=f"Actor {self.actor_id}",
             on_failure=sync_expiries.record,
@@ -402,8 +411,9 @@ class EnvironmentActor:
         reasoning_effort: str | None = None,
         reasoning_budget: int | None = None,
     ) -> TurnGeneration:
-        """One /v1/chat/completions request; returns the turn's :class:`TurnGeneration` (capture fields
-        populated per the ``RolloutConfig`` flags).
+        """One /v1/chat/completions request (and a ``/detokenize`` for a call cut at the cap,
+        :meth:`_cut_calls_as_written`); returns the turn's :class:`TurnGeneration` (capture fields populated per
+        the ``RolloutConfig`` flags).
 
         The request gets ``config.request_timeout`` of engine-serving time: a weight sync that freezes it
         (vLLM ``mode=keep``) is credited back, since expiring it would re-issue a turn the engine
@@ -448,6 +458,13 @@ class EnvironmentActor:
         routing_mask = capture_routing_mask(choice, data) if config.capture_routed_experts else None
         # The engine's prompt length anchors the mask; the trainer's re-render can differ by a token.
         routing_prompt_tokens = usage.get("prompt_tokens") if routing_mask else None
+        finish_reason = get_finish_reason(
+            choice, completion_tokens=usage.get("completion_tokens"), max_tokens=config.max_tokens
+        )
+        if finish_reason == FINISH_REASON_LENGTH and tool_calls and token_ids:
+            tool_calls = await self._cut_calls_as_written(
+                client, url, payload.get("model"), token_ids, tool_calls, config
+            )
         return TurnGeneration(
             text=text,
             tool_calls=tool_calls,
@@ -458,10 +475,50 @@ class EnvironmentActor:
             routing_mask=routing_mask,
             routing_prompt_tokens=routing_prompt_tokens,
             prompt_token_ids=prompt_token_ids,
-            finish_reason=get_finish_reason(
-                choice, completion_tokens=usage.get("completion_tokens"), max_tokens=config.max_tokens
-            ),
+            finish_reason=finish_reason,
         )
+
+    async def _cut_calls_as_written(
+        self,
+        client: aiohttp.ClientSession,
+        url: str,
+        model: str | None,
+        token_ids: list[int],
+        salvaged: list[dict[str, Any]],
+        config: RolloutConfig,
+    ) -> list[dict[str, Any]]:
+        """The call a turn was writing when its cap cut it, as the policy wrote it, for the judge and the completions
+        record: vLLM's parser salvages only the call's name and whatever arguments it closed, so the turn's ids past
+        its reasoning close are decoded (vLLM's ``/detokenize``, which answers ``prompt``; SGLang's answers ``text``)
+        and carried whole as the call's arguments. The salvage stands wherever no single-token reasoning close is
+        resolved to split the ids at (SGLang, which enforces no thinking budget; gpt-oss, whose close spans several
+        tokens; a run with no budget) and when the decode fails — the cut is booked either way; only what a judge
+        reads of it changes."""
+        end = config.reasoning_end_token_id
+        if config.backend != VLLM_BACKEND or end is None or end not in token_ids:
+            return salvaged
+        visible = token_ids[len(token_ids) - token_ids[::-1].index(end) :]
+
+        async def _decode() -> str:
+            async with client.post(f"{url}/detokenize", json={"model": model, "tokens": visible}) as resp:
+                if resp.status != 200:
+                    raise RolloutHTTPError(resp.status, config.backend, await resp.text())
+                return (await resp.json())["prompt"]
+
+        try:
+            written = await _await_with_deadline(_decode(), config.request_timeout, self._paused_clock, what="decode")
+        except Exception as e:  # what a judge reads of a cut call never fails the episode
+            warn_once(
+                logger,
+                _CUT_CALL_DECODE_FAILED_WARNED,
+                config.backend,
+                "Actor %s: decoding a cut call's text failed (%s); the judge reads the call as the parser salvaged it",
+                self.actor_id,
+                describe_exception(e),
+            )
+            return salvaged
+        first = salvaged[0]
+        return [{**first, "function": {**first.get("function", {}), "arguments": written}}]
 
     def _build_payload(
         self,
@@ -590,21 +647,11 @@ class RolloutManager:
         # the actor there and waits indefinitely, which on the CPU-actor-tier topology
         # (agent-docs/infrastructure/ray.md) keeps every actor on the training node instead of
         # spilling. `_spill_on_unavailable` makes the affinity an actual preference.
-        try:
-            local_node_id = ray.get_runtime_context().get_node_id()
-            strategy = NodeAffinitySchedulingStrategy(node_id=local_node_id, soft=True, _spill_on_unavailable=True)
-        except (TypeError, ValueError) as exc:
-            # A Ray without the private spill argument (TypeError), or a node id it refuses (ValueError).
-            logger.warning(
-                "RolloutManager: node affinity unavailable (%s); the environment actors are placed anywhere in "
-                "the Ray cluster instead of preferring this node",
-                describe_exception(exc),
-            )
-            actor_cls, clock_cls = EnvironmentActor, _RemoteEnginePauseClock
-        else:
-            actor_cls = EnvironmentActor.options(scheduling_strategy=strategy)
-            clock_cls = _RemoteEnginePauseClock.options(scheduling_strategy=strategy)
-        self._actor_pause_clock = clock_cls.remote()
+        strategy = NodeAffinitySchedulingStrategy(
+            node_id=ray.get_runtime_context().get_node_id(), soft=True, _spill_on_unavailable=True
+        )
+        self._actor_pause_clock = _RemoteEnginePauseClock.options(scheduling_strategy=strategy).remote()
+        actor_cls = EnvironmentActor.options(scheduling_strategy=strategy)
         self._actors = [
             actor_cls.remote(i, self.env_type, self.env_config, self._actor_pause_clock)
             for i in range(self.num_workers)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Distributed DPO training (text or VLM) with Expert and Tensor Parallelism support.
+"""Distributed DPO training (text or VLM).
 
 Direct Preference Optimization on preference pairs (chosen vs rejected). One script serves both
 text and vision-language models: ``load_model_for_training`` auto-detects the modality. For a VLM
@@ -7,8 +7,9 @@ the processor is the ``processing_class``, which flips TRL 1.6's DPOTrainer into
 auto-selects ``DataCollatorForVisionPreference`` for an images-bearing dataset; for a text model
 the repo tokenizes the pairs and runs generation-eval examples.
 
-CP is not supported (``concatenated_forward`` needs full sequences); use EP and/or TP. Under EP/TP
-use PEFT (``ref_model=None``) or ``precompute_ref_log_probs`` — the reference is not parallelized.
+CP is not supported (``concatenated_forward`` needs full sequences). Under EP/TP use PEFT
+(``ref_model=None``) or ``precompute_ref_log_probs`` — the reference is not parallelized. PP is
+declared but not yet available in this release.
 
 Usage:
     # Text or VLM (auto-detected) — EP / TP via torchrun
@@ -54,8 +55,6 @@ def main():
     parser = H4ArgumentParser((DPOScriptArguments, DPOConfig, ModelConfig, DistributedArguments))
     args, dpo_config, model_config, dist_args = parser.parse()
 
-    # DPOConfig also declares pad_token; the resolve-conflict parser captures the YAML key there,
-    # so sync_tokens mirrors it back onto the script args the tokenizer setup reads.
     runtime = init_training_script(
         args,
         dpo_config,
@@ -63,7 +62,6 @@ def main():
         dist_args,
         script_prefix="dpo",
         trainer_cls=DistributedDPOTrainer,
-        sync_tokens=("pad_token",),
     )
     parallelism_config = runtime.parallelism_config
 

@@ -24,9 +24,13 @@ python scripts/environments/inference/run_env.py --env_type qa_search \
 | `--max_turns` / `--env_kwargs` | the env's own; coding 15 / `{}` | Turn cap override; JSON merged into the env config |
 | `--temperature` / `--top_p` / `--max_tokens` / `--request_timeout` | 0.7 (0.2 coding) / 0.95 / 32768 (coding at a level: the level's `thinking_tokens` + 4096) / 180 s | Sampling, HTTP timeout |
 
+Every request also carries `top_k`, `min_p` and `repetition_penalty`: the run's `rollout_*` values
+under `--training_config`, else their off values (`-1`, `0.0`, `1.0`), so a served model's
+`generation_config.json` defaults never filter the eval.
+
 A `prompt` given as a message list reaches the environment as its last `user` turn, the task
-training hands it ([Async GRPO with Environments](../async-grpo/README.md)); a row with no `user` turn
-is refused before any episode runs.
+training hands it ([Async GRPO with Environments](../async-grpo/README.md)); a row with no `user` turn,
+or a non-text content part in it, is refused before any episode runs.
 
 `run_env.py` reads `--prompt_field` / `--answer_field`, passes extra columns through
 `--context_fields`, buckets by `--group_by` and names each example by `--id_field` (default `id`);
@@ -35,13 +39,13 @@ and id columns, which a dataset may lack; like the trainer, it refuses a dataset
 field before generating when the environment declares `requires_answer`. `run_code_contests.py`
 instead takes `--adapter` (which fixes the bucket and id fields per benchmark), `--language`,
 `--reasoning_effort` (`low` / `medium` / `high`, or `none` for no level; it also sets the default
-`--max_tokens`), `--eval_protocol`, and `--start_date` / `--end_date` / `--platform` on a benchmark
-that stamps contest dates ([Code Contests](code-contests.md#evaluation)). There an option with a
+`--max_tokens`), `--eval_protocol`, `--start_date` / `--end_date` / `--platform` on a benchmark
+that stamps contest dates, and `--include_examples_only` ([Code Contests](code-contests.md#evaluation)). There an option with a
 flag of its own (`--max_turns`, `--language`, `--eval_protocol`, `--reasoning_effort`) is refused in
 `--env_kwargs`, which would otherwise override the flag.
 
 `--training_config <yaml>` parses the YAML with the training script's own config classes: its
-`RolloutConfig` (template variables, stop tokens, thinking budget, sampling) and environment config
+`RolloutConfig` (template variables, stop tokens, thinking and episode output budgets, sampling) and environment config
 (rewards, `max_turns`, `environment_kwargs`, `environment_type`) become the eval's. An explicit flag
 wins over the YAML, the YAML over the default. An environment at `reasoning_effort: random` draws each problem's level
 from the problem's text, as the trainer's eval does, so a rerun scores every problem at the same level.
@@ -77,7 +81,7 @@ every score (the telemetry line still counts it), and `generation_errors` counts
 no sample reads `nan`.
 
 `invalid` counts the samples scored 0 with no signal, each carrying `error`: an invalid grade (a
-grading or sandbox outage, an inconclusive code grade, a failed scorer, a null `answer`) or an episode whose run raised. Invalid
+grading or sandbox outage, an inconclusive code grade, a failed scorer whose term is `invalid` on error, a null `answer`) or an episode whose run raised. Invalid
 samples stay in the means, unlike in training, where the baseline drops them.
 
 ## Output files
@@ -101,7 +105,10 @@ Each later line is an `episode`, addressed by `index` and `id`: `reward`, `succe
 `generation_error` (null on a scored sample), `stats`, the messages, `reasoning_effort` /
 `reasoning_budget`, `info`. The answer key (`_`-prefixed `info`
 fields), `context` and assistant chain-of-thought are stripped; each message keeps its own
-`tool_calls`, which the re-grader replays.
+`tool_calls`, which the re-grader replays, a turn the engine cut while writing a call its unrun
+`cut_tool_calls`, which it does not, and each assistant turn its `thinking_cap` (its level's
+per-turn cap) where it ran under one; no turn records `reasoning_tokens`, since the eval transport
+captures no sampled ids.
 
 ## Re-grading recorded trajectories
 
@@ -114,10 +121,14 @@ python scripts/environments/inference/regrade_trajectories.py \
     "$HALO_DATA_ROOT/eval/trajectories"/*.jsonl --workers 64 --output regraded.jsonl
 ```
 
-It rebuilds each problem's hidden tests by `index` under the meta line's contest `selection`, and
+It rebuilds each problem's hidden tests by `index` under the meta line's contest `selection` (one
+recording no `include_examples_only` predates that choice and scored every problem; an
+`index` past the rebuilt problems refuses the file: the dataset no longer matches the run's), and
 replays every recorded `submit_solution`, its arguments read as the environment read them (a
 Python-literal arguments string included), up to that episode's own budget, through `grade_solution`
-under the meta line's `env_grading` contract. The meta's `eval_protocol` only rebuilds the
+under the meta line's `env_grading` contract, which is refused before any grade when it names a field the
+contract does not declare or holds a value the contract refuses (an unknown `comparison` or `verdict_detail`, a
+non-positive time limit). The meta's `eval_protocol` only rebuilds the
 environment, whose `max_submissions` is the budget of an episode that stamped none. Grading stops at
 the first failing test and `max_grading_seconds` does not apply. It reports, per file, the protocol
 and, over the episodes that carry a verdict (`n`): `s@1`, the fraction whose first admitted submission

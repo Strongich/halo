@@ -20,19 +20,15 @@ from huggingface_hub.constants import REPOCARD_NAME
 from huggingface_hub.repocard import metadata_load, metadata_save
 from huggingface_hub.utils import HFValidationError, validate_repo_id
 from peft import PeftType
-from peft.utils import CONFIG_NAME as ADAPTER_CONFIG_NAME
+from peft.utils import CONFIG_NAME as ADAPTER_CONFIG_FILE
 
-from src.checkpoint.atomic import FILE_STAGING_SUFFIX, create_staged_file, is_staged_file
+from src.checkpoint.atomic import create_staged_file
 from src.log import warn_once
 
 logger = logging.getLogger(__name__)
 
 HUB_TAGS = ("halo",)
 
-# The staged card's name pattern: unique per write, and skipped by the non-weight copy should a
-# crash leave one behind.
-CARD_STAGING_PREFIX = f".{REPOCARD_NAME}."
-CARD_STAGING_SUFFIX = FILE_STAGING_SUFFIX
 # The adapter types stock PEFT loads; the toolkit's native expert-LoRA types are outside it.
 _STOCK_PEFT_TYPES = frozenset(peft_type.value for peft_type in PeftType)
 # Export cards already warned about, so the config finalizer that follows a copy does not repeat it.
@@ -47,11 +43,6 @@ class MalformedModelCardError(ValueError):
         self.card = card
         self.reason = reason
         super().__init__(f"{_malformed_card_message(card, reason)} Repair or remove it, then re-run.")
-
-
-def is_staged_card(name: str) -> bool:
-    """Whether ``name`` is a card :func:`tag_model_card` staged and never swapped in."""
-    return is_staged_file(name, REPOCARD_NAME) and name.endswith(CARD_STAGING_SUFFIX)
 
 
 def with_halo_tags(tags: str | list[str] | None) -> list[str]:
@@ -137,7 +128,7 @@ def _fresh_card_metadata(directory: Path) -> dict:
     carries. A ``peft_type`` outside PEFT's registry (the native EP expert adapters) and a full-model
     directory declare no library, so the card claims no loader that would refuse the files.
     """
-    adapter_config = directory / ADAPTER_CONFIG_NAME
+    adapter_config = directory / ADAPTER_CONFIG_FILE
     if not adapter_config.is_file():
         return {}
     config = json.loads(adapter_config.read_text())

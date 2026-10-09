@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 _EP_INIT_ENGINE = "/init_weight_transfer_engine"
 _EP_UPDATE_WEIGHTS = "/update_weights"
 _EP_FINISH_UPDATE = "/finish_weight_update"
-_EP_RESUME = "/resume"
 
 # Deadline for the 1-token liveness probe. Long enough that a merely busy scheduler still answers,
 # short enough that a wedged one is reported instead of parking the trainer for the sync deadline.
@@ -56,13 +55,19 @@ def _build_sampling_params(
     logprobs: int = 1,
     extra: dict | None = None,
 ) -> dict:
-    params = {"n": n, "temperature": temperature, "top_p": top_p, "max_tokens": max_tokens, "logprobs": logprobs}
-    if repetition_penalty != 1.0:
-        params["repetition_penalty"] = repetition_penalty
-    if top_k > 0:
-        params["top_k"] = top_k
-    if min_p > 0.0:
-        params["min_p"] = min_p
+    """TRL's sampling arguments as a completions body. Every filter is stated, an off one included,
+    since the server fills an omitted one from the model's generation_config.json; TRL's top_k 0 is
+    vLLM's own off value."""
+    params = {
+        "n": n,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "max_tokens": max_tokens,
+        "logprobs": logprobs,
+    }
     if extra:
         params.update(extra)
     return params
@@ -74,7 +79,7 @@ class VLLMWeightSyncClient(BaseWeightSyncClient):
     BACKEND_KEY = "vllm"
     BACKEND_NAME = "vLLM"
     GROUP_HOST_ENV = "VLLM_GROUP_HOST"
-    RESUME_ENDPOINT = _EP_RESUME
+    RESUME_ENDPOINT = "/resume"
     UNSERVABLE_MODEL_TYPES = {
         "zaya": "vLLM 0.26.0 ships no Zaya implementation (agent-docs/models/zaya.md)",
         "mistral4": (
@@ -156,7 +161,7 @@ class VLLMWeightSyncClient(BaseWeightSyncClient):
             raise RuntimeError(
                 f"vLLM server {self.base_url} is PAUSED for a weight update (GET /is_paused) — generation "
                 f"requests would queue instead of running. A trainer died mid weight sync without lifting "
-                f"its /pause. Lift it (POST {self.base_url}{_EP_RESUME}) before reconnecting — unless that "
+                f"its /pause. Lift it (POST {self.base_url}{self.RESUME_ENDPOINT}) before reconnecting — unless that "
                 f"sync had already streamed part of the model, in which case the server holds a partly "
                 f"written model and has to be RESTARTED instead (its log names the last update)."
             )

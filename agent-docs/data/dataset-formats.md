@@ -41,11 +41,11 @@ source instead).
 test together: a column missing from any dataset, or whose feature type differs across them, is
 dropped, with no fixed allowlist.
 
-The **declared** render columns are the exception. `conversation_field` and `tools_field` are pinned
-through the concatenation, an entry that lacks one getting a null-filled column of the carrying
-entry's type, so a mixed corpus keeps them. A declared column the intersection loses anyway (a type
-mismatch across the entries, which no fill can bridge) raises rather than rendering the whole corpus
-without it.
+The **declared** render columns are the exception. A declared `conversation_field` must be in every
+entry: a source without it raises, naming that source. `tools_field` may be missing from some entries,
+which get a null-filled column of the carrying entry's type, so a mixed corpus keeps its tools. A
+declared column the intersection loses anyway (a type mismatch across the entries, which no fill can
+bridge) raises rather than rendering the whole corpus without it.
 
 **Which rows a ratio keeps** is drawn without replacement from `numpy.random.default_rng(seed)`
 (PCG64) — seed `42`, `+1` for the `test` split and stepped per list entry, so every rank selects the
@@ -83,11 +83,11 @@ VLM, below).
 `train`/`test` schemas at load and raises, naming the available columns. Without it a typo silently
 no-ops the empty-conversation filter and surfaces much later as a `KeyError` inside the tokenizer map.
 
-The check follows the *script*, not the YAML. SFT, both distillation scripts and both
-prompt-rendering GRPO scripts (offline, environmental) declare a conversation column — each with its
-own default, `messages` for teacher distillation and `prompt` elsewhere — so a dataset without it raises
-whether or not the YAML names one; scripts that render no conversation (preference, reward,
-classification, online GRPO, embedding) declare none and skip the check.
+The check follows the *script*, not the YAML. SFT, both distillation scripts and the three
+prompt-rendering GRPO scripts (offline, online, environmental) declare a conversation column, each with
+its own default (`messages` for teacher distillation, `prompt` elsewhere), so a dataset without it
+raises whether or not the YAML names one. Scripts that render no conversation (preference, reward,
+classification, embedding) declare none and skip the check.
 
 `tools_field` is checked the same way for a single dataset. Across a `dataset:` list it raises only
 when **no** source carries the column and warns per source otherwise — a tool-use corpus concatenated
@@ -182,10 +182,7 @@ Reference-model shapes for vision rows: [DPO → Vision-language](../training-me
 
 Config in `OfflineGRPOConfig` (`src/configs/offline_grpo_config.py`); defaults: [Offline GRPO → Configuration](../training-methods/grpo/offline-grpo.md#configuration).
 
-Offline GRPO supports CP and EP+CP for full fine-tuning. Full-FT KL reference sweeps require a finite,
-unsharded dataset; pre-sharded KL inputs and supplied grouped `ref_per_token_logps` are refused.
-The trainer owns reference scores and their checkpoint/resume identity. See
-[Offline GRPO](../training-methods/grpo/offline-grpo.md#reference-model).
+Full-fine-tune KL runs need a finite, unsharded dataset ([Offline GRPO → Reference model](../training-methods/grpo/offline-grpo.md#reference-model)).
 
 ## Classification
 
@@ -255,6 +252,11 @@ GLM, Ling, and GPT-OSS (`gpt-oss-harmony.jinja`; `gpt-oss-multiturn.jinja` is th
 terminates every assistant turn). Pin a native template whenever the training
 render must match serving byte-for-byte.
 
+The template lands on the tokenizer and, for a VLM run, on its processor as well
+(`adopt_tokenizer_chat_template`): a processor renders and saves with a `chat_template` of its own,
+so the processor is what decides both the VLM rows and the exported `chat_template.jinja`. The same
+holds for `prepare_dataset.py --vlm` and `patch_vocab.py --chat_template`.
+
 ### Special-token ownership
 
 Rendered chat-template text tokenizes through `tokenize_rendered`
@@ -271,7 +273,7 @@ appends a trailing `<|im_end|>` instead of prepending BOS.
 - They are always stripped from generation prompts (`for_generation=True`), so a prompt never ends
   with a turn terminator.
 
-This seam covers SFT (runtime and offline), classification, the prompts-reward preprocess,
+This seam covers SFT (runtime and offline), classification, reward-model scoring (`encode_for_scoring`),
 teacher/self-distillation, and generation-eval prompts. The SMPO and offline-GRPO prompt paths use
 the same probe to prepend BOS only when the post-processor owns it.
 

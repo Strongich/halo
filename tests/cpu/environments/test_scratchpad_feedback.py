@@ -5,8 +5,9 @@ The scratchpad is where the policy debugs, so its reply has to carry the diagnos
 a compile error as the compiler's first diagnostics (the last stderr line of g++ is a caret gutter),
 a crash as its signal and the traceback's tail, ahead of any stdout (the protocol cuts a long
 observation from the end), and a program run under the same limits its graded tests get — the
-problem's time limit, and a stack as large as the memory limit. Every program here really compiles
-and runs on the local backend.
+problem's time limit, and a stack as large as the memory limit. A run given no input says so and is booked like
+any other run; a turn of calls refused unrun is flagged untrainable, so the next turn retries on the recovery
+reserve. Every program here really compiles and runs on the local backend.
 
 Run: python tests/cpu/environments/test_scratchpad_feedback.py  (or pytest)
 """
@@ -20,16 +21,18 @@ import pytest
 from src.environments.envs.protocols.native import NativeToolUseEnvironment
 from src.environments.envs.tasks.coding.code_contests import (
     NO_STDIN_NOTE,
+    SCRATCHPAD_BUDGET_SPENT_REPLY,
     SCRATCHPAD_TIME_LIMIT_NOTE,
-    STARVED_RUN_NOTE,
     SUBMIT_TOOL,
     CodeContestsEnvironment,
 )
 from src.environments.envs.tasks.coding.grading import run_solution_against_tests
-from src.environments.sandbox.base import REPL_NO_OUTPUT_MESSAGE
+from src.environments.episode import recovering_turn
+from src.environments.sandbox.base import REPL_NO_OUTPUT_MESSAGE, SandboxExecutor, SandboxResult
 from src.environments.sandbox.local import LocalSubprocessSandbox
 from src.environments.sandbox.repl import run_code_via_sandbox
 from src.environments.tools.definitions import NativeToolCall
+from tests.common.code_contests import counts_beside_budget_words, retired_budget_phrases
 
 needs_gpp = pytest.mark.skipif(shutil.which("g++") is None, reason="g++ not installed")
 
@@ -73,13 +76,31 @@ int main() {
 
 def _env(language="cpp", **kwargs):
     kwargs.setdefault("sandbox", LocalSubprocessSandbox())
-    return CodeContestsEnvironment(language=language, max_test_calls=6, **kwargs)
+    kwargs.setdefault("max_test_calls", 6)
+    return CodeContestsEnvironment(language=language, **kwargs)
+
+
+def _reset(env, time_limit=None):
+    answer = {"tests": [{"input": "1\n", "output": "2\n"}], "time_limit": time_limit}
+    ids, _ = env.reset(["solve it"], [{"answer": json.dumps(answer)}])
+    return ids
 
 
 def _episode(env, time_limit=None):
-    answer = {"tests": [{"input": "1\n", "output": "2\n"}], "time_limit": time_limit}
-    ids, _ = env.reset(["solve it"], [{"answer": json.dumps(answer)}])
-    return env.get_trajectories(ids)[0]
+    return env.get_trajectories(_reset(env, time_limit))[0]
+
+
+def _turn(env, ids, *calls: tuple[str, dict]):
+    """One assistant turn through the protocol's step, its ``(tool, arguments)`` calls as the engine parses them."""
+    tool_calls = [
+        {"id": f"c{i}", "function": {"name": name, "arguments": json.dumps(arguments)}}
+        for i, (name, arguments) in enumerate(calls)
+    ]
+    return env.step(ids, [""], [{"finish_reason": "stop", "tool_calls": tool_calls}])[0]
+
+
+def _last_turn_flagged(traj) -> bool:
+    return next(m for m in reversed(traj.messages) if m.role == "assistant").calls_rejected
 
 
 def _scratchpad(env, traj, **arguments):
@@ -181,81 +202,180 @@ def test_a_compile_that_outruns_its_timeout_is_a_compile_error_not_an_infra_faul
     assert grade.infra_errors == 0 and "COMPILATION ERROR" in grade.details
 
 
-def test_every_scratchpad_reply_states_the_runs_left():
+def test_no_scratchpad_reply_states_the_runs_left():
+    """The cap is enforced, never stated: a reply is the run's output and its notes, the run that spends
+    the last one reads like any other, and the next call is refused with the spent-budget reply, which
+    names no count either and spends nothing."""
     env = _env(language="python")
     traj = _episode(env)
     replies = [_scratchpad(env, traj, code=code, stdin="1\n") for code in ("print(1)", "raise SystemExit(3)")]
-    assert replies[0] == "1\n(Scratchpad runs left: 5 of 6.)"
-    assert replies[1].endswith("\n(Scratchpad runs left: 4 of 6.)")
+    assert replies[0] == "1"
+    assert replies[1].startswith("Error: ")
     for _ in range(4):
-        last = _scratchpad(env, traj, code="print(2)", stdin="1\n")
-    assert last.endswith("(Scratchpad runs left: 0 of 6.)")
-    assert "runs left" not in env._run_test("print(3)"), "a direct call outside an episode carries no budget"
+        replies.append(_scratchpad(env, traj, code="print(2)", stdin="1\n"))
+    assert replies[-1] == "2" and env._test_calls(traj) == 6
+    refused = _scratchpad(env, traj, code="print(3)", stdin="1\n")
+    assert refused == f"Error: {SCRATCHPAD_BUDGET_SPENT_REPLY}" and env._test_calls(traj) == 6
+    for reply in (*replies, refused):
+        assert not retired_budget_phrases(reply) and not counts_beside_budget_words(reply), reply
+    assert env._run_test("print(3)") == f"3\n{NO_STDIN_NOTE}", "a direct call outside an episode carries no budget"
 
 
-def test_a_run_given_no_input_that_prints_nothing_spends_no_run():
-    """A solution run with no stdin reads nothing and prints nothing: the run is returned to the budget and the
-    reply says so. A starved run that crashes returns a traceback, and a run that prints (or is quiet on real
-    input) told the model something, so each of those spends its run."""
+def test_a_long_output_is_cut_so_the_notes_after_it_survive():
+    """The protocol cuts an observation past ``max_observation_chars`` from its end, where the notes
+    are; the program's output gives way instead, so the reply keeps them and fits the cap."""
+    env = _env(language="python")
+    reply = _scratchpad(env, _episode(env), code="print('x' * 2_000_000)")
+    assert len(reply) <= env.max_observation_chars, len(reply)
+    assert reply.startswith("xxx") and "\n…[truncated " in reply
+    assert reply.endswith(f"\n{NO_STDIN_NOTE}"), reply[-300:]
+
+
+class _PrintsSandbox(SandboxExecutor):
+    """Answers every run with ``n`` characters of stdout and a clean exit."""
+
+    def __init__(self, n: int):
+        self.n = n
+
+    def open_session(self):
+        raise NotImplementedError
+
+    def run(self, code, *, stdin="", timeout=15.0, language="python", files=None):
+        return SandboxResult(stdout="y" * self.n, returncode=0)
+
+
+@pytest.mark.parametrize("past_the_fit", [-24, 0, 1])
+def test_output_that_fits_beside_its_notes_is_not_cut(past_the_fit):
+    """Only a reply that would pass the cap is cut: an output up to the cap less its no-stdin note line
+    comes back whole, one character more is cut."""
+    tail = f"\n{NO_STDIN_NOTE}"
+    cap = _env(language="python").max_observation_chars
+    n = cap - len(tail) + past_the_fit
+    env = _env(language="python", sandbox=_PrintsSandbox(n))
+    reply = _scratchpad(env, _episode(env), code="print(1)")
+    assert len(reply) <= cap and reply.endswith(tail)
+    assert (reply == "y" * n + tail) is (past_the_fit <= 0), reply[-120:]
+
+
+def test_a_list_program_is_refused_unspent_on_both_tools():
+    """A list ``code`` has no string reading, and staged into the sandbox it fails there as the
+    backend's fault, voiding a graded episode: refused at binding, it spends neither budget and grades
+    nothing."""
+    env = _env(language="python")
+    traj = _episode(env)
+    for tool in (env.test_tool_name, SUBMIT_TOOL):
+        call = NativeToolCall(id="c", name=tool, arguments={"code": ["print(2)"]})
+        (result,), _ = env._execute_tool_calls([call], traj)
+        assert result.content == f"Error: {tool}: code must be a string, got list" and not result.success
+    assert env._test_calls(traj) == 0 and env._submissions(traj) == 0
+    assert "submission_result" not in traj.info and not traj.episode_invalid
+
+
+def test_a_scalar_stdin_runs_as_its_string_and_a_null_one_as_none():
+    """``"stdin": 5`` (as SGLang's Gemma 4 parser emits it) feeds the program ``5``; ``"stdin": null``
+    is a run on no input."""
+    env = _env(language="python")
+    traj = _episode(env)
+    assert _scratchpad(env, traj, code="print(int(input()) * 2)", stdin=5) == "10"
+    reply = _scratchpad(env, traj, code="print(int(input()) * 2)", stdin=None)
+    assert reply.startswith("Error: ") and "EOFError" in reply and NO_STDIN_NOTE in reply, reply
+
+
+def test_a_silent_input_less_run_is_an_ordinary_run():
+    """A run given no input that prints nothing still ran: its reply carries the no-stdin note, it spends its
+    slot and earns ``tool_success_reward`` like any run, and a turn of nothing else trains like any turn."""
+    env = _env(language="python", tool_success_reward=0.05, tool_error_penalty=0.03)
+    ids = _reset(env)
+    step = _turn(env, ids, (env.test_tool_name, {"code": _READS_INPUT}), (env.test_tool_name, {"code": "x = 1"}))
+    traj = step.trajectory
+    assert [m.content for m in traj.messages[-2:]] == [f"{REPL_NO_OUTPUT_MESSAGE}\n{NO_STDIN_NOTE}"] * 2
+    assert step.reward == pytest.approx(0.05 + 0.05)
+    assert (traj.info["total_tool_calls"], traj.info["successful_tool_calls"]) == (2, 2)
+    assert env._test_calls(traj) == 2
+    assert not _last_turn_flagged(traj) and not recovering_turn(traj)
+
+
+def test_output_computed_from_no_input_says_it_got_none():
+    """A program that prints without reading the input it needed reads like a result; the note says
+    no stdin was passed. Empty stdin is not refused: a self-test embedding its own input is a real use."""
+    env = _env(language="python")
+    reply = _scratchpad(env, _episode(env), code="import sys\nprint(len(sys.stdin.read()))")
+    assert reply == (
+        "0\n(No stdin was passed to this run; if the program reads input, pass it in the `stdin` argument.)"
+    ), reply
+
+
+@pytest.mark.parametrize(
+    ("code", "error"), [("def f(:\n    pass", "SyntaxError"), ("if 1:\nprint(1)", "IndentationError")]
+)
+def test_a_python_source_that_does_not_compile_gets_no_missing_input_note(code, error):
+    """The interpreter stops on a SyntaxError before reading anything, so a missing input cannot be its cause."""
+    env = _env(language="python")
+    reply = _scratchpad(env, _episode(env), code=code)
+    assert reply.startswith("Error: ") and error in reply, reply
+    assert NO_STDIN_NOTE not in reply and not retired_budget_phrases(reply), reply
+
+
+def test_every_input_less_run_spends_its_run_and_carries_the_note():
+    """A run with no stdin says so whatever it did — printed nothing, crashed or printed — and spends its run; a
+    quiet run on real input carries no note."""
     env = _env(language="python")
     traj = _episode(env)
     silent = _scratchpad(env, traj, code=_READS_INPUT)
-    assert STARVED_RUN_NOTE in silent and silent.endswith("(Scratchpad runs left: 6 of 6.)"), silent
-    assert env._test_calls(traj) == 0
+    assert silent == f"{REPL_NO_OUTPUT_MESSAGE}\n{NO_STDIN_NOTE}", silent
     crash = _scratchpad(env, traj, code="print(int(input()) + 1)")
-    assert NO_STDIN_NOTE in crash and crash.endswith("(Scratchpad runs left: 5 of 6.)"), crash
+    assert crash.startswith("Error: ") and "EOFError" in crash and crash.endswith(f"\n{NO_STDIN_NOTE}"), crash
     printed = _scratchpad(env, traj, code="print(7)")
-    assert STARVED_RUN_NOTE not in printed and printed.endswith("(Scratchpad runs left: 4 of 6.)"), printed
-    quiet_on_input = _scratchpad(env, traj, code=_READS_INPUT.replace("print", "len"), stdin="1\n")
-    assert quiet_on_input.endswith("(Scratchpad runs left: 3 of 6.)"), quiet_on_input
-    assert env.rollout_metrics(traj)["episode/starved_test_runs"] == 1.0
+    assert printed == f"7\n{NO_STDIN_NOTE}", printed
+    quiet_on_input = _scratchpad(env, traj, code="import sys\nsys.stdin.read()", stdin="1\n")
+    assert quiet_on_input == REPL_NO_OUTPUT_MESSAGE, quiet_on_input
+    assert env._test_calls(traj) == 4
 
 
-def test_only_the_first_silent_input_less_run_of_an_episode_is_returned():
-    """Returning every such run would make one that reads nothing free to repeat: past
-    ``max_starved_run_refunds`` the run spends its turn of the budget and gets the plain no-stdin note."""
+def test_a_turn_of_only_malformed_calls_is_flagged_and_the_next_turn_recovers():
+    """A ``run_code`` call missing the ``language`` a language list requires is refused at binding, unrun and
+    unspent: a turn of nothing else is flagged untrainable and the next turn runs on the recovery reserve, the
+    reply and the tool-error price as they were. Beside a call that ran, it is not."""
+    env = _env(language=["python", "cpp"], tool_error_penalty=0.05)
+    ids = _reset(env)
+    step = _turn(env, ids, ("run_code", {"code": "print(1)", "stdin": "1\n"}))
+    traj = step.trajectory
+    assert traj.messages[-1].content == "Error: run_code: missing a required argument: 'language'"
+    assert _last_turn_flagged(traj) and recovering_turn(traj)
+    assert step.reward == pytest.approx(-0.05) and env._test_calls(traj) == 0
+    step = _turn(env, ids, ("run_code", {"code": "print(1)", "stdin": "1\n", "language": "python"}))
+    assert step.trajectory.messages[-1].content == "1"
+    assert not _last_turn_flagged(step.trajectory) and not recovering_turn(step.trajectory)
+    step = _turn(
+        env,
+        ids,
+        ("run_code", {"code": "print(2)", "stdin": "1\n"}),
+        ("run_code", {"code": "print(2)", "stdin": "1\n", "language": "python"}),
+    )
+    assert not _last_turn_flagged(step.trajectory) and env._test_calls(step.trajectory) == 2
+
+
+def test_a_turn_of_only_scratchpad_calls_past_the_budget_is_flagged():
+    """A scratchpad call past ``max_test_calls`` is refused unrun: a turn of nothing else is flagged and the next
+    turn recovers, the refusal text unchanged; beside a submission it is not."""
+    env = _env(language="python", max_test_calls=1)
+    ids = _reset(env)
+    assert not _last_turn_flagged(
+        _turn(env, ids, (env.test_tool_name, {"code": "print(1)", "stdin": "1\n"})).trajectory
+    )
+    step = _turn(env, ids, (env.test_tool_name, {"code": "print(2)", "stdin": "1\n"}))
+    traj = step.trajectory
+    assert traj.messages[-1].content == f"Error: {SCRATCHPAD_BUDGET_SPENT_REPLY}"
+    assert _last_turn_flagged(traj) and recovering_turn(traj) and env._test_calls(traj) == 1
+    step = _turn(
+        env, ids, (env.test_tool_name, {"code": "print(3)", "stdin": "1\n"}), (SUBMIT_TOOL, {"code": "print(2)"})
+    )
+    assert not _last_turn_flagged(step.trajectory)
+
+
+def test_a_direct_call_outside_an_episode_gets_the_plain_note():
     env = _env(language="python")
-    traj = _episode(env)
-    first, second = _scratchpad(env, traj, code=_READS_INPUT), _scratchpad(env, traj, code=_READS_INPUT)
-    assert STARVED_RUN_NOTE in first and first.endswith("(Scratchpad runs left: 6 of 6.)"), first
-    assert NO_STDIN_NOTE in second and second.endswith("(Scratchpad runs left: 5 of 6.)"), second
-    assert env.rollout_metrics(traj)["episode/starved_test_runs"] == 1.0
-    never = _env(language="python", max_starved_run_refunds=0)
-    reply = _scratchpad(never, _episode(never), code=_READS_INPUT)
-    assert NO_STDIN_NOTE in reply and reply.endswith("(Scratchpad runs left: 5 of 6.)"), reply
-
-
-def test_the_refund_cap_returns_exactly_that_many_silent_runs():
-    env = _env(language="python", max_starved_run_refunds=2)
-    traj = _episode(env)
-    replies = [_scratchpad(env, traj, code=_READS_INPUT) for _ in range(3)]
-    assert [STARVED_RUN_NOTE in reply for reply in replies] == [True, True, False], replies
-    assert NO_STDIN_NOTE in replies[2] and replies[2].endswith("(Scratchpad runs left: 5 of 6.)"), replies[2]
-    assert env.rollout_metrics(traj)["episode/starved_test_runs"] == 2.0
-
-
-@pytest.mark.parametrize("refunds", [0, 1])
-def test_a_direct_call_outside_an_episode_returns_every_silent_run(refunds):
-    """A direct call keeps no budget, so whatever the episode cap, a silent input-less run reads as returned."""
-    env = _env(language="python", max_starved_run_refunds=refunds)
-    assert env._run_test(_READS_INPUT) == f"{REPL_NO_OUTPUT_MESSAGE}\n{STARVED_RUN_NOTE}"
-
-
-def test_a_clean_input_less_run_that_writes_only_to_stderr_spends_no_run():
-    """A clean exit's reply leaves stderr out, so a program that only logged to stderr showed the model no
-    output: the run is returned as a silent one is, not charged under a reply that reads as nothing."""
-    env = _env(language="python")
-    traj = _episode(env)
-    reply = _scratchpad(env, traj, code="import sys\nsys.stderr.write('debug: read nothing\\n')")
-    assert reply == f"{REPL_NO_OUTPUT_MESSAGE}\n{STARVED_RUN_NOTE}\n(Scratchpad runs left: 6 of 6.)", reply
-    assert env._test_calls(traj) == 0
-    assert env.rollout_metrics(traj)["episode/starved_test_runs"] == 1.0
-
-
-@pytest.mark.parametrize("cap", [-1, 1.5, True])
-def test_a_refund_cap_that_is_not_a_count_is_refused(cap):
-    with pytest.raises(ValueError, match="max_starved_run_refunds"):
-        _env(language="python", max_starved_run_refunds=cap)
+    assert env._run_test(_READS_INPUT) == f"{REPL_NO_OUTPUT_MESSAGE}\n{NO_STDIN_NOTE}"
 
 
 def test_a_garbled_argument_name_is_refused_unspent_and_named():

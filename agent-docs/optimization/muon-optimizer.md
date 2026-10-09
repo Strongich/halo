@@ -56,7 +56,7 @@ per-param index space; upstream Muon serializes only its own state, which would 
 
 `_weight_decay_update_kernel` computes the update in fp32 and rounds the new weight to bf16 with stochastic rounding (same technique as [AdamWBF16](bf16-optimizer.md)). The orthogonalized update has magnitude ~`lr` after RMS-norm scaling, which at typical fine-tune LRs is below the bf16 weight ULP; nearest rounding would truncate the entire update to zero.
 
-SR keeps the write unbiased so small updates accumulate. Each seed is keyed by the parameter's step count (a `step` entry in Muon's per-param state) and its position, under a key apart from the internal AdamWBF16's (see [AdamWBF16](bf16-optimizer.md#stochastic-rounding)), so replicas stay bit-identical and a resume rounds as the uninterrupted run would.
+SR keeps the write unbiased so small updates accumulate. Each seed is keyed by the parameter's step count (a `step` entry in Muon's per-param state) and its name, under a key apart from the internal AdamWBF16's (see [AdamWBF16](bf16-optimizer.md#stochastic-rounding)), so replicas stay bit-identical and a resume rounds as the uninterrupted run would.
 
 ## Newton-Schulz kernel backend
 
@@ -66,7 +66,7 @@ The `Dockerfile` force-installs the ABI-compatible pair (`quack-kernels==0.5.0`,
 
 ## Benchmark
 
-Optimizer micro-benchmark on one B300 (`tests/gpu/optimizers/bench_muon.py --hidden 4096 --layers 8`: synthetic FFN, 8 layers × 4096 × 16384, 1.61B params; median of 20 timed steps; 2026-10-03, commit 0bc3a22a5, Blackwell image), isolating the optimizer step:
+Optimizer micro-benchmark on one B300 (`tests/gpu/optimizers/bench_muon.py --hidden 4096 --layers 8`: synthetic FFN, 8 layers × 4096 × 16384, 1.61B params; median of 20 timed steps; Blackwell image), isolating the optimizer step:
 
 | Optimizer | Optimizer step | Peak mem vs AdamW |
 |---|:---:|:---:|

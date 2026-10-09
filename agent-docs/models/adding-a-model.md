@@ -23,7 +23,7 @@ Add the family predicate beside the existing ones and wire it into whichever sea
 
 ## Declare the head transform
 
-The chunked GRPO log-probs (`use_chunked_grpo_logprobs`) and the last pipeline stage compute logits from the backbone's hidden state instead of calling `*ForCausalLM.forward`. Whatever that forward applies around `lm_head` — a hidden-state scale, a logit scale or division, a softcap, a vocabulary cut — has to be declared, or both paths refuse the family.
+The chunked GRPO log-probs (`use_chunked_grpo_logprobs`) compute logits from the backbone's hidden state instead of calling `*ForCausalLM.forward`, as does the PP stage seam. Whatever that forward applies around `lm_head` — a hidden-state scale, a logit scale or division, a softcap, a vocabulary cut — has to be declared, or the chunked path refuses the family.
 
 Declare it with a `HeadTransformSpec` subclass in `src/models/head_transform.py`: claim the causal-LM class names in `HF_MODULE_NAMES` and build the `HeadTransform` from the config in `transform`. Resolution walks the class's MRO. A family with no spec gets the base, which applies `final_logit_softcapping` where the config sets it.
 
@@ -87,9 +87,9 @@ No hook may allocate state sized by `world_size` either — invisible at 8 GPUs,
 
     Genuinely distinct layouts override the gather instead: GptOss re-interleaves gate/up, Gemma4 strips the `experts.` prefix.
 
-- `_HUB_PER_EXPERT_KEYS` — the same triple, for a family whose hub checkpoint is per-expert while its gather does *not* do the split. That is exactly the pairing `__init_subclass__` forbids with `_PER_EXPERT_UNFUSED_KEYS`.
+- `_HUB_PER_EXPERT_KEYS` — the same triple, for a family with a per-expert spelling its gather does *not* split into. That is exactly the pairing `__init_subclass__` forbids with `_PER_EXPERT_UNFUSED_KEYS`.
 
-    Two cases: families storing gate/up/down separately, which subclass `EPSeparateGluMoELayerBase` for the `_gather_individual_glu_state_dict` / `_merge_individual_glu_shards` pair (Bailing, Qwen3); and families whose gather writes the fused tensor transformers reverts on save (Qwen3.5/3.6, DeepSeek-V4, Cohere2 MoE, GLM-5 Next).
+    Two cases: families storing gate/up/down separately, which subclass `EPSeparateGluMoELayerBase` for the `_gather_individual_glu_state_dict` / `_merge_individual_glu_shards` pair (Bailing, Qwen3); and families whose gather writes the fused tensor while transformers also loads the per-expert spelling — their hub's for DeepSeek-V4, Cohere2 MoE and GLM-5 Next, and for Qwen3.5/3.6, whose hub ships the fused tensor, the one `unfuse_moe_experts.py` writes.
 
     `EPMoELayerBase.hub_per_expert_keys()` unions the two. A family answering `None` there is one `unfuse_moe_experts.py` refuses.
 
@@ -97,12 +97,12 @@ No hook may allocate state sized by `world_size` either — invisible at 8 GPUs,
 
     Which families an engine can take an *online* update for lives on its weight-sync client (`UNSERVABLE_MODEL_TYPES` in `src/distributed/nccl/clients/`), one loader fact per `model_type`. Add an entry there when the engine's loader cannot take the chunked update; `validate_weight_sync_support` then refuses the pair at trainer construction quoting it ([Rollout Servers](../infrastructure/rollout-servers.md#which-families-each-engine-serves)).
 
-- `_EXPORT_KEY_RENAMES` — `(module spelling, hub spelling)` pairs for a family whose in-library module names differ from its checkpoint's. Transformers applies its own `WeightRenaming` entries only inside `from_pretrained`; the gather, the RL weight sync and the lazy loader all bypass that.
+- `_EXPORT_KEY_RENAMES` — `(module spelling, hub spelling)` pairs for a family whose in-library module names differ from its checkpoint's inside an EP layer. The gathered save and the RL weight sync revert transformers' own `WeightRenaming` entries off the load's record, but the key-by-key paths with no model behind them — the lazy loader and `merge_ep_shards.py` — read only these pairs.
 
-    Undeclared, the export writes keys vLLM silently skips and the lazy loader leaves that submodule randomly initialized (Laguna's `shared_expert` ↔ `shared_experts`).
+    Undeclared, the lazy loader leaves that submodule randomly initialized and the sharded EP save is refused (Laguna's `shared_expert` ↔ `shared_experts`).
 
 - `_supports_weight_sync` / `_supports_gradient_checkpointing` / `_supports_lazy_loading` — all default `True`. Set one `False` and the owning gate rejects loudly instead of corrupting silently. Which family switches off which flag is published, pinned against the classes, in [Per-family EP restrictions](../parallelism/expert-parallelism.md#per-family-ep-restrictions).
-- `_supports_bias_balancing` — `True` when routing *selection* happens in-layer: add `self._balancing_bias(scores)` before top-k, gather gate weights from the **unbiased** scores, and call `self._record_expert_load(indices)`. For logit-routed families `_deepseek_biased_route` does the biased selection and the unbiased gate; the caller still records the load on its indices.
+- `_supports_bias_balancing` — `True` when routing *selection* happens in-layer. Select through the shared helpers, not a hand-added `self._balancing_bias(...)`, which is `None` when balancing is off and in native-adoption mode (the adopted slot already sits in the selection): score-routed layers take top-k over `self._selection_scores(scores)` (the group-limited base, DeepSeek-V4, Inkling, LFM-2); logit-routed ones use `self._biased_topk(logits)` (Qwen3, Cohere2 MoE) or `_deepseek_biased_route`, which also returns the unbiased gate (GPT-OSS, Qwen3.5). Gate weights come from the **unbiased** scores, and the caller records the load with `self._record_expert_load(indices)`.
 
     A layer can refuse per-instance by overriding `enable_bias_balancing` (DeepSeek-V4 hash layers). Leave `False` when the router sits outside the wrapper (Gemma4) or the family's own gate owns a native balancing buffer (Zaya). An explicit `bias_update` on a model where no layer accepts the bias raises.
 
@@ -154,7 +154,7 @@ Full procedure in [Context Parallelism — Adding a new model](../parallelism/co
 
 1. **Write a wrapper** under `layers/` and declare `HF_MODULE_NAMES`. Two templates: subclass `UlyssesAttentionBase` for the optimized path (RoPE before all-to-all, native GQA — copy `Qwen3MoeUlyssesAttention`), or `MLAUlyssesAttentionBase` when Q/K and V head dims differ (copy `Glm4MoeLiteUlyssesAttention`).
 
-    There is no accept list to edit. `layers/registry.py` imports every module in the package and derives `WRAPPER_CLASS_MAP` — and `CP_SUPPORTED_ATTENTION_CLASSES` from it — by walking the `UlyssesAttentionBase` subclass tree, so the wrapper registers by existing and a duplicate HF name raises.
+    There is no accept list to edit. `layers/registry.py` imports every module in the package and derives `WRAPPER_CLASS_MAP` by walking the `UlyssesAttentionBase` subclass tree, so the wrapper registers by existing and a duplicate HF name raises.
 
 2. **Runtime requirements**: a real Flash Attention impl (`SUPPORTED_ATTN_IMPLEMENTATIONS` in `validation.py`) unless the wrapper declares `REQUIRES_FLASH_ATTN_LABEL = False` (modeling code that cannot carry a flash label, e.g. Bailing), and both `num_attention_heads` and `num_key_value_heads` divisible by `cp_size`.
 
@@ -196,6 +196,8 @@ If a model isn't in transformers yet, or its `trust_remote_code` conflicts with 
 
 HF models that only need `trust_remote_code=True` (Bailing/Ling, Laguna) take the shims path with no vendoring.
 
+A node's ranks share the module cache transformers copies remote code into (`HF_MODULES_CACHE`), and transformers rewrites a module there in place. `src/models/patches/remote_code_hooks.py`, which every loader and training entry point imports, makes each copy land whole (the remote code a save writes beside a checkpoint too), so a rank never imports a module a peer is still writing.
+
 ## Declare Liger coverage
 
 Upstream Liger's `MODEL_TYPE_TO_APPLY_LIGER_FN` doesn't cover every supported model, and covers some only in part. A family that neither registry covers warns at model load that the run trains unfused, and refuses an explicit `liger_kernel_config` key. Add one `LigerFamilySpec` to `src/kernels/liger/families.py` — there is no per-family applier module:
@@ -204,7 +206,7 @@ Upstream Liger's `MODEL_TYPE_TO_APPLY_LIGER_FN` doesn't cover every supported mo
 
     Then the variant parameters: `rms_norm_offset` / `rms_norm_casting_mode` for a Gemma-style `(1 + w)` norm or an fp32 weight multiply, `rms_norm_kernel="native"` to serve an offset-free norm with torch's fused `F.rms_norm` instead of Liger's, `logit_scale_attr` for a head that scales its logits, `router_aux_loss_in_head` for a head that adds the router aux loss after the projection, `rope=True` only for a full-width `rotate_half` rotary.
 
-    A `trust_remote_code` family sets `remote_classes` instead of `modeling_module`; its patch fires when transformers loads the modeling file.
+    A `trust_remote_code` family sets `remote_classes` (every class a role names) instead of `modeling_module`; its patch fires when transformers loads the modeling file. A native family whose hub repos also ship their own modeling file through `auto_map` (Laguna) sets both.
 
     List a multimodal wrapper's `model_type` only when its text tower can be nothing but this family. Otherwise the orchestrator resolves it through `text_config`, and the fused loss is forced off there because the wrapper's own head runs.
 

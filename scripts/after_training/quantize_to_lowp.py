@@ -15,8 +15,10 @@ block-scaled convention:
   - ``<name>.weight_scale``  — one scale per block along the contraction axis: ``uint8`` e8m0 (mxfp8,
     block 32) or ``float8_e4m3fn`` (nvfp4, block 16),
   - ``<name>.weight_shape``  — the original ``[out, in]`` shape (the packed nvfp4 data halves the last dim),
-  - ``<name>.weight_global_scale`` — nvfp4 only: the per-tensor fp32 multiplier of its two-level scaling
-    (the ``e4m3`` block scale is relative to it, so dropping it rescales the weight).
+  - ``<name>.weight_global_scale`` — nvfp4 only: the per-tensor fp32 scale of its two-level scaling, in
+    compressed-tensors' spelling: an element is ``code x weight_scale / weight_global_scale``, so the
+    stored value is the reciprocal of :class:`~src.kernels.lowp.quantization.BlockScaledTensor`'s
+    multiplier (dropping it rescales the weight).
 
 Which weights those are is derived from the rosters that decide what QAT quantized (the trainer's
 dense ``MLP_PROJECTIONS`` plus the EP layer classes' expert layouts), so the export cannot quantize a
@@ -52,6 +54,7 @@ import torch
 from safetensors.torch import save_file
 from transformers.utils import CONFIG_NAME
 
+from src.checkpoint.config_export import write_config_json
 from src.checkpoint.format import (
     SAFETENSORS_METADATA,
     SAFETENSORS_WEIGHTS_FILE,
@@ -72,15 +75,9 @@ from src.distributed.expert_parallel.expert_weights import (
     hf_fused_expert_keys,
     per_expert_layouts,
 )
+from src.kernels.lowp.linear import PRECISION_TO_FORMAT
 from src.kernels.lowp.mixed_precision import MLP_PROJECTIONS, block_index, block_numbering_root, kept_block_indices
-from src.kernels.lowp.quantization import (
-    FORMAT_BLOCK_SIZE,
-    BlockScaledTensor,
-    dequantize,
-    quantize_mxfp4,
-    quantize_mxfp8,
-    quantize_nvfp4,
-)
+from src.kernels.lowp.quantization import FORMAT_BLOCK_SIZE, QUANTIZERS, BlockScaledTensor, dequantize
 from src.log import configure_cli_logging
 
 configure_cli_logging()
@@ -108,13 +105,10 @@ _DEFAULT_EXCLUDE = (
     r"(norm|layernorm|embed|lm_head|\.bias$|rotary|router|gate\.weight$"
     r"|vision_tower|vision_model|visual|multi_modal_projector)"
 )
-_QUANTIZERS = {"mxfp8": quantize_mxfp8, "mxfp4": quantize_mxfp4, "nvfp4": quantize_nvfp4}
 # Round-trip dequant relerr --verify accepts: the format's own block-scaled error (mxfp8 ~0.02-0.05,
 # nvfp4 ~0.08-0.15) with headroom. Above it the cause is structural, usually the contraction axis. The
 # QAT forward is exact wherever a value lands in this band.
 _VERIFY_RELERR_TOL = {"mxfp8": 0.08, "nvfp4": 0.25, "mxfp4": 0.35}
-# Storage format -> the ``lowp_precision`` spelling that trains it.
-_FMT_TO_LOWP_PRECISION = {"mxfp8": "fp8", "nvfp4": "fp4", "mxfp4": "mxfp4"}
 # Per-expert un-fused hub layout (``...experts.3.gate_proj.weight``): expert weights other than the
 # 3-D fused tensor, told apart from a dense MLP projection by this segment alone. The container
 # spellings are the EP layer classes' own (``routed_experts`` beside ``experts``).
@@ -130,7 +124,7 @@ def _is_expert_weight(name: str, ndim: int) -> bool:
     This is the seam ``--lowp_apply_moe_experts`` turns on, so it is the complement of "dense MLP
     projection" under the same include roster.
     """
-    if ndim == 3 and any(name.endswith(suffix) for suffix in _FUSED_EXPERT_SUFFIXES):
+    if ndim == 3 and name.endswith(_FUSED_EXPERT_SUFFIXES):
         return True
     return _PER_EXPERT_SEGMENT.search(name) is not None
 
@@ -156,7 +150,7 @@ def _should_quantize(
     """
     if include.search(name) is None or exclude.search(name) is not None or tensor.dim() < 2:
         return False
-    if not (name.endswith(".weight") or (tensor.dim() == 3 and any(name.endswith(s) for s in _FUSED_EXPERT_SUFFIXES))):
+    if not (name.endswith(".weight") or (tensor.dim() == 3 and name.endswith(_FUSED_EXPERT_SUFFIXES))):
         return False
     if block_index(name) in kept_blocks:
         return False
@@ -193,7 +187,7 @@ def _reject_unexportable_experts(
         ndim = len(header.get_shape())
         if header.get_dtype() not in SAFETENSORS_FLOAT_DTYPES:
             continue
-        if ndim == 3 and not any(name.endswith(suffix) for suffix in _FUSED_EXPERT_SUFFIXES):
+        if ndim == 3 and not name.endswith(_FUSED_EXPERT_SUFFIXES):
             raise ValueError(
                 f"{name!r} is a 3-D floating expert tensor in the low-precision scope, but no EP layer "
                 f"class declares its name as a fused expert key ({', '.join(_FUSED_EXPERT_SUFFIXES)}), so "
@@ -261,6 +255,26 @@ def _backbone_block_count(input_dir: str, include: re.Pattern, exclude: re.Patte
     return (max(indices) + 1) if indices else 0
 
 
+def _stored_global_scale(name: str, weight: torch.Tensor, global_scale: torch.Tensor) -> torch.Tensor:
+    """The ``weight_global_scale`` compressed-tensors stores for an nvfp4 weight, shape ``[1]`` as its
+    ``generate_gparam`` writes it: the reciprocal of the quantizer's power-of-two multiplier, so exact.
+
+    An all-zero weight's multiplier is far below fp32's reciprocal range; its codes and block scales are
+    all zero, so it stores compressed-tensors' own value for that case, 1.0. An ``inf`` would reach
+    vLLM's max over a fused layer's partition scales and zero every partition.
+    """
+    stored = global_scale.reciprocal().reshape(1).cpu()
+    if not torch.isposinf(stored).any():
+        return stored
+    if weight.any():
+        raise ValueError(
+            f"{name!r} has a nonzero max |w| of {weight.float().abs().max().item():.3e}, below the range an "
+            f"nvfp4 global scale can store (its reciprocal overflows fp32). Pass --exclude to keep it in "
+            f"high precision."
+        )
+    return torch.ones(1, dtype=stored.dtype)
+
+
 def quantize_checkpoint(
     input_dir: str,
     output_dir: str,
@@ -275,7 +289,7 @@ def quantize_checkpoint(
     keep_last_blocks: int = 0,
     verify: bool = False,
 ) -> None:
-    quantizer = _QUANTIZERS[fmt]
+    quantizer = QUANTIZERS[fmt]
     block = FORMAT_BLOCK_SIZE[fmt]
     inc, exc = re.compile(include), re.compile(exclude)
     reject_in_place_conversion(input_dir, output_dir)
@@ -338,14 +352,12 @@ def quantize_checkpoint(
                 skipped.append(name)
                 continue
             base = name[: -len(".weight")] if name.endswith(".weight") else name
-            q: BlockScaledTensor = quantizer(
-                t.cuda().float() if torch.cuda.is_available() else t.float(), axis=axis, block_size=block
-            )
+            q: BlockScaledTensor = quantizer(t.cuda().float() if torch.cuda.is_available() else t.float(), axis=axis)
             out_tensors[f"{base}.weight_packed"] = q.data.cpu().contiguous()
             out_tensors[f"{base}.weight_scale"] = q.scales.cpu().contiguous()
             out_tensors[f"{base}.weight_shape"] = torch.tensor(list(t.shape), dtype=torch.int64)
             if q.global_scale is not None:
-                out_tensors[f"{base}.weight_global_scale"] = q.global_scale.cpu().contiguous()
+                out_tensors[f"{base}.weight_global_scale"] = _stored_global_scale(name, t, q.global_scale)
             quantized.append(name)
             weight_axes[name] = axis
             if verify:
@@ -415,6 +427,8 @@ def _write_manifest(
     """Copy every non-weight file (config, tokenizer, chat_template.jinja, remote-code .py) + drop a
     quantization_config.json describing the block-scaled scheme."""
     copy_checkpoint_aux_files(input_dir, output_dir)
+    # The ``lowp_precision`` spelling that trains this storage format.
+    lowp_precision = next(precision.value for precision, trained in PRECISION_TO_FORMAT.items() if trained == fmt)
     manifest = {
         "quant_method": "block_scaled",
         "format": fmt,
@@ -434,32 +448,34 @@ def _write_manifest(
         "scope": scope,
         "quantized_weights": names,
         "note": (
-            f"Trained with mixed-precision QAT (lowp_precision: {_FMT_TO_LOWP_PRECISION[fmt]}, "
+            f"Trained with mixed-precision QAT (lowp_precision: {lowp_precision}, "
             f"i.e. {fmt}); quantizing the bf16/fp32 master to this format reproduces the QAT "
-            "forward exactly. Dequantize via src.kernels.lowp.quantization.dequantize."
+            "forward exactly. Dequantize via src.kernels.lowp.quantization.dequantize, whose nvfp4 "
+            "global scale is the reciprocal of the stored weight_global_scale."
         ),
     }
     with open(os.path.join(output_dir, "quantization_config.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
     # Stamp the scheme into config.json, the key readers consult; it also flips the toolkit's
-    # native-quantized detection (EP lazy loading routes such checkpoints to from_pretrained). Do not
-    # set quant_method to the raw format name: "mxfp8"/"mxfp4"/"nvfp4" are transformers methods with a
-    # different on-disk layout, which would turn the refusal into a wrong-layout load.
+    # native-quantized detection (EP lazy loading routes such checkpoints to from_pretrained, whose
+    # coverage gate refuses the missing *.weight keys). vLLM and SGLang refuse the unknown
+    # "block_scaled" method; plain transformers only warns, skips quantization and random-initializes
+    # every quantized weight. A raw format name ("mxfp4", "nvfp4", "mxfp8") would instead select a
+    # transformers or vLLM method that reads a different on-disk layout.
     config_path = os.path.join(output_dir, CONFIG_NAME)
     if os.path.exists(config_path):
         with open(config_path) as f:
             config = json.load(f)
         config["quantization_config"] = manifest
-        with open(config_path, "w") as f:
-            json.dump(config, f, indent=2)
+        write_config_json(config_path, config)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Quantize a bf16/fp32 checkpoint to block-scaled mxfp8/mxfp4/nvfp4.")
     p.add_argument("--input_dir", required=True, help="Source checkpoint directory (safetensors).")
     p.add_argument("--output_dir", required=True, help="Output directory for the quantized checkpoint.")
-    p.add_argument("--format", choices=list(_QUANTIZERS), required=True, help="Block-scaled target format.")
+    p.add_argument("--format", choices=list(QUANTIZERS), required=True, help="Block-scaled target format.")
     p.add_argument(
         "--contraction_axis",
         type=int,

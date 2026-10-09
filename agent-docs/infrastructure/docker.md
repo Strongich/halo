@@ -27,8 +27,9 @@ The Makefile's `DOCKER_RUN` is not identical to a hand-rolled launch. It runs in
 networking would silently fail them) plus `-e PYTHONPATH=/workspace -e CUDA_DEVICE_MAX_CONNECTIONS=1`.
 
 It makes `--env-file` and the `~/.aws` mount conditional on `ENV_FILE`/`AWS_DIR` so CI can run
-creds-free. It also **omits `--cap-add=SYS_PTRACE`**, so py-spy cannot attach to a job started through
-a `make` target.
+creds-free. It also **omits `--cap-add=SYS_PTRACE`**, so py-spy attaches to a job started through a
+`make` target only on a host whose `kernel.yama.ptrace_scope` is 0
+([Debugging §1c](../reference/debugging.md#1c-py-spy--cpu-flame-graph-dataloader--python-stalls)).
 
 The equivalent detached background job:
 
@@ -166,7 +167,7 @@ base NGC image need updating.
 
 | Variable | Value | Effect |
 |----------|-------|--------|
-| `CUDA_DEVICE_MAX_CONNECTIONS` | `1` | Latched by the driver at `cuInit` (DeepEP import time), so it must be in the environment from PID 1. Free default ([measured effect](deepep.md#environment-variables)); it does **not** make racy single-domain multi-group EP safe — `ParallelismConfig` rejects that shape. |
+| `CUDA_DEVICE_MAX_CONNECTIONS` | `1` | Latched by the driver at `cuInit` (DeepEP import time), so it must be in the environment from PID 1. The setting the EP suites are validated with, at no measurable throughput cost ([measured effect](deepep.md#environment-variables)); it does **not** make racy single-domain multi-group EP safe — `ParallelismConfig` rejects that shape. |
 | `TORCH_ALLOW_TF32_CUBLAS_OVERRIDE` | `0` | The NGC base defaults fp32 matmuls to TF32, whose 10-bit mantissa collapses adjacent long-context RoPE positions past 2048. Forced off. |
 | `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED` | `1` | Persist the FA4 CuTe DSL kernel cache (~10 s JIT per kernel on first use). |
 | `CUTE_DSL_ENABLE_TVM_FFI` | `1` | TVM-FFI direct-invocation ABI for CuTe DSL kernels. |
@@ -180,6 +181,12 @@ base NGC image need updating.
 `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` and `TRITON_CACHE_DIR` are not baked. The FA4 cache and the Triton
 kernel/autotune cache both derive their directories from `HF_HOME` (or the temp dir) at runtime, so one
 mounted volume carries every kernel cache across `--rm` containers.
+
+The FA4 cache serializes the writer of each kernel file with `flock`, so a shared `HF_HOME` needs
+locks that hold across nodes. Where `flock` fails (Lustre mounted without `flock`), the first use of
+each kernel raises after a 15 s lock timeout, mid-run included. Where locks are node-local (NFS
+`nolock` or `local_lock=flock`, Lustre `localflock`), one node can load a kernel file another is still
+writing. On either mount, set `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` to node-local storage.
 
 Triton matters more than it looks: fla's autotuners persist measured configs there (`FLA_CACHE_RESULTS`
 defaults on), and some of their keys are shape-derived, so an ephemeral cache re-benchmarks kernels per
@@ -239,8 +246,9 @@ the lock, the resolved `libnccl.so.2`, and the `ncclUniqueId` ABI identity betwe
 
 The image bakes the RL serving contract: native weight transfer (`VLLM_SERVER_DEV_MODE=1`; the
 trainer's client drives the phased update protocol the server exposes), R3 routed-experts capture, and
-two `sitecustomize`-applied patches, layerwise reload and weight-transfer re-init. The patch targets are
-asserted against the live vLLM at build, so an upstream refactor fails the image build.
+three `sitecustomize`-applied patches: layerwise reload, weight-transfer re-init and spec-decode
+prompt log-probs. The patch targets are asserted against the live vLLM at build, so an upstream
+refactor fails the image build.
 
 What the patches do, the `--moe-backend triton` rule, serving flags, networking, GPU assignment, and
 troubleshooting: [Rollout Servers](rollout-servers.md).
@@ -279,13 +287,13 @@ docker pull public.ecr.aws/whitecircle/halo:vllm-0.26.0
 docker pull public.ecr.aws/whitecircle/halo:sglang-0.5.17
 ```
 
-Each moving tag has immutable SemVer pins (`blackwell-1.0.0`); there is deliberately no `latest` — it
+Each moving tag has immutable SemVer pins (`blackwell-1.1.0`); there is deliberately no `latest` — it
 would let a Hopper host silently pull a Blackwell image. Pin a release by pulling its versioned tag
 and retagging locally:
 
 ```bash
-docker pull public.ecr.aws/whitecircle/halo:hopper-1.0.0
-docker tag  public.ecr.aws/whitecircle/halo:hopper-1.0.0 halo:hopper
+docker pull public.ecr.aws/whitecircle/halo:hopper-1.1.0
+docker tag  public.ecr.aws/whitecircle/halo:hopper-1.1.0 halo:hopper
 ```
 
 Maintainers publish with `make push-public-all` (`ecr-public-login` + the four `push-public-*`
@@ -321,9 +329,9 @@ S3 fails with `SSOTokenLoadError`, re-run `aws sso login` on the host. See [AWS 
 
 [Claude Code](https://code.claude.com) is not installed by default: pass
 `--build-arg INSTALL_CLAUDE_CODE=1` to install it at `/root/.local/bin/claude` (best-effort, non-fatal).
-Repo-aware skills live under `skills/` (symlinked from `.claude/skills` and `.agents/skills`) and ship
-inside the image (`skills/` is copied in and the symlinks recreated) and inside any container that
-mounts the repo at `/workspace`.
+The repo-aware skills (`skills/`, symlinked from `.claude/skills` and `.agents/skills`) are copied
+into `/workspace` at build, so the in-image agent has them without a repo mount; a mounted checkout
+at `/workspace` replaces them with its own.
 
 ## Cloud and dev setup
 

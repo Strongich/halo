@@ -16,13 +16,13 @@ The registries behind the matrix: EP wrappers under `src/distributed/expert_para
 | [Qwen3.5 / Qwen3.6 MoE](qwen3_5.md) | Yes | **No** ¹ | Yes | Yes | **No** | Yes | Yes | `examples/sft/qwen3_5/*` |
 | [GPT-OSS](gpt-oss.md) | Yes | Yes | Yes | Yes | Yes ⁶ | Yes | Yes | `examples/sft/gptoss/*` |
 | [GLM-4 MoE Lite](glm4.md) | Yes | Yes | Yes ² | Yes | Yes ⁶ | Yes | Yes | `examples/sft/glm4/*` |
-| [Laguna S / XS 2.1](laguna.md) | Yes | **No** | **No** | partial ¹³ | **No** | **No** | Yes | `examples/sft/laguna/*` |
+| [Laguna S / XS 2.1](laguna.md) | Yes | **No** | **No** | Yes | **No** | **No** | Yes | `examples/sft/laguna/*` |
 | [Inkling-Small](inkling.md) | Yes | **No** | **No** | Yes | **No** | **No** | Yes ¹² | `examples/sft/inkling/*` |
 | [Gemma 4 MoE](gemma4.md) | Yes | **No** | **No** | Yes | **No** | **No** | Yes | `examples/sft/gemma4/*` |
 | [Bailing MoE / Ling](bailing.md) | Yes | Yes ³ | **No** ³ | Yes | partial ⁶ ¹³ | **No** | Yes | `examples/sft/ling_mini_2/*` |
 | [LFM-2 MoE](lfm2.md) | Yes | **No** | Yes | Yes | **No** | Yes | Yes | `examples/sft/lfm2/*` |
 | [Mistral4 MoE](mistral4.md) | Yes | Yes | Yes | Yes | partial ⁶ ¹³ | Yes | Yes | `examples/sft/mistral4/*` |
-| [DeepSeek-V4](deepseek-v4.md) | Yes | **No** ⁸ | **No** ⁸ | untested | **No** | **No** | Yes | `examples/sft/deepseek_v4/*` |
+| [DeepSeek-V4](deepseek-v4.md) | Yes | **No** ⁸ | **No** ⁸ | Yes | **No** | **No** | Yes | `examples/sft/deepseek_v4/*` |
 | [Zaya (Zyphra/ZAYA1)](zaya.md) | Yes ⁴ | **No** ⁴ | **No** ⁴ | Yes | **No** | **No** | Yes | `examples/sft/zaya/*` |
 | [Cohere2 MoE (Command A+)](cohere2-moe.md) | Yes | Yes ⁹ | Yes ⁹ | Yes ⁹ | Yes ⁶ ⁹ | Yes ⁹ | Yes ¹² | `examples/sft/cohere2_moe/*` |
 | [GLM-5 Next (GLM-5.3-Flash)](glm5-next.md) | Yes | **No** ¹⁰ | **No** ¹⁰ | Yes | **No** | **No** | Yes | `examples/sft/glm5_next/*` |
@@ -47,7 +47,7 @@ Trainer × parallelism support is tracked in [Trainer Compatibility](../referenc
 
 ⁷ LoRA "Yes" means the family trains with adapters under FSDP/DP, EP, CP, and pure ETP. It is rejected at trainer construction under **TP** and **EP+TP** (adapters are plain tensors outside the TP DTensor graph). Under EP the adapters cover attention (PEFT) *and* the experts (native grouped adapters); the expert half is refused at `expert_tp_size > 1`, leaving attention-only LoRA there. See [PEFT](../optimization/peft.md).
 
-⁸ DeepSeek-V4 is eager-only (`head_dim=512` exceeds every FA kernel; sinks + compressor KV concat rule out SDPA/flex). Its CSA/HCA compressors pool token windows along the sequence axis (no CP), and shared-KV MQA is not shardable (`apply_tp_to_attention_only` raises). `padding_free` is rejected — no varlen kernel. See [deepseek-v4.md](deepseek-v4.md).
+⁸ DeepSeek-V4 is eager-only (`head_dim=512` exceeds every FA kernel; sinks + compressor KV concat rule out SDPA/flex). Its CSA/HCA compressors pool token windows along the sequence axis (no CP), and shared-KV MQA is not shardable (`apply_tp_to_attention_only` raises). `packing` and `padding_free` are refused — the compressor windows are cut at row indices, so a packed document reads the row's first windows. See [deepseek-v4.md](deepseek-v4.md).
 
 ⁹ Tiny-model verified on the single-node 8-GPU matrix (ep8 / cp8 / tp8 / ep8+cp2 / ep8+tp2 / etp8 / ep2+etp4) plus EP=2 loss/grad equivalence vs the stock model; only EP=8 is validated at the full Command A+ scale. See [cohere2-moe.md](cohere2-moe.md).
 
@@ -57,7 +57,7 @@ Trainer × parallelism support is tracked in [Trainer Compatibility](../referenc
 
 ¹² Tiny-model LoRA verified: `tests/gpu/trainers/lora/test_lora_merged_save_resume_families.py` trains expert and mixed adapters at ep2, ep1 and ep2+cp2 (Inkling's CP row checks the refusal) through a merged save and an exact resume. No full-scale LoRA run.
 
-¹³ A tiny-model LoRA row is the only GPU test of the shape: Laguna pure ETP in `tests/gpu/trainers/lora/test_lora_weight_sync_exact_families.py` (`--mode etp2 --adapters peft`), Ling 2.0 and Mistral4 EP+CP in `test_lora_merged_save_resume_families.py` (`--cp-size 2`, ep2+cp2). Validate a short run first.
+¹³ A tiny-model LoRA row is the only GPU test of the shape: Ling 2.0 and Mistral4 EP+CP in `tests/gpu/trainers/lora/test_lora_merged_save_resume_families.py` (`--cp-size 2`, ep2+cp2). Validate a short run first.
 
 ## MoE knobs
 
@@ -82,27 +82,32 @@ Families spell the count and the width differently (`num_experts`, `num_local_ex
 ## Load precision
 
 The training and scoring loaders cast floating parameters to the run dtype after `from_pretrained`
-and before parallel wrappers (`cast_parameters_to_run_dtype` in `src/models/loading/dtype.py`;
-lazy loaders cast per tensor). This overrides transformers' FP32 module pins — DeepSeek-V4's norms
-and hyper-connections, GLM-5 Next's KDA state, Inkling's short convolutions — so FSDP2 sees one dtype
+and before parallel wrappers (`cast_parameters_to_run_dtype` in `src/models/loading/dtype.py`; lazy
+loaders cast per tensor). This overrides transformers' FP32 module pins — DeepSeek-V4's norms and
+hyper-connections, GLM-5 Next's KDA state, Inkling's short convolutions — so FSDP2 sees one dtype
 within each shard group. Persistent buffers have a separate policy: a family-pinned buffer stays
-FP32 on every loader, including the lazy EP loader's `e_score_correction_bias`.
+FP32 on every loader, including the lazy EP loader's `e_score_correction_bias`, and Zaya's balancing
+biases are FP32 by design.
 
 Configured FP32 parameter masters are the exception. The shared selector in
-`src/distributed/loading/precision.py` preserves non-EP weights under `fp32_non_ep_params` and the
-EP wrapper's selected router/expert weights under their flags. Eager construction streams those
-checkpoint values back before wrapping; lazy construction reads/fuses them at FP32 immediately.
-Native dense TP rebuilds its existing TP shards at FP32 before the DP wrap, preserving tied aliases
-and never moving a full FP32 matrix onto each GPU. This applies to fresh stages and resumes alike;
-resolved resume provenance only makes coverage strict. See
+`src/distributed/expert_parallel/fp32_masters.py` preserves non-EP weights under `fp32_non_ep_params`
+and the EP wrapper's selected router/expert weights under their flags. Eager construction streams
+those checkpoint values back before wrapping; lazy EP construction reads and fuses them at FP32
+directly. Native dense TP rebuilds its existing TP shards at FP32 before the DP wrap, preserving tied
+aliases and never moving a full FP32 matrix onto each GPU. This holds under every parallelism mode,
+for a new training run started from a checkpoint and for a resume alike. A full-fine-tune resume
+requires every configured master to be restored. See
 [Checkpoint precision](../reference/checkpoints.md#what-gets-saved) and the
 [eager EP memory/read cost](../parallelism/expert-parallelism.md#model-loading).
 
 A quantized base keeps packed bnb `Params4bit` storage, including floating `bnb_4bit_quant_storage`;
-it is never a parameter master. FP8 weights are refused: dequantize once to BF16 with the family's
-`scripts/before_training/convert_*_bf16.py` converter. Conversion tools keep the original pins,
-while the deduplication embeddings tool loads at the checkpoint's dtype. The reward-scoring tool
-casts the whole model, buffers included, to its `--rm_dtype`.
+it is never a parameter master. FP8 weights are refused on every training loader that casts (all but the
+dense TP loader below): dequantize once to
+BF16 with the family's `scripts/before_training/convert_*_bf16.py` converter. Three loads skip the
+cast: the conversion tools, which keep the original pins; the deduplication embeddings tool, which
+loads at the checkpoint's dtype; and the dense TP loader, which loads straight into DTensors (no dense
+family pins a parameter). The reward-scoring tool casts the whole model, buffers included, to its
+`--rm_dtype`.
 
 ## Per-family pages
 

@@ -166,7 +166,6 @@ class DataCollatorWithPacking(DataCollatorForLanguageModeling):
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerBase,
-        pad_to_multiple_of: int | None = None,
         return_seq_idx: bool = False,
         return_flash_attn_kwargs: bool = False,
     ):
@@ -178,7 +177,7 @@ class DataCollatorWithPacking(DataCollatorForLanguageModeling):
                 f"document out of the loss entirely. The training loaders force right padding; set "
                 f"tokenizer.padding_side='right' if you are constructing this collator directly."
             )
-        super().__init__(tokenizer=tokenizer, mlm=False, pad_to_multiple_of=pad_to_multiple_of, return_tensors="pt")
+        super().__init__(tokenizer=tokenizer, mlm=False, return_tensors="pt")
         self.return_seq_idx = return_seq_idx
         self.return_flash_attn_kwargs = return_flash_attn_kwargs
 
@@ -217,8 +216,6 @@ class DataCollatorWithPacking(DataCollatorForLanguageModeling):
             batch = self._mask_packed_labels(batch, examples)
             if self.flatten_to_single_row:
                 batch = flatten_packed_batch(batch, self._real_row_lengths(batch, examples))
-                if self.pad_to_multiple_of:
-                    batch = self._pad_flattened_tail(batch)
             # The varlen set is only defined on the flattened [1, total] row — PP keeps its rows.
             markers = SegmentMarkers(
                 seq_idx=self.return_seq_idx,
@@ -243,31 +240,6 @@ class DataCollatorWithPacking(DataCollatorForLanguageModeling):
             seq_lengths = example.get("seq_lengths") if isinstance(example, dict) else None
             lengths.append(min(sum(seq_lengths), width) if isinstance(seq_lengths, list) else width)
         return lengths
-
-    def _pad_flattened_tail(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Re-pad the flattened row to ``pad_to_multiple_of`` as a chunked-ramp tail.
-
-        ``pad_tail_positions`` keeps the tail a handful of no-op documents — re-padding with
-        position-0 tokens would rebuild the per-pad length-1 segments the flatten just removed.
-        """
-        total = batch["input_ids"].shape[1]
-        missing = -total % self.pad_to_multiple_of
-        if not missing:
-            return batch
-        batch["input_ids"] = torch.cat(
-            [
-                batch["input_ids"],
-                torch.full((1, missing), self.tokenizer.pad_token_id, dtype=batch["input_ids"].dtype),
-            ],
-            dim=1,
-        )
-        batch["labels"] = torch.cat(
-            [batch["labels"], torch.full((1, missing), LABEL_IGNORE_INDEX, dtype=batch["labels"].dtype)], dim=1
-        )
-        batch["position_ids"] = torch.cat(
-            [batch["position_ids"], pad_tail_positions(missing, batch["position_ids"].dtype).unsqueeze(0)], dim=1
-        )
-        return batch
 
     def _mask_packed_labels(self, batch: dict[str, Any], examples: list[dict[str, Any]]) -> dict[str, Any]:
         """Per-row label hook, run on the ``[B, L]`` packed batch after ``_handle_packing`` and
@@ -321,8 +293,6 @@ class DataCollatorForCompletionOnlyLMWithPacking(DataCollatorWithPacking):
         self,
         response_prompt_template: str | list[int],
         tokenizer: PreTrainedTokenizerBase,
-        ignore_index: int = LABEL_IGNORE_INDEX,
-        pad_to_multiple_of: int | None = None,
         train_on_last_assistant_only: bool = False,
         eos_token_ids: frozenset[int] | None = None,
         return_seq_idx: bool = False,
@@ -330,13 +300,11 @@ class DataCollatorForCompletionOnlyLMWithPacking(DataCollatorWithPacking):
     ):
         super().__init__(
             tokenizer=tokenizer,
-            pad_to_multiple_of=pad_to_multiple_of,
             return_seq_idx=return_seq_idx,
             return_flash_attn_kwargs=return_flash_attn_kwargs,
         )
 
         self.response_prompt_template = response_prompt_template
-        self.ignore_index = ignore_index
         self.train_on_last_assistant_only = train_on_last_assistant_only
         self.response_token_ids = tokenize_response_template(response_prompt_template, self.tokenizer)
         self.eos_token_ids = eos_token_ids if eos_token_ids is not None else resolve_eos_token_ids(self.tokenizer)
@@ -354,7 +322,7 @@ class DataCollatorForCompletionOnlyLMWithPacking(DataCollatorWithPacking):
                 batch,
                 self.response_token_ids,
                 self.eos_token_ids,
-                self.ignore_index,
+                LABEL_IGNORE_INDEX,
                 self.train_on_last_assistant_only,
                 self.response_prompt_template,
                 tokenizer=self.tokenizer,
@@ -371,7 +339,7 @@ class DataCollatorForCompletionOnlyLMWithPacking(DataCollatorWithPacking):
                 batch["labels"][i] = self._mask_sequence(labels, input_ids=input_ids)
                 continue
 
-            new_labels = torch.full_like(labels, self.ignore_index)
+            new_labels = torch.full_like(labels, LABEL_IGNORE_INDEX)
             offset = 0
             for seq_len in example["seq_lengths"]:
                 seq_labels = labels[offset : offset + seq_len]
@@ -383,16 +351,15 @@ class DataCollatorForCompletionOnlyLMWithPacking(DataCollatorWithPacking):
 
         return batch
 
-    def _mask_sequence(self, labels: torch.Tensor, input_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """Completion-only mask a single sequence. When input_ids is given, detect template/EOS in
-        it (unaffected by the position_ids==0 boundary masking on labels); the mask applies to labels.
+    def _mask_sequence(self, labels: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """Completion-only mask a single sequence: template/EOS are detected in ``input_ids``
+        (unaffected by the position_ids==0 boundary masking on labels); the mask applies to labels.
 
         Uses :data:`~src.data.spans.PACKED_SPAN_POLICY`, the same policy the offline bake takes for
         a packed artifact, so a terminator-less final turn trains the same tokens either way.
         """
-        detect = input_ids if input_ids is not None else labels
         spans = resolve_spans_or_warn(
-            detect.tolist(),
+            input_ids.tolist(),
             self.response_token_ids,
             self.eos_token_ids,
             train_on_last_assistant_only=self.train_on_last_assistant_only,
@@ -402,15 +369,15 @@ class DataCollatorForCompletionOnlyLMWithPacking(DataCollatorWithPacking):
             row_label="packed document",
         )
         if spans is None:
-            return torch.full_like(labels, self.ignore_index)
+            return torch.full_like(labels, LABEL_IGNORE_INDEX)
         response_starts, eos_ends = spans
 
-        new_labels = torch.full_like(labels, self.ignore_index)
+        new_labels = torch.full_like(labels, LABEL_IGNORE_INDEX)
         for start, end in zip(response_starts, eos_ends, strict=False):
             # Copy from `labels`, not input_ids: a template starting at a doc boundary must keep its mask.
             new_labels[start : end + 1] = labels[start : end + 1]
             # Rescue the turn-ending EOS dropped by the copy when pad_token_id == eos_token_id.
-            if input_ids is not None and start <= end < len(input_ids):
+            if start <= end < len(input_ids):
                 new_labels[end] = input_ids[end]
 
         return new_labels
@@ -419,8 +386,8 @@ class DataCollatorForCompletionOnlyLMWithPacking(DataCollatorWithPacking):
 @dataclass
 class DataCollatorWithFlattening(DefaultDataCollator):
     """Padding-free Flash Attention collator (no completion masking): flattens the
-    mini-batch into a single [1, total_tokens] sequence. Requires the model to use
-    `attn_implementation="flash_attention_2"`.
+    mini-batch into a single [1, total_tokens] sequence. Requires a varlen flash implementation
+    (:data:`~src.models.patches.attention.VARLEN_ATTN_IMPLEMENTATIONS`).
     """
 
     tokenizer: PreTrainedTokenizerBase = None
@@ -479,7 +446,6 @@ class DataCollatorWithFlatteningAndCompletionMask(DataCollatorWithFlattening):
     """
 
     response_prompt_template: str | list[int] = None
-    ignore_index: int = LABEL_IGNORE_INDEX
     train_on_last_assistant_only: bool = False
     eos_token_ids: frozenset[int] | None = None
 
@@ -506,7 +472,7 @@ class DataCollatorWithFlatteningAndCompletionMask(DataCollatorWithFlattening):
         spans = resolve_spans_or_warn(
             input_ids,
             self.response_token_ids,
-            self.eos_token_ids or frozenset(),
+            self.eos_token_ids,
             train_on_last_assistant_only=self.train_on_last_assistant_only,
             span_policy=PACKED_SPAN_POLICY,
             response_prompt_template=self.response_prompt_template,
@@ -514,10 +480,10 @@ class DataCollatorWithFlatteningAndCompletionMask(DataCollatorWithFlattening):
             row_label="flattened sample",
         )
         if spans is None:
-            return [self.ignore_index] * len(labels)
+            return [LABEL_IGNORE_INDEX] * len(labels)
         response_starts, eos_ends = spans
 
-        new_labels = [self.ignore_index] * len(labels)
+        new_labels = [LABEL_IGNORE_INDEX] * len(labels)
         for start, end in zip(response_starts, eos_ends, strict=False):
             for i in range(start, min(end + 1, len(labels))):
                 new_labels[i] = labels[i]

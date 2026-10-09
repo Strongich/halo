@@ -57,8 +57,8 @@ router's weight without calling the router, and FSDP2's root post-backward callb
 gradient. A module that itself owns trainable parameters of two dtypes cannot be split, and the wrap
 raises. A layer whose trainable parameters share one dtype gets no extra group.
 
-On gpt-oss-20b at `ep_size: 1` (2× B300, seq 4096, batch 1; 34c102bba) the fp32 router runs 10,647 tok/s/GPU
-against 10,883 with a bf16 router, at the same 104 GiB peak. In that run set, the fp32 router over replicated
+On gpt-oss-20b at `ep_size: 1` (2× B300, seq 4096, batch 1) the fp32 router runs 10,647 tok/s/GPU against
+10,883 with a bf16 router, at the same 104 GiB peak. In that run set, the fp32 router over replicated
 experts (`fsdp_shard_ep1_experts: false`, which keeps the router out of FSDP2) ran 8,770–9,060 at 153 GiB.
 
 FSDP2 shards params, gradients, and optimizer states across the DP ranks, so per-rank optimizer-state
@@ -111,7 +111,7 @@ EP issues no collectives, so the re-gather races nothing).
 `ParallelismConfig` rejects it whenever `is_ep_mode` (`ep_group_size>1`), because the re-gather can
 race the DeepEP combine (real EP) or the Expert-TP reduce (pure ETP). **TP with
 `data_parallel_size>1` is also rejected** (a plain all-gather on TP-sharded DTensor params has no
-registered sharding strategy), and so is PP (the schedule pins each stage unsharded). Lower peak
+registered sharding strategy). Lower peak
 memory there with [HSDP](#hsdp-hybrid-sharded-data-parallel) or activation checkpointing instead.
 
 `fsdp_reshard_after_backward: false` additionally keeps parameters **unsharded across a
@@ -141,7 +141,7 @@ clipped) while `unshard()` no-ops on it, hiding the optimizer's update from the 
 The cost is one unsharded param copy per GPU (at the FSDP param dtype), held between a window's
 microsteps and freed at its last backward; under ZeRO-2 each forward/backward already holds it, so
 peak memory is unchanged. Plain-DP/CP/EP torchrun path only; rejected with
-`fsdp_reshard_after_forward: true` (contradicts FULL_SHARD's purpose), TP, or PP.
+`fsdp_reshard_after_forward: true` (contradicts FULL_SHARD's purpose) or TP.
 
 ### Deferred gradient reduce (`fsdp_defer_grad_sync`)
 
@@ -157,8 +157,8 @@ stays within about 4e-4 of the default and the final weights within about 2% of 
 under the 1.2e-3 loss spread between DP and HSDP (both correct) on the same data.
 
 Measured with packed `sft.py` (4k tokens, batch 2, gradient checkpointing, B300; tok/s/GPU, peak allocated
-in GiB). The two GA 4 rows on one 8-GPU node are single runs at commit 0bc3a22a5, whose tok/s the trainer
-logs to four significant figures; the other rows are from 34c102bba, the mean of 3 runs unless noted:
+in GiB). The two GA 4 rows on one 8-GPU node are single runs from a separate run set, whose tok/s the trainer logs to
+four significant figures; the other rows are the mean of 3 runs unless noted:
 
 | Run | GA | default | `fsdp_defer_grad_sync` | + `fsdp_reshard_after_backward: false` | peak allocated |
 |---|---|---|---|---|---|
@@ -187,8 +187,8 @@ width, slow inter-node fabric, small microbatches) and the memory is there.
 
 The in-backward EP expert and router hooks gate on the same `sync_gradients`, and the deferred EP
 sweep, the TP replicated-gradient sweep and the gradient clip run after the window's last backward,
-so all of them read the same reduced gradients as with the flag off. Rejected under PP (the schedule
-already reduces once per step), TP at `data_parallel_size==1` (no FSDP2 wrap to defer), QLoRA (no
+so all of them read the same reduced gradients as with the flag off. Rejected under TP at
+`data_parallel_size==1` (no FSDP2 wrap to defer), QLoRA (no
 wrap; its sweep already runs once per step) and `fsdp_reshard_after_forward: true` (the held unsharded
 gradient is the state ZeRO-3 exists to shard; defer under ZeRO-2 instead). Under `accelerate launch`
 it is warned and ignored: accelerate's `no_sync` already skips the reduce on non-final microsteps.
@@ -206,8 +206,7 @@ Set it `false` to keep a full replicated copy on every DP rank (EP modules becom
 MoE at `true`, the second is skipped with a warning). No effect when `ep_group_size>1`.
 
 `false` raises at config time under TP or CP, whose setup paths FSDP-shard ep1 experts
-unconditionally, and under PP, where a MoE stage and a dense stage would run different clip
-collectives. The flag is honored only on the pure-DP path.
+unconditionally. The flag is honored only on the pure-DP path.
 
 The two flags compose into the EP1 sharding matrix (MoE, `ep_group_size==1`):
 
@@ -245,14 +244,11 @@ the 2D `(dp_replicate, dp_shard)` mesh built by `create_dp_mesh` (`src/distribut
 grad-norm sums shard norms over the `dp_shard` sub-group only.
 
 - **Scope:** pure DP and CP only; every other mode rejects `use_hsdp` at config time
-  (`ParallelismConfig._validate_hsdp`, `_validate_pipeline_parallel`).
+  (`ParallelismConfig._validate_hsdp`).
 
     TP / EP+TP / Expert-TP build their own `(dp, tp)` mesh the 2D HSDP mesh is not wired into.
     Multi-group EP already shards over the EP group, and a single global EP group must keep 1D FSDP
     so its backward collectives share the DeepEP combine's membership.
-
-    Under PP the 2D mesh is built by `init_device_mesh` over the whole world and cannot be restricted
-    to a stage's rank block, so every rank would silently get the first stage's ranks.
 
 - **Trade-off:** one param replica per domain, so it costs memory vs 1D full-shard. Use it when
   inter-node DP bandwidth, not per-GPU memory, is the bottleneck.
@@ -296,8 +292,7 @@ FSDP2 with [`--use_hsdp`](#hsdp-hybrid-sharded-data-parallel).
 
 ## Data parallel size
 
-`(world_size / pp_size) / max(tp_size, cp_size, expert_tp_size)`; EP is orthogonal and does not
-reduce it, and a whole pipeline chain consumes one batch. The
+`world_size / max(tp_size, cp_size, expert_tp_size)`; EP is orthogonal and does not reduce it. The
 per-mode breakdown lives in [Distributed Data Loading](data-loading.md#data-parallel-size); the
 support matrix in [Supported combinations](README.md#supported-combinations).
 
@@ -348,7 +343,8 @@ MoE.
 | `use_hsdp` on a single NVLink domain | warned — no-op; the replica axis engages once the job spans domains | `_validate_hsdp` |
 | QLoRA / `load_in_4bit` | supported on a **dense** model. On a MoE the grouped-GEMM loader takes over and rejects a quantized base (`use_grouped_gemm` is on by default) — set `use_grouped_gemm: false`, under either launcher. QLoRA skips FSDP2, so `use_hsdp`, `fsdp_reshard_after_forward`, `fsdp_reshard_after_backward` and `fsdp_defer_grad_sync` raise under it | `model_loading.py`, `mixins/base.py` |
 | `use_peft` / LoRA, `packing`, `padding_free`, `torch_compile`, `gradient_checkpointing` | supported and ungated — plain DP is the mode with the widest knob surface | — |
-| `lowp_precision != "bf16"`, `init_from_scratch` | SFT only. `init_from_scratch` also refuses QLoRA and every EP/CP/TP/ETP/PP mode, so plain DP is the one mode it runs in | `parallelism_config_from_args`, `model_loading.py` |
+| `lowp_precision != "bf16"` | SFT only | `parallelism_config_from_args` |
+| `init_from_scratch` | SFT only; refuses QLoRA and every EP/CP/TP/ETP mode, so plain DP is the one mode it runs in | `parallelism_config_from_args`, `model_loading.py` |
 
 ## Common issues
 

@@ -12,6 +12,7 @@ The environments run against a stub sandbox that echoes a canned result (no subp
 Run: python tests/cpu/environments/test_code_contests_protocols.py  (or pytest)
 """
 
+import json
 import sys
 from types import SimpleNamespace
 
@@ -35,12 +36,22 @@ from src.environments.envs.tasks.coding.code_contests import (
     DEFAULT_EVAL_PROTOCOL,
     EVAL_PROTOCOL_KNOB_DEFAULTS,
     EVAL_PROTOCOLS,
+    SCRATCHPAD_BUDGET_SPENT_REPLY,
+    SUBMISSION_BUDGET_SPENT_REPLY,
     CodeContestsEnvironment,
 )
 from src.environments.envs.tasks.coding.datasets import ContestSelection
 from src.environments.envs.tasks.coding.grading import VERDICT_DETAIL_FULL
+from src.environments.episode import recovering_turn
 from src.environments.registry import resolve_environment
-from tests.common.code_contests import SINGLE_TEST_ANSWER, StubSandbox, call_tool, reset_episode
+from tests.common.code_contests import (
+    SINGLE_TEST_ANSWER,
+    StubSandbox,
+    call_tool,
+    counts_beside_budget_words,
+    reset_episode,
+    retired_budget_phrases,
+)
 
 # The shipped recipes' ladder: effort buys submissions and scratchpad runs as well as thinking.
 _RECIPE_PROFILES = {
@@ -65,9 +76,12 @@ def test_leaderboard_pins_one_submission_and_no_scratchpad():
     assert env.grading_spec.verdict_detail == VERDICT_DETAIL_FULL, (
         "the verdict detail is the config's, not the protocol's"
     )
+    # The pins bind through the caps alone: the descriptions say nothing of a disabled scratchpad or an
+    # only submission, and carry no count.
     schemas = {tool["function"]["name"]: tool["function"]["description"] for tool in env.get_tools_schema()}
-    assert "This tool is disabled for this task." in schemas["python_repl"]
-    assert "This is your only graded submission" in schemas["submit_solution"]
+    for description in (schemas["python_repl"], schemas["submit_solution"]):
+        assert not retired_budget_phrases(description), description
+        assert not counts_beside_budget_words(description), description
 
 
 def test_the_harness_is_the_default_and_pins_nothing():
@@ -102,7 +116,7 @@ def test_every_protocol_pins_only_knobs_the_environment_resolves():
 def test_the_leaderboard_pins_hold_at_every_effort_level():
     """A training config's ladder binds three submissions at ``high``; under the leaderboard the
     episode still gets one and no scratchpad, the level keeps its thinking budget, and the task
-    message states the budgets where the trained ladder put them."""
+    message states no budget under either."""
     harness = _env(reasoning_effort_profiles=_RECIPE_PROFILES)
     traj = reset_episode(harness, {"reasoning_effort": "high", **SINGLE_TEST_ANSWER})
     assert traj.info[EPISODE_TOOL_BUDGETS_KEY] == {"python_repl": 6, "submit_solution": 3}
@@ -113,7 +127,7 @@ def test_the_leaderboard_pins_hold_at_every_effort_level():
         assert traj.info[EPISODE_TOOL_BUDGETS_KEY] == {"python_repl": 0, "submit_solution": 1}, level
         assert leaderboard.thinking_budget_for_effort(level) == _RECIPE_PROFILES[level]["thinking_tokens"]
         user = next(m for m in reversed(traj.messages) if m.role == "user")
-        assert "Budgets for this task: 1 graded submission, 0 scratchpad runs." in user.content, level
+        assert not retired_budget_phrases(user.content), (level, user.content)
 
 
 def test_a_pinned_profile_key_is_still_validated():
@@ -126,14 +140,46 @@ def test_a_leaderboard_episode_grades_one_program_and_refuses_the_scratchpad():
     env = _env(eval_protocol="leaderboard", reasoning_effort_profiles=_RECIPE_PROFILES)
     traj = reset_episode(env, {"reasoning_effort": "high", **SINGLE_TEST_ANSWER})
 
-    assert "Test limit reached (0)" in call_tool(env, traj, "python_repl")
+    assert call_tool(env, traj, "python_repl") == f"Error: {SCRATCHPAD_BUDGET_SPENT_REPLY}"
     call_tool(env, traj, "submit_solution")
-    assert "Submission limit reached (1)" in call_tool(env, traj, "submit_solution")
+    assert call_tool(env, traj, "submit_solution") == f"Error: {SUBMISSION_BUDGET_SPENT_REPLY}"
 
     assert traj.info[TOOL_CALL_COUNTS_KEY].get("python_repl", 0) == 0
     assert traj.info[TOOL_CALL_COUNTS_KEY]["submit_solution"] == 1
     assert (traj.info["tests_passed"], traj.info["tests_total"]) == (1, 1)
     assert traj.info["tested_before_submission"] is False
+
+
+def _scratchpad_turn(env, ids):
+    """One turn of a single scratchpad call through the protocol's step."""
+    call = {
+        "id": "c",
+        "function": {"name": "python_repl", "arguments": json.dumps({"code": "print(1)", "stdin": "1"})},
+    }
+    return env.step(ids, [""], [{"finish_reason": "stop", "tool_calls": [call]}])[0]
+
+
+def test_a_leaderboard_scratchpad_call_flags_no_turn_while_a_spent_budget_still_does():
+    """The leaderboard closes the scratchpad: a call to it gets the spent-budget reply and price, but it refuses
+    nothing the protocol offered, so its turn is not flagged and the next one gets no recovery reserve, which would
+    buy the leaderboard more output per sample than the setting it reproduces. A harness budget the episode spent
+    still flags a turn of nothing else."""
+    leaderboard = _env(eval_protocol="leaderboard", tool_error_penalty=0.05)
+    ids, _ = leaderboard.reset(["solve it"], [SINGLE_TEST_ANSWER])
+    step = _scratchpad_turn(leaderboard, ids)
+    traj = step.trajectory
+    assert traj.messages[-1].content == f"Error: {SCRATCHPAD_BUDGET_SPENT_REPLY}"
+    assert step.reward == pytest.approx(-0.05)
+    assert not traj.messages[-2].calls_rejected and not recovering_turn(traj)
+
+    harness = _env(max_test_calls=1, tool_error_penalty=0.05)
+    ids, _ = harness.reset(["solve it"], [SINGLE_TEST_ANSWER])
+    assert not _scratchpad_turn(harness, ids).trajectory.messages[-2].calls_rejected
+    step = _scratchpad_turn(harness, ids)
+    traj = step.trajectory
+    assert traj.messages[-1].content == f"Error: {SCRATCHPAD_BUDGET_SPENT_REPLY}"
+    assert step.reward == pytest.approx(-0.05)
+    assert traj.messages[-2].calls_rejected and recovering_turn(traj)
 
 
 def test_the_registry_presets_take_the_protocol():
@@ -266,7 +312,7 @@ async def test_a_no_level_episode_sends_no_level_and_records_none(monkeypatch):
     )
     calls = []
 
-    async def fake_generate(**kwargs):
+    async def fake_generate(model, messages, **kwargs):
         calls.append(kwargs)
         return SimpleNamespace(
             answer="done", finish_reason="stop", completion_tokens=3, tool_calls=None, reasoning=None, token_ids=None
@@ -276,7 +322,8 @@ async def test_a_no_level_episode_sends_no_level_and_records_none(monkeypatch):
     traj = await eval_runner.run_episode(env, "solve it", dict(SINGLE_TEST_ANSWER), None, rollout=rollout)
 
     assert env.reasoning_effort is None
-    assert calls and all(call["extra_body"] == {} for call in calls)
+    filters = {"top_k": rollout.top_k, "min_p": rollout.min_p, "repetition_penalty": rollout.repetition_penalty}
+    assert calls and all(call["extra_body"] == filters for call in calls)
     assert calls[0]["max_tokens"] == 32768
     assert eval_runner.serialize_trajectory(traj)["reasoning_effort"] is None
     meta = contest_meta(args.adapter, ContestSelection(), env, env_config["reasoning_effort"], env_config)

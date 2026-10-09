@@ -6,17 +6,17 @@ Around that sit Manifold-Constrained Hyper-Connections (`hc_mult` parallel resid
 
 | | EP | CP | TP | ETP | EP+TP | EP+CP |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
-| DeepSeek-V4 | Yes | No | No | Yes (untested) | No | No |
+| DeepSeek-V4 | Yes | No | No | Yes | No | No |
 
 - **CP** — the CSA/HCA compressors pool non-overlapping token windows along the sequence axis; a CP shard would compress incomplete windows at every chunk boundary. Rejected by class name in `src/distributed/context_parallel/validation.py`.
 - **TP** — `DeepseekV4Attention` (shared-KV MQA broadcast to all heads + the compressor branch) is not shardable; `apply_tp_to_attention_only` raises when a model ends up with zero shardable attention layers under `tp_size > 1`.
-- **ETP** — the experts use the shared fused-GLU storage, so `expert_tp_size > 1` mechanically works through `_init_fused_glu_params`; unvalidated on V4.
+- **ETP** — the experts use the shared fused-GLU storage, split through `_init_fused_glu_params`. Pure ETP and EP+ETP train, save and resume on the tiny model (the precompute-resume suites, `--mode etp2` / `ep2etp2`); the full V4-Flash checkpoint is not run under ETP.
 - **PP** — [not yet available in this release](../parallelism/pipeline-parallelism.md).
-- **RL weight sync** — online and async GRPO reject DeepSeek-V4 at trainer construction (`validate_weight_sync_support`, off each client's `UNSERVABLE_MODEL_TYPES`). The sync feeds trainer parameter names straight into the engine's `model.load_weights`, and neither pinned engine has a loader they land in ([Rollout Servers](../infrastructure/rollout-servers.md#which-families-each-engine-serves)).
+- **RL weight sync** — online and async GRPO reject DeepSeek-V4 at trainer construction (`validate_weight_sync_support`, off each client's `UNSERVABLE_MODEL_TYPES`). The sync feeds the engine's `model.load_weights` directly, and neither pinned engine has a loader that takes it ([Rollout Servers](../infrastructure/rollout-servers.md#which-families-each-engine-serves)).
 
-    vLLM 0.26.0 serves V4 from an out-of-tree package whose loader targets DeepSeek's original release checkpoint, not the HuggingFace module tree the toolkit trains: per-expert vs fused experts, fused vs separate attention projections, bare `embed.weight` vs `model.embed_tokens.weight`. Those weights are also fp8/fp4-packed and the o-projection reads a `weight_scale_inv` unconditionally, so the BF16 checkpoint is not servable there either.
+    vLLM 0.26.0 serves V4 from an out-of-tree package whose loader targets DeepSeek's original fp8/fp4-packed release: its o-projection reads a `weight_scale_inv` unconditionally, so a BF16 checkpoint is not servable there, whatever its names. A gathered save writes the names transformers' own `save_pretrained` reverts to (`model.layers.N.attn.*`, `model.layers.N.ffn.*`, `head.weight`), with the experts as the fused pair.
 
-    SGLang 0.5.17 maps per-expert `w1/w3/w2` names where the gather emits the fused pair, and no end-to-end sync has been validated for the family. No key mapping fixes this from the gather side.
+    SGLang 0.5.17 maps per-expert `w1/w3/w2` names where the gather emits the fused pair, and no end-to-end sync has been validated for the family. No key mapping fixes this from the gather side. A saved checkpoint reaches that layout through `unfuse_moe_experts.py`; serving one on SGLang is unverified.
 
 ## Attention: eager-only
 
@@ -24,10 +24,7 @@ Every non-eager backend is off (`_supports_flash_attn/_supports_sdpa/_supports_f
 
 Consequences:
 
-- **No varlen path** — `padding_free` is rejected by the collator factory, which gates on the resolved `_attn_implementation` (only `flash_attention_2/_3/_4` qualify) and so catches DeepSeek-V4's eager attention. `packing` still runs, but materializes a dense mask over the flattened batch (side up to `per_device_train_batch_size * max_length`) instead of consuming `cu_seqlens`.
-- **Packed documents are isolated in the masked-attention layers only.** The mask is synthesized from the per-document `position_ids` whenever no cache is live, which training always is (`use_cache=False`).
-
-    The CSA and HCA compressor layers pool KV across the whole row and so cross document boundaries by construction. That is an accepted mixer-class cost, the same one the linear-attention families carry ([Document isolation](../data/collators.md#document-isolation-under-packing)).
+- **One document per row.** `packing` and `padding_free` are refused on every backend (`reject_compressed_kv_rows` in `src/models/segment_markers.py`, keyed on the compressed `layer_types`, so the legacy `compress_ratios` spelling the config folds into them is covered). The SFT script refuses them off its first config read, before the model load, `prepare_dataset.py` refuses `--pack-sequences` before fetching the input, and the collator factory refuses them again. A packing or padding-free collator handed straight to the SFT trainer, and SMPO's own `padding_free` forward, are refused at trainer construction. The CSA and HCA compressors cut their KV windows at fixed indices of the row and judge each window's causality by position. A multi-document row restarts its positions at every document while the windows stay put, so every document after the first attends the compressed KV of the row's first tokens instead of its own: wrong context, not a soft boundary leak. The masked-attention layers alone would isolate (the mask is synthesized from the per-document `position_ids` whenever no cache is live, and training runs `use_cache=False`), but no position or segment marker reaches the compressor windows ([Document isolation](../data/collators.md#document-isolation-under-packing)).
 
 - The per-rope-type rotary buffers (`{main,compress}_inv_freq`, on the model-level rotary and inside every compressor/indexer) are recomputed in fp32 by the rotary fixer chain `finalize_loaded_model` walks on every load path.
 

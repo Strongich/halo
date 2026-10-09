@@ -86,7 +86,7 @@ TINY_DSV4_CONFIG = {
     "partial_rotary_factor": 0.25,
 }
 
-# Tiny gpt-oss MoE for PP+EP tests (GptOssForCausalLM): hidden 256 keeps the DeepEP transport pad
+# Tiny gpt-oss MoE (GptOssForCausalLM): hidden 256 keeps the DeepEP transport pad
 # (multiple of 256) exact; 8 layers with the family's period-2 layer_types (sliding/full alternation)
 # make the pp2 stage offset (4) a whole number of periods; 8 experts top-2 split evenly at ep2/ep4.
 # router_aux_loss_coef=0 because a PP stage severs the HF aux-loss path (the PP split gate rejects a
@@ -108,10 +108,10 @@ TINY_GPTOSS_CONFIG = {
     "attn_implementation": "eager",
 }
 
-# Tiny Qwen3-MoE for the PP+EP load-equivalence matrix: transformers saves its experts as one module
-# per expert (``experts.{i}.gate_proj.weight``), so a checkpoint written from it is the individual
-# format the lazy loader routes through ExpertFuser, which GptOss's fused layout never reaches.
-# 8 layers so a pp2 split is non-trivial on either side.
+# Tiny Qwen3-MoE: transformers saves its experts as one module per expert
+# (``experts.{i}.gate_proj.weight``), so a checkpoint written from it is the individual format the
+# lazy loader routes through ExpertFuser, which GptOss's fused layout never reaches. 8 layers so a
+# pp2 split is non-trivial.
 TINY_QWEN3_MOE_CONFIG = {
     "vocab_size": 1024,
     "hidden_size": 256,
@@ -337,7 +337,7 @@ TINY_BAILING_MOE_CONFIG = {
     "tie_word_embeddings": False,
 }
 
-# Tiny dense Qwen3.5 (text) for pipeline-parallelism tests: 8 layers keep the family's period-4
+# Tiny dense Qwen3.5 (text), the dense roster's ``qwen3_5`` model: 8 layers keep the family's period-4
 # L,L,L,F layer_types pattern intact across a pp2 split (offset 4 = one whole period), so both
 # GatedDeltaNet linear-attention layers and full-attention layers sit on every stage.
 TINY_QWEN35_CONFIG = {
@@ -357,9 +357,9 @@ TINY_QWEN35_CONFIG = {
     "tie_word_embeddings": False,
 }
 
-# Tiny dense Qwen3 for pipeline-parallelism tests: 8 layers so a 2- or 4-stage split is exact and
-# every stage still holds several layers. tie_word_embeddings is off so the embedding/head tie is
-# exercised by its own dedicated test rather than confounding the base equivalence gate.
+# Tiny dense Qwen3, the dense roster's ``qwen3`` model: 8 layers so a 2- or 4-stage split is exact and
+# every stage still holds several layers. tie_word_embeddings is off; a test of the embedding/head tie
+# turns it on itself.
 TINY_QWEN3_CONFIG = {
     "vocab_size": 1024,
     "hidden_size": 128,
@@ -370,6 +370,26 @@ TINY_QWEN3_CONFIG = {
     "head_dim": 32,
     "max_position_embeddings": 512,
     "tie_word_embeddings": False,
+}
+
+# The tied two-layer Qwen3 the optimizer-resume suite trains, dense or (with the expert fields below)
+# as Qwen3-MoE; the tokenizer it is saved with sets vocab_size.
+TINY_TIED_QWEN3_CONFIG = {
+    "hidden_size": 256,
+    "intermediate_size": 512,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "max_position_embeddings": 4096,
+    "tie_word_embeddings": True,
+}
+TINY_TIED_QWEN3_MOE_FIELDS = {
+    "moe_intermediate_size": 128,
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": [],
 }
 
 # Tiny dense Granite for the head-transform contract: the forward divides the logits by
@@ -604,6 +624,60 @@ TINY_MISTRAL4_CONFIG = {
     "norm_topk_prob": True,
     "routed_scaling_factor": 1.0,
     "tie_word_embeddings": False,
+}
+
+# Tiny vision towers for the multimodal wrappers an EP family's text tower ships under: SigLIP for
+# Command A+ (``cohere2_vision``), SigLIP-2 for LFM2-VL, Pixtral for Mistral 3, plus the Gemma 4,
+# Qwen3.5/3.6 and Inkling towers. One layer each — the towers carry the checkpoint namespace under
+# test, not compute; an output width is the text tower's hidden size where the config asks for one.
+TINY_SIGLIP_VISION_CONFIG = {
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "image_size": 28,
+    "patch_size": 14,
+}
+TINY_SIGLIP2_VISION_CONFIG = {
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "num_patches": 16,
+    "patch_size": 14,
+}
+TINY_PIXTRAL_VISION_CONFIG = {
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "head_dim": 16,
+    "image_size": 28,
+    "patch_size": 14,
+}
+TINY_GEMMA4_VISION_CONFIG = {
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 1,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+}
+TINY_QWEN35_VISION_CONFIG = {
+    "depth": 1,
+    "hidden_size": 16,
+    "intermediate_size": 16,
+    "num_heads": 2,
+    "out_hidden_size": TINY_QWEN35_MOE_CONFIG["hidden_size"],
+}
+# The upstream scale planner (``plan_out_scales``) rejects most tiny shapes; this one builds a valid
+# 4-layer pixel-shuffle stack.
+TINY_INKLING_VISION_CONFIG = {
+    "temporal_patch_size": 2,
+    "patch_size": 4,
+    "n_layers": 4,
+    "hidden_size": 32,
+    "text_hidden_size": TINY_INKLING_CONFIG["hidden_size"],
 }
 
 # Special Models

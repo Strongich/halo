@@ -8,9 +8,11 @@ teacher-distill, self-distill), so each test file builds its own dataset and tra
 holds the model/adapter build and the adapter-invariant assertions shared across them.
 
 Modes:
-    lora        — attention PEFT LoRA (q_proj/v_proj). Dense under FSDP, MoE attention under EP.
+    lora        — attention PEFT LoRA on the checkpoint's attention projections
+                  (:func:`attention_target_modules`). Dense under FSDP, MoE attention under EP.
     qlora       — LoRA on a 4-bit bitsandbytes base (dense, FSDP/DDP only; QLoRA+EP/TP is rejected).
     expert_lora — native grouped LoRA on the MoE expert FFNs (gate/up/down), built inside EP layers.
+    mixed       — ``lora`` and ``expert_lora`` together, from one target list.
 """
 
 from __future__ import annotations
@@ -34,7 +36,14 @@ from torch.distributed.tensor import DTensor
 from transformers import AutoModelForCausalLM
 from trl import ModelConfig, get_quantization_config
 
-from src.checkpoint.format import SAFETENSORS_INDEX_FILE, cast_to_save_dtype, read_checkpoint_index
+from src.checkpoint.format import (
+    ADAPTER_CONFIG_FILE,
+    ADAPTER_SAFETENSORS_FILE,
+    SAFETENSORS_INDEX_FILE,
+    cast_to_save_dtype,
+    has_adapter_weight_file,
+    read_checkpoint_index,
+)
 from src.distributed.checkpoint.peft import PeftAdapterSaver
 from src.distributed.expert_parallel.expert_weights import gather_ep_lora_adapters, has_ep_lora
 from src.distributed.loading.model_loading import load_distributed_model
@@ -244,9 +253,8 @@ def load_peft_model(
 
     ``expert_lora`` and any EP mode use the MoE model; ``lora``/``qlora`` without EP use the dense
     model. ``peft_config`` is the attention PEFT config (or None for expert-LoRA-only); the caller
-    wires it into the trainer (``peft_config=`` kwarg, or ``get_peft_model`` for the plain-Trainer
-    distillation trainer). QLoRA quantization is derived from ``model_config`` exactly as the scripts
-    do.
+    hands it to the trainer's ``peft_config=`` kwarg. QLoRA quantization is derived from
+    ``model_config`` exactly as the scripts do.
 
     ``model_name``/``revision`` override the mode's default model, so one test file can sweep the
     other MoE families (each with its own expert storage layout and export renames) rather than being
@@ -363,9 +371,9 @@ def assert_adapter_checkpoint(trainer, output_dir: str, rank: int, *, expert_lor
     if rank != 0:
         return True, "non-zero rank (save participated)"
 
-    path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    path = os.path.join(adapter_dir, ADAPTER_SAFETENSORS_FILE)
     if not os.path.exists(path):
-        return False, f"adapter_model.safetensors not written to {adapter_dir}"
+        return False, f"{ADAPTER_SAFETENSORS_FILE} not written to {adapter_dir}"
     saved = load_file(path)
     lora_keys = [k for k in saved if "lora_" in k]
     if not lora_keys:
@@ -416,11 +424,11 @@ def adapter_save_checks(save_dir: str, rank: int) -> dict[str, bool]:
     contents = os.listdir(save_dir)
     log(f"  Save contents: {sorted(contents)}")
 
-    has_adapter_config = "adapter_config.json" in contents
+    has_adapter_config = ADAPTER_CONFIG_FILE in contents
     checks["has_adapter_config"] = has_adapter_config
-    log(f"  Has adapter_config.json: {'PASS' if has_adapter_config else 'FAIL'}")
+    log(f"  Has {ADAPTER_CONFIG_FILE}: {'PASS' if has_adapter_config else 'FAIL'}")
 
-    has_adapter_weights = any("adapter" in f and (f.endswith(".safetensors") or f.endswith(".bin")) for f in contents)
+    has_adapter_weights = has_adapter_weight_file(save_dir)
     checks["has_adapter_weights"] = has_adapter_weights
     log(f"  Has adapter weights: {'PASS' if has_adapter_weights else 'FAIL'}")
 

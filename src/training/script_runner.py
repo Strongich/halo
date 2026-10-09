@@ -38,12 +38,13 @@ from src.distributed.runtime import (
 )
 from src.distributed.tensor_parallel.state_dict import input_embeddings_tp_sharded
 from src.models.loading.tokenizer_setup import (
+    adopt_tokenizer_chat_template,
     get_model_context_window,
     is_bounded_length,
     resolve_length_to_context,
     setup_model_and_tokenizer,
 )
-from src.trainers.grpo.early_stop import GRPOEarlyStopCallback
+from src.training.early_stopping import StopsTrainingEarly
 from src.training.environment import (
     TrainingStoppedEarly,
     prepare_distributed_resume,
@@ -77,16 +78,15 @@ def init_training_script(
     *,
     script_prefix: str,
     trainer_cls,
-    sync_tokens: Sequence[str] = (),
     split_expert_lora: bool = True,
     **parallelism_kwargs,
 ) -> ScriptRuntime:
     """Run the common pre-model phase of a training entry script.
 
-    Token-field sync → ``init_distributed`` → ``PartialState`` → CUDA device pinning (a process
-    stays on that one GPU) → :func:`parallelism_config_from_args` (+ expert-LoRA split) →
-    ``setup_training_environment`` (run name ``{script_prefix}-{mode_suffix}``) → checkpoint-resume
-    resolution. Every entry script depends on that order.
+    ``init_distributed`` → ``PartialState`` → CUDA device pinning (a process stays on that one GPU) →
+    :func:`parallelism_config_from_args` (+ expert-LoRA split) → ``setup_training_environment`` (run
+    name ``{script_prefix}-{mode_suffix}``) → checkpoint-resume resolution. Every entry script depends
+    on that order.
 
     Args:
         args: parsed script-arguments dataclass.
@@ -97,16 +97,11 @@ def init_training_script(
         trainer_cls: the trainer class the script builds, forwarded to
             :func:`parallelism_config_from_args`, whose CP/PP gates it supplies: a mode the trainer
             refuses is rejected before the model — or a teacher/reference/vLLM probe — loads.
-        sync_tokens: token field names to mirror between ``args`` and ``training_config``
-            (configs that re-declare ``eos_token``/``pad_token`` under the resolve-conflict parser).
         split_expert_lora: peel MoE expert targets out of ``model_config.lora_target_modules`` into
             native EP grouped-LoRA (must run before the model load; no-op without expert targets).
         **parallelism_kwargs: extra :func:`parallelism_config_from_args` knobs
             (SFT passes ``allow_low_precision`` / ``supports_init_from_scratch``).
     """
-    for field_name in sync_tokens:
-        sync_token_field(args, training_config, field_name)
-
     # Every launcher that declares a world (torchrun/accelerate export RANK, a bare srun is caught by
     # its SLURM world size) gets the toolkit's watchdog timeout and eager device bind.
     init_distributed()
@@ -163,16 +158,6 @@ def pin_single_process_to_bound_gpu(training_config) -> None:
         f"takes one process per GPU: `halo launch <method> <config> -n <gpus>` (torchrun)."
     )
     training_config._n_gpu = 1
-
-
-def sync_token_field(args, training_config, field_name: str) -> None:
-    """Mirror a token field across ``args`` and ``training_config``; the config wins when both set."""
-    value = getattr(training_config, field_name, None)
-    if value is None:
-        value = getattr(args, field_name, None)
-    if value is not None:
-        setattr(args, field_name, value)
-        setattr(training_config, field_name, value)
 
 
 def _reject_images_under_text_only_model(args, datasets, *, text_only_model: bool) -> None:
@@ -246,7 +231,7 @@ def load_script_datasets(
     # Threaded for every script so a declared tools column is validated at load; a typo'd knob
     # otherwise renders the whole run without tools. The scripts that cannot render it (KTO,
     # environmental GRPO) reject the knob through reject_unsupported_args before their load.
-    loader_kwargs.setdefault("tools_field", getattr(args, "tools_field", None))
+    loader_kwargs.setdefault("tools_field", args.tools_field)
     ds = loader(
         args.dataset,
         args.test_size,
@@ -384,16 +369,18 @@ def apply_context_window(args, model: PreTrainedModel, tokenizer: PreTrainedToke
 
 
 def install_resolved_tokenizer(processing_class, tokenizer: PreTrainedTokenizer):
-    """Return the trainer's ``processing_class`` carrying the resolved tokenizer.
+    """Return the trainer's ``processing_class`` carrying the resolved tokenizer and its chat template.
 
     ``apply_max_length`` may hand back a different object than the one loaded (the
-    ``tokenizer_backend`` proxy), and a processor still holds the raw inner tokenizer. Read off the
-    loaded object rather than the checkpoint's modality: a multimodal checkpoint that ships no
-    processor loads a tokenizer for a run without image data.
+    ``tokenizer_backend`` proxy), and a processor still holds the raw inner tokenizer and its own
+    template (:func:`adopt_tokenizer_chat_template`). Read off the loaded object rather than the
+    checkpoint's modality: a multimodal checkpoint that ships no processor loads a tokenizer for a run
+    without image data.
     """
     if isinstance(processing_class, PreTrainedTokenizerBase):
         return tokenizer
     processing_class.tokenizer = tokenizer
+    adopt_tokenizer_chat_template(processing_class)
     return processing_class
 
 
@@ -450,10 +437,10 @@ def padded_workload_attn_implementation(
     """Attention implementation for padded (non-varlen) workloads: reward modeling, the GRPO family,
     and every other script that forwards right-padded batches.
 
-    Defaults to SDPA when the YAML pins none, because the auto-detected FA4 runs padded shapes
-    through its slow varlen path. ``sinks_reset=False`` (on-policy gpt-oss, pretrained sinks live)
-    drops the default: only a sink-carrying implementation is accepted there, so requesting SDPA
-    would reject the run. Pass the run's own ``reset_sinks`` rather than a hardcoded value.
+    Defaults to SDPA when the YAML pins none — the auto-detected FA4 runs padded shapes through its
+    slow varlen path. ``sinks_reset=False`` (on-policy gpt-oss, pretrained sinks live) drops the
+    default: only a sink-carrying impl is accepted there, so requesting SDPA would reject the run.
+    Pass the run's own ``reset_sinks`` — hardcoding it makes the exemption a claim about the model.
     ``context_parallel`` drops it too: Ulysses calls FlashAttention itself, so the loader's
     hardware-aware selection names the kernel CP runs.
     """
@@ -570,8 +557,13 @@ def load_script_model(
             consumed ``model_init_kwargs``.
         attn_implementation: the request when ``model_config.attn_implementation`` is unset — pass
             :func:`padded_workload_attn_implementation` for scripts that forward right-padded batches.
+
+    A policy built from the resume checkpoint keeps the run's base as its config's ``_name_or_path``,
+    the name TRL's model card reads for ``base_model``, so a resumed run's card names the model an
+    uninterrupted run's does instead of none (a local checkpoint path). Where the weights were read
+    stays on the loader's ``LOADED_WEIGHTS_FROM_ATTR`` stamp, which the resume and the export read.
     """
-    return load_model_consuming_init_kwargs(
+    model, tokenizer = load_model_consuming_init_kwargs(
         model_config,
         training_config,
         runtime.parallelism_config,
@@ -586,6 +578,9 @@ def load_script_model(
         train_sinks=dist_args.train_sinks,
         preserve_checkpoint_precision=runtime.policy_from_checkpoint,
     )
+    if runtime.policy_from_checkpoint:
+        model.config._name_or_path = model_config.model_name_or_path
+    return model, tokenizer
 
 
 def build_training_callbacks(
@@ -625,8 +620,7 @@ def run_trainer(
     """Run the common post-construction phase: integration-callback reordering, the canonical
     start log (mode + EP/CP/TP/ETP/DP sizes + ``extra_start_log`` lines), resume log, training,
     and EP cleanup. A run the GRPO early stop ended exits non-zero on every rank."""
-    # Integrations add themselves at the head of the list and would consume `logs` before the
-    # toolkit's own callbacks run their on_log.
+    # Integrations add themselves at the HEAD and would consume `logs` before our callbacks' on_log.
     reorder_integration_callbacks_last(trainer)
 
     parallelism_config = runtime.parallelism_config
@@ -654,7 +648,7 @@ def run_trainer(
     # An early stop fails the run, so a scheduler or a chained stage does not take its output for a finished
     # one. Its verdict is taken across ranks, so every rank exits.
     if any(
-        isinstance(callback, GRPOEarlyStopCallback) and callback.stopped
+        isinstance(callback, StopsTrainingEarly) and callback.stopped
         for callback in trainer.callback_handler.callbacks
     ):
         raise TrainingStoppedEarly(

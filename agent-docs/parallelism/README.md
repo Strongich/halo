@@ -22,7 +22,7 @@ Wrapped MoE families: [Qwen3 MoE](../models/qwen3.md#qwen3-moe), [Qwen3.5/3.6 Mo
 
 ## Supported combinations
 
-All modes use FSDP2 (`fully_shard`, per-layer). EP expert modules sit in `ignored_params` and sync via EP backward hooks, except at `ep_group_size == 1`, where `fsdp_shard_ep1_experts` (default on) has FSDP2 shard them; CP wraps the attention path for sequence splitting and lets FSDP2 sync the rest.
+All modes use FSDP2 (`fully_shard`, per-layer). EP expert modules sit in `ignored_params` and sync via EP backward hooks or the deferred post-backward sweep, except at `ep_group_size == 1`, where `fsdp_shard_ep1_experts` (default on) has FSDP2 shard them; CP wraps the attention path for sequence splitting and lets FSDP2 sync the rest.
 
 | Mode | Data Parallel Size | Notes |
 |------|-------------------|-------|
@@ -119,7 +119,7 @@ The default is 1D full-shard. Under `--use_hsdp` it is a 2D `(dp_replicate, dp_s
 shards within one NVLink domain (`dp_shard_size = nvlink_domain_size`) and replicates across domains
 (`dp_replicate_size = num_nvlink_domains`).
 
-HSDP composes only with pure DP and CP; TP, EP, ETP and PP each reject it for their own reason. On a
+HSDP composes only with pure DP and CP; TP, EP and ETP each reject it for their own reason. On a
 single domain it is a no-op ([HSDP](data-parallelism.md#hsdp-hybrid-sharded-data-parallel)).
 
 Node-local EP+CP reaches cross-domain depth without HSDP: EP dispatch/combine and CP Ulysses
@@ -140,15 +140,14 @@ traced to the code that raises. This table is the index into them, not a second 
 | Axis | Trainers | Models | Signature knob rejections |
 |---|---|---|---|
 | [EP](expert-parallelism.md#limitations) | all | the wrapped MoE families; a dense model raises | QLoRA, PEFT inside expert layers, `fsdp_reshard_after_forward`, `use_hsdp`, stock AdamW with `bf16_optimizer: false`, `accelerate launch` |
-| [ETP](expert-tensor-parallelism.md#limitations) | all (gated by `_supports_ep`) | every EP-capable MoE family | expert LoRA, `save_sharded_ep` — plus every EP rule |
+| [ETP](expert-tensor-parallelism.md#limitations) | all | every EP-capable MoE family | expert LoRA, `save_sharded_ep` — plus every EP rule |
 | [TP](tensor-parallelism.md#limitations) | all | the attention classes in `TP_SHARDABLE_ATTENTION_CLASSES`; zero sharded layers raises | LoRA/PEFT, QLoRA, `fsdp_reshard_after_forward` at DP > 1, `use_hsdp` |
 | [CP](context-parallelism.md#limitations) | SFT, SMPO, offline GRPO (full fine-tuning) | the Ulysses attention wrappers | packing, padding-free, left padding, non-Flash attention, `label_smoothing_factor`, `loss_type: dft`, eval metrics, multimodal; offline GRPO adapters |
 | [PP](pipeline-parallelism.md) | — (not yet available in this release; `pipeline_parallel_size > 1` is rejected at config time) | — | — |
 | [DP](data-parallelism.md#limitations) | all | all | MoE grouped GEMM under `accelerate launch`, multi-device `device_map` |
 
-Trainer support is declared per class (`_supports_ep` / `_supports_tp` / `_supports_cp` /
-`_supports_pp`) and enforced in `ParallelismValidationMixin`; there is no `_supports_etp`, since ETP
-folds into `ep_group_size`. Full matrix:
+EP, ETP and TP run under every trainer. CP and PP support is declared per class (`_supports_cp` /
+`_supports_pp`) and enforced in `ParallelismValidationMixin`. Full matrix:
 [Trainer Compatibility](../reference/trainer-architecture.md#trainer-compatibility). CP's `False`
 rows are per-trainer declarations — `logits_to_keep`, global log-probability sums, full-sequence
 pooling and dual models are the reasons behind them, not properties CP itself detects.
@@ -179,7 +178,7 @@ pooling and dual models are the reasons behind them, not properties CP itself de
 
 ⁶ LFM-2 — CP blocked by the sequence-axis short-conv layers in the hybrid stack (no Ulysses wrapper); see [lfm2.md](../models/lfm2.md).
 
-⁷ Laguna — `LagunaAttention` is in neither the Ulysses nor the TP registry, so CP and TP both raise; ETP is mechanically reachable, and its only GPU test is a tiny-model LoRA row (`test_lora_weight_sync_exact_families.py`, etp2). See [laguna.md](../models/laguna.md).
+⁷ Laguna — `LagunaAttention` is in neither the Ulysses nor the TP registry, so CP and TP both raise; pure ETP and EP+ETP train, save and resume on the tiny model (the precompute-resume suites). See [laguna.md](../models/laguna.md).
 
 ⁸ Inkling — CP blocked by the sequence-axis short convolutions, TP by the RoPE-free relative-logits attention. See [inkling.md](../models/inkling.md).
 

@@ -6,12 +6,12 @@ import contextlib
 import inspect
 import json
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from src.environments.base import Message
-from src.environments.sandbox.base import SandboxAgentFault, SandboxInfraError
+from src.environments.sandbox.base import SandboxFault
 
 # What reading model-authored arguments as JSON or a Python literal raises on malformed text, past a
 # syntax error: an unhashable dict key or set member (``{[1]: 2}``) is a TypeError, deep nesting a
@@ -29,15 +29,41 @@ class ToolBudgetExhausted(Exception):
     """
 
 
+class ToolDisabled(ToolBudgetExhausted):
+    """A call to a tool whose episode budget is zero: the run disabled it (the ``leaderboard`` evaluation
+    protocol's scratchpad, a ``tool_budgets`` cap of 0). Answered and booked like a spent budget, but no refusal
+    (:func:`refused_unrun`): the turn stands as one failed call and the next gets no recovery reserve, which would
+    buy a protocol that disables the tool more output per sample than the setting it reproduces."""
+
+
 class ToolArgumentError(TypeError):
     """A call whose model-authored arguments the tool refuses: a required parameter missing
     (``submit_solution`` with no ``code``), a name its schema does not declare, a value outside its enum,
-    or a name its handler has no keyword for.
+    a list or an object for a ``string`` parameter, or a name its handler has no keyword for.
 
     Raised before the handler runs, so the model reads ``Error: <tool>: missing a required argument:
-    'code'`` instead of a Python signature. Expected control flow like :class:`ToolBudgetExhausted`:
-    booked as a tool ERROR, logged without a traceback.
+    'code'`` instead of a Python signature, or by a handler refusing an admitted call
+    (:class:`ToolCallRefused`). Expected control flow like :class:`ToolBudgetExhausted`: booked as a
+    tool ERROR, logged without a traceback.
     """
+
+
+class ToolCallRefused(ToolArgumentError):
+    """A handler refusing an admitted call it will not run, the call returned to the episode's budget
+    (code contests: a program identical to one already graded)."""
+
+
+# What refuses a call unrun, expected control flow logged without a traceback: its arguments failing to bind or
+# its tool's episode budget spent, both at admission, or its handler (:class:`ToolCallRefused`).
+TOOL_CALL_REFUSALS = (ToolBudgetExhausted, ToolArgumentError)
+
+
+def refused_unrun(outcome: object) -> bool:
+    """Whether a call's ``outcome`` refused it unrun (:data:`TOOL_CALL_REFUSALS`), a disabled tool's
+    (:class:`ToolDisabled`) aside. Under the native protocol a turn whose every call was refused or named no
+    existing tool is flagged ``calls_rejected``, so an episode that recovers never reinforces it and the turn
+    after it runs on the recovery reserve."""
+    return isinstance(outcome, TOOL_CALL_REFUSALS) and not isinstance(outcome, ToolDisabled)
 
 
 def parse_python_expression(source: str) -> ast.expr:
@@ -62,10 +88,11 @@ def _parse_tool_arguments(raw: str) -> dict[str, Any]:
 
 @dataclass
 class ToolParameter:
-    """A single parameter for a tool."""
+    """A single parameter for a tool. ``type`` is its JSON-schema type as declared, ``None`` where a
+    schema declares none (an MCP property typed through ``anyOf`` or ``$ref``), which takes any value."""
 
     name: str
-    type: str
+    type: str | None
     description: str
     enum: list[str] | None = None
     required: bool = True
@@ -80,8 +107,8 @@ class NativeTool:
     parameters: list[ToolParameter] = field(default_factory=list)
     handler: Callable[..., Any] | None = None
     async_handler: Callable[..., Any] | None = None
-    # The observation for a call refused over the episode's cap on this tool (``{cap}`` and ``{name}``
-    # format fields); ``None`` takes the generic wording.
+    # The observation for a call refused because the episode spent its budget for this tool; ``None``
+    # takes the generic wording. States the refusal, never the budget's size.
     budget_message: str | None = None
 
     def to_openai_schema(self) -> dict[str, Any]:
@@ -90,10 +117,9 @@ class NativeTool:
         required = []
 
         for param in self.parameters:
-            prop = {
-                "type": param.type,
-                "description": param.description,
-            }
+            prop: dict[str, Any] = {"description": param.description}
+            if param.type is not None:
+                prop["type"] = param.type
             if param.enum:
                 prop["enum"] = param.enum
             properties[param.name] = prop
@@ -130,26 +156,39 @@ class NativeTool:
             raise ToolArgumentError(
                 f"{self.name}: unknown argument {', '.join(map(repr, unknown))}; its arguments are {', '.join(declared)}"
             )
+        bound = dict(arguments)
         for parameter in self.parameters:
+            value = bound.get(parameter.name)
+            if parameter.type == "string" and parameter.name in bound:
+                # A JSON scalar reads as its str() (an engine's parser may send ``"stdin": 5``; ``true`` reads ``True``)
+                # and a null as an omission; a list or an object has no such reading, and a list ``code``
+                # passed on fails inside the sandbox, read as a backend fault.
+                if value is None:
+                    del bound[parameter.name]
+                elif not isinstance(value, str | int | float):
+                    raise ToolArgumentError(
+                        f"{self.name}: {parameter.name} must be a string, got {type(value).__name__}"
+                    )
+                else:
+                    bound[parameter.name] = value = str(value)
             # The schema is the contract the model was shown: a required parameter left out, or an enum
             # value outside it, is a malformed call refused before the handler (and before the episode's
             # budget), even when the handler would supply a default of its own.
-            if parameter.required and parameter.name not in arguments:
+            if parameter.required and parameter.name not in bound:
                 raise ToolArgumentError(f"{self.name}: missing a required argument: {parameter.name!r}")
-            if parameter.enum and parameter.name in arguments and arguments[parameter.name] not in parameter.enum:
+            if parameter.enum and parameter.name in bound and value not in parameter.enum:
                 raise ToolArgumentError(
-                    f"{self.name}: {parameter.name} must be one of {', '.join(parameter.enum)}, "
-                    f"got {arguments[parameter.name]!r}"
+                    f"{self.name}: {parameter.name} must be one of {', '.join(parameter.enum)}, got {value!r}"
                 )
         try:
             signature = inspect.signature(handler)
         except (TypeError, ValueError):
-            return arguments
+            return bound
         try:
-            signature.bind(**arguments)
+            signature.bind(**bound)
         except TypeError as e:
             raise ToolArgumentError(f"{self.name}: {e}") from None
-        return arguments
+        return bound
 
     def bind(self, arguments: dict[str, Any], *, for_async: bool = False) -> dict[str, Any]:
         """Admit a call's model-authored arguments: the schema-checked set the handler can bind, or
@@ -162,14 +201,12 @@ class NativeTool:
             raise NotImplementedError(f"Tool '{self.name}' has no handler")
         return self._bind_for_call(handler, arguments)
 
-    def budget_exhausted_message(self, cap: int, left: Mapping[str, int]) -> str:
-        """The observation for a call refused over the episode's cap of ``cap`` calls on this tool.
-
-        ``left`` maps each capped tool to the calls it has left, which a ``budget_message`` names as
-        ``{left_<tool>}``, so a refusal can point at the budget that still holds.
-        """
-        template = self.budget_message or "{name} limit reached ({cap}); this call was not executed."
-        return template.format(name=self.name, cap=cap, **{f"left_{tool}": calls for tool, calls in left.items()})
+    def budget_exhausted_message(self) -> str:
+        """The observation for a call refused because the episode spent its budget for this tool: the
+        tool's own ``budget_message``, else a generic one. It states the refusal, never the budget's
+        size — what an episode may do is the chat template's and the engine's to control, not a number
+        the model reads."""
+        return self.budget_message or f"Not executed: this task's budget for {self.name} is spent."
 
     @staticmethod
     def _as_text(result: Any) -> str:
@@ -292,9 +329,12 @@ class NativeToolResult:
     # can reproduce any wording of it (an MCP server answering "Tool not found: x" is a real failure of
     # a real tool), and the protocol drops a turn from training on this flag alone.
     unknown_tool: bool = False
+    # The call was refused and nothing ran (:func:`refused_unrun`): at admission, or by its handler
+    # (:class:`ToolCallRefused`). Structural like ``unknown_tool``, and read the same way.
+    refused: bool = False
     # The sandbox fault the call ended on, booked by type (infra or agent-caused) rather than as an
     # ordinary tool error, and ending the episode.
-    sandbox_fault: SandboxInfraError | SandboxAgentFault | None = None
+    sandbox_fault: SandboxFault | None = None
 
     def to_message(self):
         """Convert to a tool :class:`Message` for the conversation."""

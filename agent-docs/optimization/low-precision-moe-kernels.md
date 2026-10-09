@@ -152,7 +152,7 @@ Which names those are is **derived** from the two rosters that decide what QAT q
 
 A dense projection spelled like a per-expert roster name but outside an expert container (LFM-2's dense `feed_forward.w1`) is left in bf16, as training left it. `--no-lowp_apply_moe_experts` declares the experts out of scope when training left them in bf16.
 
-A MoE checkpoint whose experts match none of the roster's spellings (Inkling's hub `experts.w13_weight` / `w2_weight`), or a 3-D bank under a spelling no EP layer class declares as fused (Step-3.7's per-layer `moe.gate_proj` / `moe.up_proj` stacks), is **refused** before any write rather than copied through under a `quantization_config` that claims QAT parity.
+A MoE checkpoint whose experts match none of the roster's spellings (Inkling's hub `experts.w13_weight` / `w2_weight`), or a 3-D bank under a spelling no EP layer class declares as fused (Step-3.7's per-layer `moe.gate_proj` / `moe.up_proj` stacks), is **refused** before any write rather than copied through under a `quantization_config` that claims QAT parity. Gathered saves write those hub spellings, so an Inkling composite or Step-3.7 export has no low-precision export.
 
 A VLM's **vision tower and projector are excluded** on top of that: the dense conversion runs inside the text backbone only, so a quantized tower would compute in a format training never saw.
 
@@ -165,11 +165,11 @@ A weight whose contraction axis is not block-divisible is copied through in high
 Consuming the result — per quantized weight `<name>`:
 
 - `<name>.weight_packed` (`float8_e4m3fn` for mxfp8, `uint8` with two `e2m1` nibbles per byte for fp4), `<name>.weight_scale` (one per block), `<name>.weight_shape` (the original shape — packed fp4 data halves the contraction axis).
-- `<name>.weight_global_scale` — **nvfp4 only**. An element is `code × block_scale × global_scale`; a loader that drops it reads the tensor rescaled by up to `E4M3_MAX × E2M1_MAX`.
+- `<name>.weight_global_scale` — **nvfp4 only**, in compressed-tensors' convention: shape `[1]`, `E4M3_MAX × E2M1_MAX / amax` (rounded to a power of two), and an element is `code × weight_scale / weight_global_scale`. A loader that drops it reads the tensor rescaled by up to `E4M3_MAX × E2M1_MAX`. An all-zero weight stores `1.0`, compressed-tensors' own value for it, never the `+inf` its amax implies, which vLLM's max over a fused layer's partitions would spread to every partition; a nonzero weight too small for the scale's fp32 range is refused.
 - The contraction axis is **per weight**, from `quantization_config.json`'s `weight_axes` map — fused 3-D experts differ by family (gpt-oss contracts on axis 1, the rest on the last), so the manifest's single `contraction_axis` is only the fallback for names absent from that map.
 - `quantization_config.json` also carries a `scope` block recording what this export reproduced: `apply_dense_mlp`, `apply_moe_experts`, `keep_first_blocks`, `keep_last_blocks` (the flags, minus the `lowp_` prefix) plus the resolved `kept_blocks` indices. The whole manifest is stamped into the output `config.json` under `quantization_config` as well.
 
-The dequantized weight reproduces the QAT forward exactly (relerr 0), so QAT→inference is consistent; `src.kernels.lowp.quantization.dequantize` is the reference reader. Engine loading — vLLM / TRT-LLM compressed-tensors — is the remaining integration step.
+The dequantized weight reproduces the QAT forward exactly (relerr 0), so QAT→inference is consistent; `src.kernels.lowp.quantization.dequantize` is the reference reader (its nvfp4 `global_scale` is the reciprocal of the stored one). Engine loading — vLLM / TRT-LLM compressed-tensors — is the remaining integration step.
 
 ## Usage
 
@@ -184,9 +184,9 @@ lowp_keep_last_blocks: 0
 
 Low precision is the fake-quant oracle by default; there is no backend knob. The native DeepGEMM kernel is opt-in via `HALO_DEEPGEMM_NATIVE=1` (never a throughput win). Two env knobs tune the simulated path: `HALO_LOWP_COMPILE=0` runs the weight round-trip eager instead of compiled, `HALO_LOWP_WEIGHT_CACHE=0` disables the per-step expert-weight cache. The master weight stays bf16/fp32 and the checkpoint is unchanged.
 
-Rejected at config/load time, loudly: any trainer but SFT; **pipeline parallelism** (each stage re-bases its layer indices to 0, so `lowp_keep_*_blocks` would protect every stage's own ends instead of the network's); a `quantization_config` (QLoRA/bitsandbytes — the weights are not plain `nn.Linear`); `fp16: true` masters; and both `lowp_apply_dense_mlp` and `lowp_apply_moe_experts` false, which would apply low precision to nothing.
+Rejected at config/load time, loudly: any trainer but SFT; a `quantization_config` (QLoRA/bitsandbytes — the weights are not plain `nn.Linear`); `fp16: true` masters; and both `lowp_apply_dense_mlp` and `lowp_apply_moe_experts` false, which would apply low precision to nothing.
 
-`lowp_apply_moe_experts` reaches the experts only on the grouped-GEMM path (`EPMoELayerBase._grouped_mm`). A layer running the per-expert loop instead (`use_grouped_gemm: false`, e.g. `examples/sft/gptoss/gptoss-120b-multinode-ep.yaml`, or ETP on gpt-oss) ignores the precision and stays bf16 on its experts. Set `use_grouped_gemm: true` to apply low precision to the experts.
+`lowp_apply_moe_experts` reaches the experts only on the grouped-GEMM path (`EPMoELayerBase._grouped_mm`). A layer running the per-expert loop instead (`use_grouped_gemm: false`, e.g. `examples/sft/gptoss/gptoss-20b-multinode-ep.yaml` at ep16, or ETP on gpt-oss) ignores the precision and stays bf16 on its experts. Set `use_grouped_gemm: true` to apply low precision to the experts.
 
 `apply_mixed_precision_compute` warns with the count of loop-path layers, and raises when the whole request converted zero modules (a fused-expert MoE with no EP wrappers would otherwise train pure bf16 with no signal).
 

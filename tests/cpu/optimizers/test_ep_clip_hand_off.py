@@ -22,20 +22,20 @@ MAX_NORM = 0.5
 class _EPTrainer(GradientSyncMixin):
     """The attributes ``ep_clip_grad_norm_`` reads, on one rank with EP layers and no TP."""
 
-    def __init__(self, optimizer, params):
+    def __init__(self, optimizer):
         self.optimizer = optimizer
         self.accelerator = SimpleNamespace(clip_grad_norm_=None)
         self.parallelism_config = SimpleNamespace(is_tp_mode=False)
         self._has_ep_layers = True
-        self._params = params
+        self._ep_config = SimpleNamespace()
         self._patch_gradient_clipping_for_ep()
 
     def _sync_deferred_expert_grads(self) -> None:
         pass
 
-    def _compute_global_grad_norm(self) -> torch.Tensor:
+    def _compute_global_grad_norm(self, params) -> torch.Tensor:
         return torch.linalg.vector_norm(
-            torch.stack([torch.linalg.vector_norm(p.grad, dtype=torch.float32) for p in self._params])
+            torch.stack([torch.linalg.vector_norm(p.grad, dtype=torch.float32) for p in params])
         )
 
 
@@ -47,6 +47,10 @@ def _params(dtype: torch.dtype = torch.float32, seed: int = 0) -> list[nn.Parame
     return params
 
 
+def _named(params: list[nn.Parameter]) -> list[tuple[str, nn.Parameter]]:
+    return [(f"p{i}", p) for i, p in enumerate(params)]
+
+
 def _clip_then_step(optimizer_cls, dtype: torch.dtype = torch.float32) -> torch.optim.Optimizer:
     """The reference: clip the gradients in place, then step; returns the stepped optimizer."""
     params = _params(dtype)
@@ -55,7 +59,7 @@ def _clip_then_step(optimizer_cls, dtype: torch.dtype = torch.float32) -> torch.
     )
     for p in params:
         p.grad.mul_(clip_coefficient(MAX_NORM, norm))
-    optimizer = optimizer_cls(params, lr=1e-2)
+    optimizer = optimizer_cls(_named(params), lr=1e-2)
     optimizer.step()
     return optimizer
 
@@ -77,8 +81,8 @@ def test_adamw_bf16_takes_the_scale_and_steps_as_if_clipped_first(dtype):
     bf16)."""
     params = _params(dtype)
     grads_before = [p.grad.clone() for p in params]
-    optimizer = AdamWBF16(params, lr=1e-2)
-    trainer = _EPTrainer(optimizer, params)
+    optimizer = AdamWBF16(_named(params), lr=1e-2)
+    trainer = _EPTrainer(optimizer)
 
     norm = trainer.accelerator.clip_grad_norm_(params, MAX_NORM)
 
@@ -94,8 +98,8 @@ def test_adamw_bf16_takes_the_scale_and_steps_as_if_clipped_first(dtype):
 def test_another_optimizer_gets_the_gradients_scaled_in_place(optimizer_cls):
     params = _params()
     grads_before = [p.grad.clone() for p in params]
-    optimizer = optimizer_cls(params, lr=1e-2)
-    trainer = _EPTrainer(optimizer, params)
+    optimizer = optimizer_cls(_named(params), lr=1e-2)
+    trainer = _EPTrainer(optimizer)
 
     norm = trainer.accelerator.clip_grad_norm_(params, MAX_NORM)
 
@@ -104,6 +108,42 @@ def test_another_optimizer_gets_the_gradients_scaled_in_place(optimizer_cls):
         torch.testing.assert_close(p.grad, before * coefficient, rtol=0, atol=0)
     optimizer.step()
     _assert_steps_match(optimizer, _clip_then_step(optimizer_cls))
+
+
+def test_a_non_l2_norm_is_refused_rather_than_ignored():
+    """The clip sums squared L2 shard norms; an L1 or inf request would come back as the L2 norm."""
+    params = _params()
+    trainer = _EPTrainer(torch.optim.SGD(params, lr=1e-2))
+
+    with pytest.raises(ValueError, match="norm_type=2 only"):
+        trainer.accelerator.clip_grad_norm_(params, MAX_NORM, norm_type=1)
+
+
+def test_installing_the_clip_on_a_model_without_ep_layers_raises():
+    """Every caller sets up an EP mode; a model without EP layers there has no expert grad sync at all."""
+
+    class _NoEPLayers(_EPTrainer):
+        def __init__(self):
+            self.accelerator = SimpleNamespace(clip_grad_norm_=None)
+            self._has_ep_layers = False
+            self._patch_gradient_clipping_for_ep()
+
+    with pytest.raises(RuntimeError, match="no EP-patched layers"):
+        _NoEPLayers()
+
+
+def test_installing_the_clip_without_an_ep_config_raises():
+    """The norm's expert legs reduce over the EP config's groups; without it they would drop silently."""
+
+    class _NoEPConfig(_EPTrainer):
+        def __init__(self):
+            self.accelerator = SimpleNamespace(clip_grad_norm_=None)
+            self._has_ep_layers = True
+            self._ep_config = None
+            self._patch_gradient_clipping_for_ep()
+
+    with pytest.raises(RuntimeError, match="no EPConfig was captured"):
+        _NoEPConfig()
 
 
 if __name__ == "__main__":

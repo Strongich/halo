@@ -62,7 +62,7 @@ class SinksPolicy(enum.StrEnum):
     @property
     def live(self) -> bool:
         """Whether the sink column participates in the softmax. Every gate keyed on live sinks
-        (kernel capability, implicit-reference KL, RL weight sync) applies to LIVE and TRAINABLE alike."""
+        (kernel capability, held-reference KL, RL weight sync) applies to LIVE and TRAINABLE alike."""
         return self is not SinksPolicy.NEUTRALIZED
 
 
@@ -269,9 +269,9 @@ def install_fa4_trainable_sink_rescale() -> bool:
         setattr(fn, _FA4_RESCALE_ATTR, True)
     cute.flash_attn_varlen_func = varlen_with_sink_grad
     cute.flash_attn_func = dense_with_sink_grad
-    if getattr(flash_utils, "_flash_varlen_fn", None) is orig_varlen:
+    if flash_utils._flash_varlen_fn is orig_varlen:
         flash_utils._flash_varlen_fn = varlen_with_sink_grad
-    if getattr(flash_utils, "_flash_fn", None) is orig_dense:
+    if flash_utils._flash_fn is orig_dense:
         flash_utils._flash_fn = dense_with_sink_grad
     logger.info("Installed the FA4 trainable-sink rescale (sink-less kernel + sigmoid(lse - sink) gate)")
     return True
@@ -356,7 +356,11 @@ def has_live_attention_sinks(model) -> bool:
     Read off the stamp rather than the tensors: the reset yields ``sinks is None`` only under
     flash_attention_2 and fills with ``dtype.min`` everywhere else, so a presence test reports reset
     sinks as live on the production Blackwell path, and by the time a trainer validates, ``sinks`` is
-    a sharded DTensor whose per-rank values would diverge.
+    a sharded DTensor whose per-rank values would diverge. A sinks model no toolkit loader stamped
+    (one TRL built itself) kept its pretrained sinks, which GptOss's default attention, eager, applies.
     """
     policy = stamped_sinks_policy(model)
-    return policy is not None and policy.live
+    if policy is not None:
+        return policy.live
+    config = getattr(model, "config", None)
+    return config is not None and model_has_sinks(config)

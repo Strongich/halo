@@ -102,7 +102,7 @@ def _make_trainer(
         async_config=async_config,
         parallelism_config=parallelism_config,
         peft_config=peft_config,
-        environment_config=EnvironmentConfig(environment_type="native_math", environment_kwargs={"max_turns": 2}),
+        environment_config=EnvironmentConfig(environment_type="native_math", max_turns=2),
     )
 
 
@@ -129,7 +129,6 @@ def _grpo_config(*, output_dir: str, max_steps: int, group_port: int, save: bool
         num_generations=2,
         max_completion_length=128,
         beta=0.0,
-        generation_kwargs={"temperature": 0.7},
         fsdp="",
         vllm_group_port=group_port,
         remove_unused_columns=False,

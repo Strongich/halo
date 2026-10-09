@@ -45,8 +45,8 @@ expert all-gathers stay on every rank; the layout assembly after them runs only 
 kept. A family that returns tensors anyway is rejected, not obeyed.
 
 Every ladder save then **streams** through `StageShardWriter`: FSDP2, CP and TP via
-`stream_gathered_checkpoint`, one conversion-closed chunk (a decoder layer) at a time; EP and PP by
-writing each MoE layer out as it is gathered.
+`stream_gathered_checkpoint`, one conversion-closed chunk (a decoder layer) at a time; EP by writing
+each MoE layer out as it is gathered.
 
 The writer never holds more than one chunk plus one pending shard, so host memory stays well under
 1× model ([measured peaks](../parallelism/expert-parallelism.md#checkpointing)). That is what makes
@@ -71,7 +71,7 @@ safetensors *file* header is the container format, not this marker.
 | **EP per-rank sharded** | `model-00000-of-000NN.safetensors` (`.shard_{rank}` keys) + index | `save_sharded_ep: true` | `format: "ep_sharded"` | No — `merge_ep_shards.py` first |
 
 Shard size defaults to 5 GB (`save_max_shard_size` overrides it). It bounds the **gathered** writers
-(EP/TP/FSDP2/CP/PP). A per-rank EP shard is one file per rank by design, so the cap does not apply
+(EP/TP/FSDP2/CP). A per-rank EP shard is one file per rank by design, so the cap does not apply
 there — the save logs that rather than appearing to honor it.
 
 It does not reach the merge either: the after-training tools size their own output from their
@@ -82,7 +82,8 @@ A directory of per-rank shards whose index never landed (a run killed between th
 the index write) is refused by every after-training tool. The shards carry `.shard_N` keys, which a
 header-only peek detects without an index.
 
-The **PP layout is not a per-rank format**. Each stage writes *complete* tensors under global
+The **PP layout** — the `save_pp_checkpoint` seam, which no run reaches in this release — **is not a
+per-rank format**. Each stage writes *complete* tensors under global
 parameter names (`stage.global_parameter_name`, with EP experts re-exported through their family
 gather), and rank 0 merges the index into HF's native multi-shard layout. That is why it
 deliberately carries no marker.
@@ -96,11 +97,6 @@ map, so no other rank ever holds one fragment per rank of it. The collision verd
 broadcast: a duplicated key raises on every rank, rather than on rank 0 alone while its peers block
 in the barrier that follows.
 
-PP does not compose with the per-rank format. `save_sharded_ep` is validated unconditionally at
-construction and **raises** under PP: its shards key tensors by unsplit-model names with no stage
-layer offset, and a sharded EP save needs one EP group spanning the whole world, which a stage's
-group never is.
-
 The per-rank EP layout holds **partial** tensors; the loaders detect the marker and refuse it with an
 error naming the merge script, so it is never silently loaded as whole. How weights return on resume
 depends on whether the mode transforms the model at construction — see
@@ -112,10 +108,10 @@ depends on whether the mode transforms the model at construction — see
 |------|:-:|:-:|---------|
 | `model.safetensors` (or sharded + index) | Yes | Yes | Weights |
 | `config.json`, `tokenizer.*` (full processor for VLMs) | Yes | Yes | Architecture config + `processing_class` |
-| `generation_config.json` | Yes | Yes | Sampling defaults, stop strings and the custom `eos_token_id` set — written for a generative model only, and paired with `config.json` by `save_model_config`. `PretrainedConfig` does not carry it, so a save that writes only `config.json` serves with defaults. Under PP the stage module mirrors the unsplit model's `generation_config`/`can_generate` so the pair holds there too. |
+| `generation_config.json` | Yes | Yes | Sampling defaults, stop strings and the custom `eos_token_id` set — written for a generative model only, and paired with `config.json` by `save_model_config`. `PretrainedConfig` does not carry it, so a save that writes only `config.json` serves with defaults. |
 | `trainer_state.json` | Yes | Yes | Step count, epoch, loss history |
 | `optimizer_shard_XXXXX.pt` | Yes | No | Per-rank optimizer shard — every torchrun sharded mode. Under multi-group EP only the replica group's lowest rank carries the replicated (FSDP-ignored) expert state; its peers read it from that shard |
-| `optimizer_meta.pt` | Yes | No | Topology fingerprint gating exact resume (+ `pp_stage_partition` under PP) |
+| `optimizer_meta.pt` | Yes | No | Topology fingerprint gating exact resume |
 | `scheduler.pt` | Yes | Yes | LR scheduler state — re-persisted on every mode so resume continues the schedule |
 | `router_balancing_biases.pt` | Yes | Yes | DeepSeek-V3 router balancing biases, restored on resume |
 | `reference_logps.pt` | Yes | Yes | Frozen per-split reference scores: DPO/KTO `precompute_ref_log_probs` columns and offline GRPO raw completion-token log-probs. Resume validates token digests, row counts and reference settings before attaching them ([DPO](../training-methods/preference/dpo.md#resuming-a-precompute-run), [Offline GRPO](../training-methods/grpo/offline-grpo.md#reference-model)) |
@@ -146,18 +142,9 @@ bf16 ([Saving by parallelism mode](#saving-by-parallelism-mode)). fp32 masters (
 `fp32_experts`, `fp32_non_ep_params`) and fp32 adapters therefore take 4 bytes per element in a
 checkpoint: `fp32_experts` doubles an MoE checkpoint's expert bytes and `fp32_non_ep_params` its
 non-expert bytes, while the routers alone are negligible. An adapter restore reads them back exactly.
-Construction from a checkpoint (Path B) preserves configured FP32 parameter masters in dense
-FSDP2, CP, EP1, EP/EP+CP, TP/EP+TP and ETP/EP+ETP. Plain eager models replay the selected checkpoint
-tensors before parallel wrapping; lazy EP loads retain them on the first read/fusion. Native dense
-TP rebuilds the existing 1-D TP shards and tied aliases before DP/FSDP2 wrapping, splitting on CPU
-so it never uploads a full FP32 matrix per TP rank. Persistent FP32 buffers follow their separate
-family pinning policy and are not parameter masters.
-
-The precision flags apply to **any** checkpoint start, including a fresh training stage.
-`preserve_checkpoint_precision` carries the script's resolved full-finetune resume provenance and
-makes master coverage strict: every configured master's identity must be restored, without
-missing-key exemptions. It does not control the dtype policy. A BF16 export promotes exactly the
-values it stored; it cannot recover precision discarded during export.
+Every checkpoint start restores the configured masters at FP32, under every parallelism mode
+([Load precision](../models/README.md#load-precision)). A BF16 export promotes exactly the values it
+stored; it cannot recover precision discarded during export.
 
 `ReferenceLogpsCheckpointMixin` persists DPO/KTO and offline GRPO scores on the filesystem-aware
 save rank. The save completes only after its file and parent directory are synced. Unchanged
@@ -166,8 +153,10 @@ adding a scored split writes a new payload. Write failures rendezvous across ran
 checkpoint rotation can remove the previous complete checkpoint.
 
 Staging and durable publication live in `src/checkpoint/atomic.py`. Fresh files use `0o666` under
-the process umask, matching ordinary checkpoint-file permissions. Export copies omit staging files
-left by interrupted reference or model-card writes.
+the process umask, matching ordinary checkpoint-file permissions. Export copies omit every
+unpublished file an interrupted save leaves: a staged write's stage (the reference and prefetch
+sidecars, `optimizer_meta.pt`, the model card), the withheld `.trainer_state.json.uncommitted`, and
+the `.<name>.<uuid hex>` / `<name>.staged` staging spellings.
 
 Offline GRPO's mapped reference storage and old-checkpoint recovery are covered in its
 [reference contract](../training-methods/grpo/offline-grpo.md#reference-model).
@@ -211,8 +200,14 @@ rewrite cannot update — raises instead of serving a geometry the trainer never
 A source declaring no `auto_map` has no schema to hand on; the export warns and keeps transformers'
 own.
 
-All three rewrites — the `model_type` restore, the legacy per-layer keys, the source schema — are
-one step, `finalize_exported_config` (`src/checkpoint/config_export.py`, which owns the whole
+An `auto_map` entry naming a module the directory does not carry is dropped. transformers copies
+remote code only for a class registered to an auto class, yet serializes the `auto_map` an in-library
+load read off the hub config (Laguna without `trust_remote_code`), so the entry would make every
+`trust_remote_code=True` reload raise on the missing file; a cross-repo `repo--module.Class`
+reference stays.
+
+All four rewrites — the `model_type` restore, the legacy per-layer keys, the source schema, the
+`auto_map` trim — are one step, `finalize_exported_config` (`src/checkpoint/config_export.py`, which owns the whole
 exported-config contract). Every writer calls it last: the parallel saves through
 `save_model_config`, `save_full_checkpoint`, and the single-GPU/DDP/accelerate-FSDP fallback in the
 trainer.
@@ -225,9 +220,6 @@ training (independent FSDP2 shards, FLCE training `lm_head` directly), so when t
 and `embed_tokens` tensors differ, the config is written with `tie_word_embeddings: false` and the
 trained `lm_head` is honored on reload. The pair is matched by key suffix, covering wrapped/VLM
 layouts.
-
-`save_pp_checkpoint` saves the stage config verbatim and skips the reconciliation — PP rejects
-tied-embedding models outright when it splits the model.
 
 The `.bin`-then-sweep fallback belongs to `write_gathered_checkpoint`, the whole-dict writer the
 injected-LoRA embedding save uses: it needs a dict still whole after the failure, which a streamed
@@ -288,50 +280,74 @@ A gathered checkpoint is a standard HF checkpoint — stock `from_pretrained` lo
 (That is serving a **saved artifact**; live RL weight-sync support is narrower —
 [Rollout Servers](../infrastructure/rollout-servers.md#which-families-each-engine-serves).)
 
+Every writer saves the names transformers' own `save_pretrained` writes: the reverse of what the
+load converted. transformers reads several hubs through renames its module tree drops: a SigLIP
+tower's `vision_model` level (Command A+, LFM2-VL), a vendor namespace (Inkling's `model.llm.*`,
+GLM-5 Next's `hc_attn_*`, Step-3.7's `moe.*`, DeepSeek-V4's `attn`/`ffn` names under the `model.`
+prefix the load added), Mistral 3's legacy llava prefixes. Each writer reverts the conversions the
+load recorded (`revert_conversions_for` in `src/checkpoint/format.py`); a model with no record (built
+from its config, or by the lazy loader), or whose load dequantized fp8/MXFP4 weights, reverts the
+family's registered mapping. The EP-gathered save and
+the RL weight sync leave out only the per-expert merges (`gathered_export_conversions` in
+`src/distributed/expert_parallel/hub_conversion.py`), since the gather owns the expert layout. vLLM
+0.26.0 raises on a SigLIP tower key that lacks its `vision_model` level.
+
 Two rules apply to some MoE families, on both engines.
 
 **Un-fuse experts.** transformers keeps MoE experts fused in memory
 (`experts.gate_up_proj` / `experts.down_proj`) and reads that layout back on load. Most hub
 checkpoints are per-expert (`experts.{i}.{gate,up,down}_proj.weight` /
-`experts.{i}.w{1,3,2}.weight`) and `from_pretrained` fuses them on load.
+`experts.{i}.w{1,3,2}.weight`) and `from_pretrained` fuses them on load; Qwen3.5/3.6 and Zaya ship
+the fused pair.
 
-The wrapper-less writer runs the save-side revert (per-expert hub spelling). An EP-gathered save
-writes whatever the family's own gather emits — the fused pair for Qwen3.5/3.6, DeepSeek-V4,
-Cohere2 MoE and GLM-5 Next.
+The wrapper-less writers and the base-Trainer save write the expert layout the model was loaded from:
+per-expert for a per-expert hub, the fused pair for Qwen3.5/3.6, whose fused-hub load converts nothing. A model with no
+record (built from its config, or by the lazy loader) reverts through the family's registered mapping
+(per-expert for Qwen3.5/3.6, through `qwen2_moe`). An EP-gathered save writes whatever the family's own gather emits — the fused
+pair for Qwen3.5/3.6, DeepSeek-V4, Cohere2 MoE and GLM-5 Next. A reload into a built model maps any of
+these back onto the live names ([Resuming training](#resuming-training)).
 
 Rewrite such a checkpoint only when the serving loader is per-expert-only, with
-`scripts/after_training/unfuse_moe_experts.py`. It emits the names that family declares and refuses
-the families whose checkpoints are not per-expert at all
-([Scripts](scripts-reference.md#post-training-scripts)).
+`scripts/after_training/unfuse_moe_experts.py`. It emits the names that family declares, so a gathered
+save comes out as the hub checkpoint, and it refuses the families whose checkpoints are not per-expert
+at all ([Scripts](scripts-reference.md#post-training-scripts)).
 
 Step-3.7 Flash is one of the refused (its hub layout is per-layer stacked, not per-expert) and needs
-no rewrite: its EP-gathered save already lands in that hub `moe.*` namespace
-(`_EXPORTS_HUB_NAMESPACE`, [Step-3.7](../models/step3p7.md#checkpoint)), which its pinned engines
-read directly.
+no rewrite: its EP-gathered save lands in that hub `moe.*` namespace
+([Step-3.7](../models/step3p7.md#checkpoint)), which its pinned engines read directly.
 
 | Serving loader | Families | Fused `gate_up_proj` / `down_proj` |
 |---|---|---|
 | vLLM 0.26.0 `RoutedExperts` | Qwen3.5/3.6, Gemma 4 | loaded directly |
-| vLLM 0.26.0 `FusedMoE` (`cohere2_moe`) | Cohere2 MoE | loaded directly |
+| vLLM 0.26.0 `FusedMoE` (`cohere2_moe`) | Cohere2 MoE ([Command A+](../models/cohere2-moe.md#loading-and-serving)) | loaded directly |
 | vLLM 0.26.0 `step3p5` | Step-3.7 Flash | not needed — the EP-gathered save writes the hub `moe.*` tensors |
 | vLLM 0.26.0 per-expert-only | GLM-4 MoE Lite, Laguna, LFM-2, Bailing/Ling 2.0 | hard-fail or silent drop — un-fuse first |
 | vLLM 0.26.0 — no model class | Mistral4, Ling 3.0 (`bailing_hybrid`), GLM-5 Next, Ring — its `BailingMoeLinearV2ForCausalLM` matches no registered architecture ([Rollout Servers](../infrastructure/rollout-servers.md#which-families-each-engine-serves)) | not servable at all ([Mistral4](../models/mistral4.md#serving), [Bailing](../models/bailing.md)) |
-| vLLM 0.26.0 — export layout not read | Inkling, DeepSeek-V4 (module-spelled exports, [below](#expert-parallelism-ep-eptp-epcp)), Zaya (no class) | not servable ([DeepSeek-V4](../models/deepseek-v4.md), [Zaya](../models/zaya.md)) |
+| vLLM 0.26.0 — release layout only | DeepSeek-V4 (fp8/fp4-packed release), Zaya (no class) | not servable ([DeepSeek-V4](../models/deepseek-v4.md), [Zaya](../models/zaya.md)) |
+| vLLM 0.26.0 `inkling` | Inkling | the export writes the hub's fused `w13_weight` under `model.llm.*`; unverified end to end |
 
 SGLang 0.5.17 reads each family's hub layout through its own per-family loader, so the same un-fuse
-rule applies; it registers no class for Mistral4, Ling 3.0 or GLM-5 Next, none matching Ring's
-architecture either, and its DeepSeek-V4 and Zaya loaders read per-expert layouts the gathered export
-does not carry.
+rule applies, Cohere2 MoE and DeepSeek-V4 included (their loaders drop the fused pair without an
+error; a DeepSeek-V4 export is unverified there even after the rewrite); it registers no class for
+Mistral4, Ling 3.0 or GLM-5 Next, none matching Ring's architecture either, and its Zaya loader reads a
+per-expert layout the gathered export does not carry.
 
 **MLA backend on Blackwell.** GLM-4 MoE Lite uses MLA; flashinfer's MLA kernel rejects its head
 config on SM100+ — serve with vLLM `--attention-backend CUTLASS_MLA` or SGLang
 `--attention-backend triton`.
 
+**Text-only exports of a multimodal checkpoint.** A `text_only_model` load (or a merge of its
+adapter) reads the checkpoint through its `*ForCausalLM` sibling, which strips `model.language_model.`
+to `model.`. The gathered and EP writers, the base-Trainer save (single GPU, DDP, accelerate FSDP),
+the weight sync and the tools' `save_full_checkpoint` revert the load's conversions minus that strip (`revert_conversions_for` / `save_pretrained_layout`
+in `src/checkpoint/format.py`), so the export stores `model.*` under its `*_text` config. vLLM reads it
+only after `reattach_vision_tower.py` ([Qwen3.5/3.6](../models/qwen3_5.md)).
+
 ## Saving by parallelism mode
 
 ### Expert parallelism (EP, EP+TP, EP+CP)
 
-`save_ep_model()` (`src/distributed/expert_parallel/saving.py`) owns all three, over three param
+`save_ep_model()` (`src/distributed/checkpoint/ep_save.py`) owns all three, over three param
 classes: EP expert weights, gathered by `gather_ep_layer_weights()` with local → global expert
 re-indexing; DTensor params (EP+TP attention, embeddings, `lm_head`, and FSDP2-sharded params such as
 the router under ep1 sharding), resolved via `full_tensor()`; and manually TP-sharded plain tensors
@@ -346,33 +362,27 @@ iteration runs on the unwrapped model with an explicit CP-prefix strip, so atten
 under their hub names; experts are replicated per CP rank (EP ⊥ DP), so any rank holds the complete
 set.
 
-Keys are written in the family's **hub** spelling. Where a family's live module names differ, the EP
-layer class declares the pairs in `_EXPORT_KEY_RENAMES` and the gather rewrites them (Laguna is the
-one such family). transformers expresses this as `WeightRenaming` and applies it only inside
-`from_pretrained`.
+Keys are written in the **hub** spelling. The save runs transformers' save-side revert of the
+load's conversions, minus the per-expert merges, on every streamed chunk — the non-expert params as
+one, each gathered layer as its own — so a vendor or wrapper namespace (Inkling, DeepSeek-V4, GLM-5
+Next, Step-3.7, a SigLIP tower) comes back as the hub spells it
+([Serving](#serving-on-vllm--sglang)). No reverse entry fuses tensors across two chunks, which
+`tests/cpu/checkpoint/test_ep_hub_namespace_export.py` pins per family by reloading every save into
+the tensors it was saved from. The RL weight sync forwards the same names.
 
-vLLM keys on hub names and silently skips unknown ones, so the module spelling would drop those
-tensors from serving and from the RL weight sync. The lazy loader applies the inverse of
-`_EXPORT_KEY_RENAMES` on read; `merge_ep_shards.py` and the GRPO weight sync apply the same rewrite,
-keeping merged-from-sharded and pushed-to-vLLM key-identical to gathered.
+Inside an EP layer, a family whose live names differ from its hub's declares the pairs in
+`_EXPORT_KEY_RENAMES` and the gather rewrites them (Laguna is the one such family). The lazy loader
+applies the inverse on read, and `merge_ep_shards.py` the same rewrite.
 
 Four families declare transformers' load-side conversion for their hub checkpoints
-(`_HUB_CONVERSION_KEYS`), which the lazy loaders replay per key. Three of them are bridged read-side
-only, so their gathered exports keep the canonical module spelling:
-
-- **Inkling** — which is exactly why its layer refuses weight sync (`_supports_weight_sync = False`).
-- **DeepSeek-V4**, whose sync neither pinned engine takes: vLLM's V4 loader targets the packed
-  fp8/fp4 release layout, SGLang's maps per-expert expert names.
-- **GLM-5 Next**, which no pinned engine loads.
-
-Step-3.7 Flash additionally declares `_EXPORTS_HUB_NAMESPACE`, so its gathered save runs
-transformers' own save-side revert per chunk and lands in the hub namespace
-([Step-3.7](../models/step3p7.md#checkpoint)).
+(`_HUB_CONVERSION_KEYS`), which the lazy loaders replay per key: Inkling, DeepSeek-V4, GLM-5 Next and
+Step-3.7 Flash. The lazy loaders also replay a sub-model's own prefix change (a SigLIP tower's
+`vision_model` level) for every family.
 
 The conversion sources are not all vendor-anchored (DeepSeek-V4's `\.norm\.` → `.kv_norm.` also
 matches the canonical final norm). So the lazy loaders keep a converted key whose targets all miss
 the model's key space while the key itself resolves — the same model-key validation transformers'
-own loader applies. A canonical checkpoint (an EP or PP resume of a toolkit save) loads untouched.
+own loader applies. A canonical checkpoint (an EP resume of a toolkit save) loads untouched.
 
 **Sharded (`save_sharded_ep: true`)** writes each rank's expert shard keyed by global rank, with
 global rank 0 adding non-expert params and the index. Because the shards are global-rank-keyed and
@@ -389,9 +399,10 @@ construction** on any of:
   (`merge_shards_to_hf`, the inverse of its own gather; `__init_subclass__` requires the two be
   overridden together), resolved through the class-declared `HF_MODEL_TYPES`; an unclaimed
   `model_type` has no transform.
-- **A family that exports the hub namespace** (`_EXPORTS_HUB_NAMESPACE`, Step-3.7 Flash): its save
-  runs transformers' save-side conversion revert per chunk, which the merge's key-by-key stream
-  cannot apply.
+- **A load that converted names the merge cannot respell** (Step-3.7 Flash, Inkling, DeepSeek-V4,
+  GLM-5 Next, a SigLIP tower, a legacy Mistral 3 checkpoint): the gathered save reverts them through
+  transformers' save-side conversion, which the merge's key-by-key stream cannot apply. Decided per
+  model off the load's record, not per family.
 - **Native expert LoRA**: the grouped `_lora_A`/`_lora_B` adapters would be written as `.shard_N`
   keys the merge's base-root pattern never matches, passing through dead while the merged experts
   stay the frozen base.
@@ -417,14 +428,14 @@ python scripts/after_training/merge_ep_shards.py \
     --input_dir /path/to/sharded_checkpoint --output_dir /path/to/merged_checkpoint
 ```
 
-The merge copies the resume sidecars (`scheduler.pt`, `router_balancing_biases.pt`,
+The merge copies the resume state (`trainer_state.json`, `scheduler.pt`, `router_balancing_biases.pt`,
 `reference_logps.pt`, `rng_state_*`, `prefetch_pending-*`) while excluding stale weight artifacts, so the merged directory
-resumes weights, scheduler, balancing biases, precomputed reference log-probs and pending prefetch rounds — but **not** the
+resumes weights, step counters, scheduler, balancing biases, precomputed reference log-probs and pending prefetch rounds — but **not** the
 optimizer: the per-rank `optimizer_shard_XXXXX.pt` files are weight-suffixed and dropped, so a resume
 from the merged directory warm-restarts. A resume pointed at
 the unmerged directory raises the merge-first error directly.
 
-The merge requires a per-rank index carrying `ep_size`, so a gathered, PP or already-merged directory
+The merge requires a per-rank index carrying `ep_size`, so a gathered or already-merged directory
 is declined rather than transformed twice, and an adapter sitting beside the shards is refused up
 front (the aux copy carries `adapter_config.json` but no weight file, so the merged directory would
 claim an adapter it does not hold). `generation_config.json` rides across verbatim. The tool's flags
@@ -434,7 +445,7 @@ are on [Scripts](scripts-reference.md#post-training-scripts).
 
 Two TP implementations exist: **HF-native TP** (`tp_plan="auto"`, dense) and **DTensor TP**
 (`parallelize_module()`, the MoE attention-only path incl. EP+TP). Both place their sharded params
-as DTensors, so `save_tp_model()` (`src/distributed/tensor_parallel/checkpoint.py`) reconstructs
+as DTensors, so `save_tp_model()` (`src/distributed/checkpoint/tp_save.py`) reconstructs
 either with one `full_tensor()` walk.
 
 The gather is a collective every TP rank must enter, and GptOss `sinks` need the separate
@@ -479,7 +490,7 @@ them: its DTensor probe sees plain tensors, takes the rank-0 `save_pretrained` b
 shared-tensor scan raises on the first parameter that branch cannot address.
 
 LoRA is rejected at construction under TP / EP+TP (adapters are not integrated into the TP DTensor
-graph) and under PP.
+graph).
 
 The saver checks for DTensor adapters before the CP branch, so non-quantized LoRA+CP (whose adapters
 are FSDP2 DTensors) routes through the FSDP2 path. Only QLoRA+CP, with no DTensor adapters, takes
@@ -514,9 +525,9 @@ but cannot resume from them: the bf16 fold loses part of the delta, and the opti
 to the adapters. So `_save_checkpoint` adds the unmerged adapter to every training checkpoint, in
 `resume_adapter/`, through the writer the non-merged save uses (`PeftAdapterSaver` for a mixed run,
 `save_ep_lora_adapters` for expert-only). The root marker `resume_adapter.json` follows once every
-save rank's copy is complete. Every checkpoint save, whatever the run, first removes a marker
-already in its step's directory (a resumed run saving a step it saved before), so a save that stops
-before its own adapter lands is unmarked rather than vouching for the abandoned run's adapter.
+save rank's copy is complete. Every checkpoint save first clears its step's directory of an earlier
+save's markers ([Interrupted saves](#interrupted-saves)), so a save that stops before its own adapter
+lands is unmarked rather than vouching for the abandoned run's adapter.
 
 The adapter sits in a subdirectory because an `adapter_config.json` at the root makes
 `from_pretrained` load that adapter on top of the merged weights, which already hold its delta. vLLM,
@@ -577,7 +588,7 @@ transformers logger only — which `setup_logging` lowers to `error` on every no
 truncated, partially uploaded or wrong-architecture directory would therefore train from random
 weights with no exception and no output.
 
-Every toolkit load path — the per-mode loaders, the lazy EP/PP loaders (which bypass `from_pretrained`
+Every toolkit load path — the per-mode loaders, the lazy EP loader (which bypasses `from_pretrained`
 entirely), and the reference/teacher-model loads — routes its absent set through
 `verify_checkpoint_coverage` (`src/models/loading/checkpoint_coverage.py`) and **raises**. A new
 loader gets it by calling `from_pretrained_verified` instead of `from_pretrained`.
@@ -607,8 +618,8 @@ Set `resume_from_checkpoint: true` in YAML (or on the CLI) and re-run the same c
 torchrun --nproc_per_node=8 scripts/training/sft.py config.yaml --resume_from_checkpoint=true
 ```
 
-Resume is resolved once in `init_training_script` (`src/training/script_runner.py`). It finds the
-latest checkpoint, broadcasting the path from rank 0, then asks `resolve_resume_weights_source()`
+Resume is resolved once in `init_training_script` (`src/training/script_runner.py`). It picks the
+checkpoint ([Checkpoint detection](#checkpoint-detection)), then asks `resolve_resume_weights_source()`
 whether to repoint the weights source.
 
 It repoints when `needs_ep_wrappers`, `is_cp_mode` or `is_tp_mode` holds — with the default
@@ -618,11 +629,16 @@ It repoints when `needs_ep_wrappers`, `is_cp_mode` or `is_tp_mode` holds — wit
 checkpoint keeps it too — adapter-only, or merge-on-save through its marker — and the loader restores
 the adapter onto the base ([Merge-on-save checkpoints](#merge-on-save-checkpoints)).
 
-The FSDP2 loader detects a model constructed from the checkpoint and skips the redundant
-full-state-dict re-read.
+Every whole-weight read into an already-built model (Path A, and every best-model load) first maps the
+checkpoint onto the live names through `ModuleLayoutView` (`src/checkpoint/format.py`). It replays the
+conversions the save reverted, so a per-expert checkpoint of a family transformers holds fused lands in
+the fused experts instead of leaving them at their construction values. The FSDP2 and TP loaders skip
+the read for a model constructed from the checkpoint.
 
 `model_config` is not mutated, so a frozen reference/teacher model and the preprocessed-dataset
-compatibility check keep using the base path. `trainer.train()` then reads `global_step` / `epoch`
+compatibility check keep using the base path. A policy built from the checkpoint keeps the base as
+its config's `_name_or_path` too (`load_script_model`), so the model card a resumed run writes names
+the same `base_model` as an uninterrupted run's. `trainer.train()` then reads `global_step` / `epoch`
 from `trainer_state.json`, computes batches to skip, and restores optimizer and LR scheduler.
 
 WandB does **not** auto-continue the same run — export `WANDB_RUN_ID` (see [Multi-node](#multi-node)).
@@ -631,11 +647,12 @@ WandB does **not** auto-continue the same run — export `WANDB_RUN_ID` (see [Mu
 
 | Mode | Path | Weight loading | Optimizer | Notes |
 |------|------|----------------|-----------|-------|
-| **FSDP2** (standard DP) | A at `use_grouped_gemm: false`, else B | Path A: `load_full_state_dict()` → `set_model_state_dict(broadcast_from_rank0)` into DTensor params. Path B: the weights are already in the model from construction and the loader skips the re-read | Per-rank FSDP2 shards | Exact resume, same world size |
-| **TP** | B | Weights load at construction and `_load_tp` skips the re-read. Where it does read (a best-model reload, or a model built from elsewhere), each rank streams the checkpoint's full tensors and `distribute_tensor`s them into its own DTensor placements; TP+DP instead raises for a model not constructed from the checkpoint | Per-rank shards | Exact resume, same world size |
+| **FSDP2** (standard DP) | A at `use_grouped_gemm: false`, else B | Path A: `load_full_state_dict()` → `ModuleLayoutView` → `set_model_state_dict(broadcast_from_rank0)` into DTensor params. Path B: the weights are already in the model from construction and the loader skips the re-read | Per-rank FSDP2 shards | Exact resume, same world size |
+| **Single process / DDP** | A at `use_grouped_gemm: false`, else B | Path A: each rank streams the whole weights into its own copy through `ModuleLayoutView` (`_load_streamed`, the TP loader). Accelerate-managed FSDP and a sentence-transformers pipeline keep the base Trainer's own loader | The base Trainer's `optimizer.pt` | Exact resume |
+| **TP** | B | Weights load at construction and `_load_streamed` skips the re-read. Where it does read (a best-model reload, or a model built from elsewhere), each rank streams the checkpoint's full tensors and `distribute_tensor`s them into its own DTensor placements; TP+DP instead raises for a model not constructed from the checkpoint | Per-rank shards | Exact resume, same world size |
 | **CP** | B | Skipped — weights via `load_distributed_model()` | Per-rank shards (matching fingerprint) | Checkpoint has HF keys, model has CP wrapper keys |
 | **EP / ETP / EP+CP / EP+TP** | B | Skipped in the loader — the trained weights load at construction because the model source points at the checkpoint | Per-rank shards (matching fingerprint) | Checkpoint holds the hub-spelled full expert tensors, not the renamed rank-local slices the EP model registers |
-| **PP / PP+EP** ([not yet available](../parallelism/pipeline-parallelism.md)) | stage-aware | Each rank reads only its stage's global-named tensors from the merged index and remaps them through `global_parameter_name`; a missing stage-retained tensor raises. On per-node output storage the locally-absent cross-stage tensors are skipped — the stage build drops them anyway | Per-rank shards, gated on the fingerprint **and** `pp_stage_partition` | Any topology drift **raises** (no warm-restart fallback). PP+EP expert weights load at construction |
+| **PP / PP+EP** ([not yet available](../parallelism/pipeline-parallelism.md)) | B at the default `use_grouped_gemm`, else stage-aware A | Path B: the stage loader read the trained tensors at construction and the reload is skipped. Path A (and a best-model load): each rank reads only its stage's global-named tensors from the merged index and remaps them through `global_parameter_name`; a missing stage-retained tensor raises, and so does a stage shard absent from this node's copy, naming the per-node placement. On per-node output storage the locally-absent cross-stage tensors are skipped — the stage build drops them anyway | Per-rank shards, gated on the fingerprint **and** `pp_stage_partition` | Any topology drift **raises** (no warm-restart fallback). PP+EP expert weights load at construction only, so a stage not built from the resume directory raises, on every rank at once |
 
 Path B modes transform the model at init (EP fuses experts into 3D tensors; CP wraps attention), so
 the gathered HF-format checkpoint cannot load back through the Trainer. Instead the model source is
@@ -649,34 +666,14 @@ only after the run had already restarted.
 A full-finetune Path-B resume from a checkpoint that is neither directly loadable nor an adapter (an
 unmerged per-rank save) **raises** rather than silently continuing from base weights.
 
-**PP+EP** checks that same construction identity explicitly. A stage's fused expert tensors load
-only at construction and are absent from its key map, so a stage built from anything but the resume
-directory would restore its experts from base weights.
-
-The verdict is **world-joined**: each rank votes, the votes are gathered in one collective over the
-global group, and the raise fires on all ranks or none. Each rank's reason string travels with its
-vote, so the joined message names the offending path.
-
-Both inputs are rank-local — a split can leave a stage holding no MoE layer at all, and the path
-comparison resolves on that node's filesystem. Raising locally would drop the offended ranks while
-their peers walked into the next collective and hung.
-
-Because the Path-B base is rebuilt fresh, two classes of trained state are restored separately by
-`CheckpointLoader`:
-
-- **Adapters** (`restore_adapters`, `src/distributed/checkpoint/peft.py`) — native EP expert adapters
-  (keyed `<layer>.experts.<attr>.lora_*`) sliced per rank, PEFT attention adapters via
-  `set_peft_model_state_dict`, read from the checkpoint root or a merged checkpoint's
-  `resume_adapter/`.
-
-    That call warns on partial matches and raises if *every* saved key is unmatched, so a silent
-    zero-init resume cannot pass quietly. Expert adapters that **no** EP layer can receive raise
-    too, and so does a LoRA scaling that differs from the one the saved `adapter_config.json`
-    records ([PEFT](../optimization/peft.md#checkpoint-saving)).
-
-- **Wrapper-added params** (`_restore_extra_trained_params`) — anything the unwrapped model declares
-  in `_extra_checkpoint_param_names`, read tensor-by-name
-  and broadcast into the live FSDP2-sharded params. No-op when the model declares none.
+Because the Path-B base is rebuilt fresh, `CheckpointLoader` restores adapters separately
+(`restore_adapters`, `src/distributed/checkpoint/peft.py`): native EP expert adapters (keyed
+`<layer>.experts.<attr>.lora_*`) sliced per rank, PEFT attention adapters via
+`set_peft_model_state_dict`, read from the checkpoint root or a merged checkpoint's
+`resume_adapter/`. That call warns on partial matches and raises if *every* saved key is unmatched,
+so a silent zero-init resume cannot pass quietly. Expert adapters that **no** EP layer can receive
+raise too, and so does a LoRA scaling that differs from the one the saved `adapter_config.json`
+records ([PEFT](../optimization/peft.md#checkpoint-saving)).
 
 > [!NOTE]
 > **Router balancing bias persists across resume — and exports where a slot exists**
@@ -724,11 +721,29 @@ read failure raises (a torn checkpoint on a non-shared FS).
 ### Checkpoint detection
 
 `detect_resume_checkpoint()` (`src/training/environment.py`) handles three cases: `true`
-auto-detects the last `checkpoint-N` in `output_dir` via HF's `get_last_checkpoint()`; an explicit
-`/path/to/checkpoint-N` uses that path and raises if it does not exist; unset / `false` returns `None`.
-When auto-detection finds no checkpoint the run is fresh, so the non-empty-`output_dir` guard re-runs
-— set `overwrite_output_dir: true` to bypass it. Detection errors are decided on rank 0 and broadcast
-so every rank raises together.
+auto-detects the newest `checkpoint-N` in `output_dir` whose `trainer_state.json` exists on every
+rank, passing over newer step directories a save never completed ([Interrupted
+saves](#interrupted-saves)) and raising when only incomplete ones exist; an explicit
+`/path/to/checkpoint-N` uses that path and raises if it does not exist or lacks its trainer state on
+any rank; unset / `false` returns `None`. When auto-detection finds no checkpoint the run is fresh, so
+the non-empty-`output_dir` guard re-runs — set `overwrite_output_dir: true` to bypass it.
+
+The pick is `resolve_resume_checkpoint()` (`src/distributed/checkpoint/coordination.py`), which
+`trainer.train(resume_from_checkpoint=True)` calls too, so a Python-API resume takes the same
+checkpoint as a scripted one; the base Trainer would take the highest-numbered directory, complete or
+not. Every FS-aware save rank lists its own `output_dir`, and rank 0 merges the lists and broadcasts
+them with any listing error: a step directory one node holds and another lacks is a candidate, and
+incomplete. Each candidate's completeness is one all-reduce, so every rank picks, or raises over, the
+same checkpoint.
+
+A resume then moves every incomplete step directory into `output_dir/_incomplete_checkpoints/` on each
+save rank holding a copy, data kept (a name already there gets a `.1`, `.2` suffix). Left in place,
+a torn directory numbered above the resumed run's next saves would take a rotation slot: rotation
+orders by mtime, but falls back to step order on a mount whose mtimes it distrusts (fuse/S3 mounts
+report one value for all), where that directory is the newest — the one it protects — and
+`save_total_limit: 1` deletes the complete checkpoints instead. Nothing moves when the resume raises.
+The `_` prefix keeps the directory out of the Trainer's Hub push and of export copies; it does count
+as content for a later fresh run's `output_dir` guard.
 
 ### Configuration
 
@@ -743,9 +758,10 @@ save_only_model: false              # false: per-rank optimizer shards + schedul
                                     # true:  weights + trainer_state + scheduler + balancing biases
                                     #        + precomputed reference log-probs
                                     #        (warm restart, any world size)
-save_on_each_node: false            # multi-node; auto-forced true on a non-shared OUTPUT filesystem
-allow_optimizer_warm_restart: false # true: a failed shard restore (e.g. CUDA OOM) warm-restarts
-                                    #       instead of raising on every rank
+save_on_each_node: false            # follows the OUTPUT filesystem: forced true when non-shared,
+                                    #   false when shared across nodes
+allow_optimizer_warm_restart: false # true: a failed shard restore (e.g. CUDA OOM) or an interrupted
+                                    #       save's optimizer state warm-restarts instead of raising
 
 save_sharded_ep: false              # EP per-rank sharded save (needs merge_ep_shards.py)
 ```
@@ -774,7 +790,8 @@ and restores them with `set_optimizer_state_dict` gated on the `optimizer_meta.p
 **Multi-group EP deduplicates the replicated half.** The EP groups are DP replicas. The
 FSDP-ignored params (the whole EP module — experts, router, shared expert) hold identical bytes on
 every rank of an `expert_replica_group`, and so do their moments: the gradients are averaged over
-that group and `AdamWBF16` keys its stochastic rounding by step and parameter position.
+that group and `AdamWBF16` keys its stochastic rounding by step and parameter name, which the
+replicas share.
 
 Only the group's **lowest rank** keeps them in its shard; its peers strip them and read them back
 from that rank's shard on resume. At Qwen3.5-397B-A17B on 512 GPUs at `ep64` that is 8 copies
@@ -806,7 +823,9 @@ node's `max_concurrent_loading` throttle. Unthrottled, a node peaks at `local_wo
 them at `ep8` on 512 GPUs).
 
 Every rank enters the throttle, whether or not it has a merge to do: it is a store phase over the
-node's local ranks.
+node's local ranks, joined over the store like the model load's
+([Multi-Node → Model loading](../parallelism/multi-node.md#model-loading)). A failed read itself is
+returned to the restore verdict below.
 
 Before the shard save's `get_optimizer_state_dict` — and before the FSDP2 weight load's
 `set_model_state_dict` — every FSDP2 module is resharded (`reshard_fsdp2_modules`,
@@ -833,6 +852,16 @@ restart.
 
 Shards present on only a subset under a matching fingerprint are a torn checkpoint and raise.
 
+Two more shapes are an interrupted save rather than a topology change, and raise the same way the
+restore failures below do (`allow_optimizer_warm_restart` takes the warm restart instead):
+
+- shards whose `optimizer_meta.pt` is missing or unreadable. The meta is written, staged and
+  renamed, only after every rank's shard, so its absence is a save killed between the two (or a meta
+  deleted alone). Checked ahead of the rank-count gate, so it never reads as a world-size change.
+- the base Trainer's `optimizer.pt` with no shards beside it. The mixin deletes that rank-0 view only
+  once its per-rank replacement is on disk, so it marks a save killed before its shards — or a
+  checkpoint written by a non-sharded run, which cannot restore into per-rank shards either.
+
 Shards whose `optimizer_meta.pt` carries **no fingerprint at all** are refused outright in every
 mode, with no warm-restart fallback. Nothing records the sharding that produced those raw local
 layouts, and the rank-count gate alone admits a permuted restore at the same world size. Deleting the
@@ -842,10 +871,6 @@ That verdict is consensused before any rank branches on it. On a non-shared file
 `optimizer_meta.pt` is written once per node, so a heterogeneous meta set (one node holding a
 fingerprint-less one) would otherwise send some ranks into the raise and the rest into a collective
 those ranks never reach.
-
-Under PP every one of these gates **raises** instead. The shards are keyed by stage-local FQNs, so
-any drift maps moments onto the wrong layers — including a `pp_stage_partition` differing from the
-live split.
 
 In every mode, a trainable param the saved shard neither holds state for **nor lists in its
 `param_groups`** raises. That is the FQN drift a rename or a different layer split produces. A param
@@ -865,8 +890,8 @@ or at applying it (a CUDA OOM inside `set_optimizer_state_dict`, a restored mome
 parameter). The message names the failing ranks and the first one's error; each failing rank's log
 carries its own. Fix the cause and resume again, or set `allow_optimizer_warm_restart: true` to take
 the warm restart: every rank drops its optimizer state, rank 0 warns with the same summary, and
-weights, step and LR schedule resume. Under PP these raise regardless, as every gate does. The flag
-covers these failures only; the gates above keep their own outcomes.
+weights, step and LR schedule resume. The flag
+covers these failures and the interrupted saves above only; the other gates keep their own outcomes.
 
 Checkpoint **rotation** (`save_total_limit`) is deferred past the toolkit's sidecars. The base
 Trainer rotates as the last step of its own save, which would delete the oldest checkpoint before
@@ -888,6 +913,41 @@ unevenly-sharded DTensors). It would otherwise write an optimizer-less checkpoin
 and, under `save_total_limit: 1`, rotate the last good one away at exit code 0.
 `save_only_model: true` is the explicit opt-in for weights-only checkpoints.
 
+#### Interrupted saves
+
+`trainer_state.json` is what resume detection takes a checkpoint by, so it is published last. The
+base Trainer writes it before the toolkit's sidecars and optimizer shards, so `_save_checkpoint` has it
+written under `.trainer_state.json.uncommitted` from the start and renames it to `trainer_state.json`,
+synced with its directory, only once every other file is on disk and before rotation runs. Each
+FS-aware save rank does this for its own copy, and a failure raises on every rank — a save rank with
+no uncommitted copy to rename included (the base save's writers, `args.should_save`, are not the output
+filesystem's save ranks), since rotation would otherwise remove the last checkpoint a resume takes for
+one it passes over. The base save's
+checkpoint push to the Hub (`push_to_hub`, per `hub_strategy`), a background upload of the directory
+as it stands, starts only after that commit, so the Hub copy is the complete checkpoint. On a
+per-node output filesystem it is global rank 0's node's copy, holding that node's ranks' optimizer
+shards only.
+
+What the push uploads follows `hub_strategy` (`Trainer._push_from_checkpoint`). Every strategy but
+`end` uploads the top level of `output_dir` at each save, minus `_*` and `checkpoint-*` entries: the
+model files copied there plus whatever else the run writes there, `log/run.log` and an online or
+async GRPO run's `completions/` parquet (prompts included) among them. `checkpoint` and
+`all_checkpoints` also upload
+the checkpoint directory itself, training state included (optimizer shards, RNG state,
+`trainer_state.json` and the sidecars, `prefetch_pending-*.pt` among them). `end` uploads nothing:
+it pushes only from a final `save_model` or `push_to_hub` call, and no training script makes one.
+
+A resumed run that saves a step it saved before writes into that step's existing directory, in place.
+Every save therefore first removes that directory's completion markers — `trainer_state.json`, its
+uncommitted spelling, `optimizer_meta.pt` and `resume_adapter.json` — so the abandoned save's copies
+cannot vouch for the mix of its files and this save's.
+
+A save stopped mid-weights, mid-sidecars or mid-shards (a preemption, a full disk) thus leaves a step
+directory with no `trainer_state.json`. `resume_from_checkpoint: true` passes over it and resumes the
+newest checkpoint whose trainer state every rank holds — the previous one, which rotation never
+removes before its successor is complete — and moves the stopped one out of rotation's sight with a
+warning ([Checkpoint detection](#checkpoint-detection)). An explicit path to it raises.
+
 > [!NOTE]
 > **accelerate launch**
 >
@@ -897,10 +957,12 @@ and, under `save_total_limit: 1`, rotate the last good one away at exit code 0.
 
 ## Multi-node
 
-The save rank follows the output filesystem ([above](#checkpoints-and-training-resume)). On a shared
-one `detect_resume_checkpoint()` broadcasts the path from rank 0. On a non-shared one the trainer
-auto-forces `save_on_each_node=true`, all nodes must hold equivalent checkpoint dirs at the same
-path, and each node's local rank 0 creates the directory before a barrier.
+The save rank follows the output filesystem ([above](#checkpoints-and-training-resume)), and so does
+resume detection's listing ([Checkpoint detection](#checkpoint-detection)). On a shared filesystem,
+across nodes the trainer forces `save_on_each_node` off, since every node's local rank 0 would
+otherwise write and rotate the same files. On a non-shared one it forces `save_on_each_node=true`, all
+nodes must hold equivalent checkpoint dirs at the same path, and each node's local rank 0 creates the
+directory before a barrier.
 
 **WandB run resumption:** the auto run ID is stamped per launch, so a resumed launch starts a new run;
 export `WANDB_RUN_ID` (and `WANDB_RESUME=allow`) to continue
@@ -926,11 +988,12 @@ checkpoint-specific.
 
 - **`missing keys: ['lm_head.weight']` on resume:** expected for `tie_word_embeddings=true` models
   (Qwen3); `lm_head.weight` shares storage with the embedding. Harmless.
-- **`resume_from_checkpoint=True` but starts at step 0:** check `output_dir` has a `checkpoint-N` dir
-  containing `trainer_state.json` with a valid `global_step`.
-- **Checkpoint not found on non-shared FS:** set `DIST_OUTPUT_SHARED_FILESYSTEM=0` (or the
-  `DIST_SHARED_FILESYSTEM=0` umbrella) so the trainer auto-forces `save_on_each_node=true`; otherwise
-  only rank 0 saves.
+- **`resume_from_checkpoint: true` but starts at step 0:** `output_dir` holds no `checkpoint-N`
+  directory, so the run warns `no checkpoint found` and starts fresh; check the path. A directory
+  without its `trainer_state.json` raises instead ([Interrupted saves](#interrupted-saves)).
+- **Multi-node on per-node storage:** set `DIST_OUTPUT_SHARED_FILESYSTEM=0` (or the
+  `DIST_SHARED_FILESYSTEM=0` umbrella) so every node writes its own copy; the startup probe raises
+  on a declaration the filesystem contradicts ([Troubleshooting](troubleshooting.md#symptom--cause--fix)).
 - **TP resume shape mismatch or hang:** the load path needs a device mesh whose `mesh_dim_names`
   include `"tp"`, and all ranks must reach the same checkpoint dir.
 

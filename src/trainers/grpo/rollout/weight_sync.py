@@ -25,14 +25,9 @@ from typing import Any
 
 import torch
 from accelerate.utils import is_peft_model
-from transformers.core_model_loading import (
-    WeightConverter,
-    WeightRenaming,
-    rename_source_key,
-    revert_weight_conversion,
-)
+from transformers.core_model_loading import rename_source_key
 
-from src.checkpoint.format import revert_conversions_for
+from src.checkpoint.format import revert_conversions
 from src.diagnostics.profiling import log_cuda_memory
 from src.distributed.expert_parallel.base_layer import EPMoELayerBase
 from src.distributed.expert_parallel.expert_weights import (
@@ -41,6 +36,7 @@ from src.distributed.expert_parallel.expert_weights import (
     is_expert_weight_attr,
     to_hub_layer_key,
 )
+from src.distributed.expert_parallel.hub_conversion import gathered_export_conversions, reversed_export_transforms
 from src.distributed.fsdp import reshard_fsdp2_modules
 from src.distributed.nccl.clients.base import WEIGHT_SYNC_CHUNK_BYTES, payload_bytes
 from src.distributed.nccl.registry import resolve_weight_sync_client
@@ -95,9 +91,9 @@ def validate_weight_sync_support(model: torch.nn.Module, backend: str) -> None:
     - **GptOss with trainable sinks** (``train_sinks``): an SFT-only policy. The frozen live sinks of
       ``reset_sinks: false`` are on-policy by construction; a sink that moves every step has no
       validated end-to-end sync into either rollout engine.
-    - **Families whose layer class declares ``_supports_weight_sync = False``**: the names this sync
-      forwards go straight into the engine's ``model.load_weights`` and cannot land on any engine;
-      each class's ``_WEIGHT_SYNC_REFUSAL_REASON`` states the family's gap. Enforced through live EP
+    - **Families whose layer class declares ``_supports_weight_sync = False``**: no end-to-end sync
+      into either engine has been validated; each class's ``_WEIGHT_SYNC_REFUSAL_REASON`` states the
+      family's gap. Enforced through live EP
       instances when present, else through the registry off ``config.model_type``, since a
       wrapper-less run carries the same contract.
     - **An EP family with no live EP wrapper** (``ep_size: 1`` with ``use_grouped_gemm: false``): the
@@ -154,8 +150,8 @@ def validate_weight_sync_support(model: torch.nn.Module, backend: str) -> None:
     for where, cls in families:
         if not cls._supports_weight_sync:
             raise ValueError(
-                f"{cls.__name__} (at {where!r}) does not support weight sync: the sync forwards "
-                f"trainer parameter names straight into the engine's model.load_weights, but "
+                f"{cls.__name__} (at {where!r}) does not support weight sync: the sync feeds the "
+                f"engine's model.load_weights directly, but "
                 f"{cls._WEIGHT_SYNC_REFUSAL_REASON}. Online/environmental GRPO with weight sync "
                 f"is unsupported for this model — see {cls.__name__}._supports_weight_sync."
             )
@@ -266,10 +262,12 @@ class _HubForwarder:
 
     Live-tree names go through three rewrites in order: :attr:`~EPMoELayerBase._EXPORT_KEY_RENAMES`
     inside EP layers (Laguna); the PEFT base-name normalization (adapter-only tensors are dropped,
-    their delta already folded); and, for a family declaring ``_EXPORTS_HUB_NAMESPACE`` (Step-3.7),
-    transformers' save-side conversion revert. Renames are one-to-one and stream; a tensor a reverse
-    ``WeightConverter`` claims is held until :meth:`flush`, since a many-to-one revert needs all of
-    its sources together while the engine loads one tensor at a time.
+    their delta already folded); and the revert the gathered save applies
+    (:func:`~src.distributed.expert_parallel.hub_conversion.gathered_export_conversions`: what the load
+    converted outside the per-expert merges, such as Step-3.7's namespace or a SigLIP tower's
+    ``vision_model`` level). Renames are one-to-one and stream; a tensor a reverse ``WeightConverter``
+    claims is held until :meth:`flush`, since a many-to-one revert needs all of its sources together
+    while the engine loads one tensor at a time.
 
     Every forward runs under the caller's ``guard``: this object is the only part of the sync that can
     fail on one rank alone (a device OOM staging the snapshot, an HTTP/NCCL error from the client, a
@@ -288,19 +286,13 @@ class _HubForwarder:
         self._guard = guard
         self._ep_layers = ep_layers
         self._peft_prefix = peft_prefix
-        self._model: torch.nn.Module | None = None
-        self._renamings: list[WeightRenaming] = []
-        self._converters: list[WeightConverter] = []
         self._held: dict[str, torch.Tensor] = {}
         self._held_bytes = 0
-        if not any(cls._EXPORTS_HUB_NAMESPACE for _where, cls in _sync_contract_classes(model)):
-            return
+        # The list the gathered save inverts, so the streamed renames and the held converts write
+        # what a checkpoint of the same model carries.
         self._model = base_transformers_model(model)
-        # The resolution every save-side revert uses, so the streamed renames and the held converts
-        # come from the same reversed list the gathered save inverts.
-        conversions = revert_conversions_for(self._model)
-        for transform in (c.reverse_transform() for c in conversions[::-1]):
-            (self._renamings if isinstance(transform, WeightRenaming) else self._converters).append(transform)
+        self._conversions = gathered_export_conversions(self._model)
+        self._renamings, self._converters = reversed_export_transforms(self._conversions)
 
     def send(self, name: str, tensor: torch.Tensor) -> None:
         """Forward one live-tree tensor, deferring a failure to the sync's rank-uniform reject."""
@@ -317,7 +309,7 @@ class _HubForwarder:
             name = normalize_peft_param_name(name, self._peft_prefix)
             if name is None:
                 return
-        if self._model is None:
+        if not self._conversions:
             self._client.update_named_param(name, tensor)
             return
         renamed, claimed_by = rename_source_key(name, self._renamings, self._converters, reverse=True)
@@ -341,7 +333,7 @@ class _HubForwarder:
         if not self._held:
             return
         held, self._held, self._held_bytes = self._held, {}, 0
-        for hub_name, hub_tensor in revert_weight_conversion(self._model, held).items():
+        for hub_name, hub_tensor in revert_conversions(self._model, held, self._conversions).items():
             self._client.update_named_param(hub_name, hub_tensor)
 
 
@@ -439,21 +431,35 @@ def _flush_and_close(sender: Any) -> None:
         raise
 
 
-def sync_weights_to_client(model: torch.nn.Module, client: Any | None, is_main: bool, is_tp_main: bool) -> bool:
-    """Gather the policy and push it to ``client``, then flush the buffered broadcast. Returns is-PEFT.
+def _refuse_missing_client() -> None:
+    raise RuntimeError(
+        "The weight-sync push reached its forwarding rank with no engine client: the gather would run and "
+        "send nothing, leaving the engine serving the old weights. The client must be formed before a push "
+        "(the environmental trainer's _form_weight_sync_group; online GRPO's TRL vllm_client)."
+    )
+
+
+def sync_weights_to_client(model: torch.nn.Module, client: Any | None, is_main: bool, is_tp_main: bool) -> None:
+    """Gather the policy and push it to ``client``, then flush the buffered broadcast.
 
     Runs on **every** rank (the gathers are collective); only the forwarding rank (global-main, TP-rank 0
-    under TP) sends.
+    under TP) sends, and it must hold a ``client``: without one the push would gather the whole policy
+    and send none of it, leaving the engine on its old weights. That refusal is raised on every rank at
+    the flush's verdict, after the gather the peers are in, never on the forwarding rank alone.
     """
     # One forwarding-rank predicate for the push and the flush: two spellings that disagree would
     # leave the buffering rank never closing the update it opened.
-    sender = client if (is_main and is_tp_main) else None
+    forwarding = is_main and is_tp_main
+    sender = client if forwarding else None
+    flush = DeferredRankFailure("weight-sync flush to the rollout engine")
+    if forwarding and client is None:
+        flush.run(_refuse_missing_client)
     # The engine fuses a co-load group only where the pushed model declares every member, so the
     # client's groups are scoped to this module tree before the first chunk.
     if sender is not None:
         sender.scope_co_load_groups(name for name, _ in model.named_modules())
     try:
-        peft = gather_and_send_weights(model, sender)
+        gather_and_send_weights(model, sender)
     except BaseException:
         # The push streams chunks into an update it opened mid-gather, so a raise past this point
         # would leave the engine quiesced behind an open reload, refusing every later sync and
@@ -464,20 +470,17 @@ def sync_weights_to_client(model: torch.nn.Module, client: Any | None, is_main: 
     # The buffered broadcast lands after every gather, so a failure here blocks no peer inside a
     # collective, but a peer that continues past it drives its next rollout round against an engine
     # left paused mid-update. Same uniform verdict as the push, on the flush's own rank-local work.
-    flush = DeferredRankFailure("weight-sync flush to the rollout engine")
     if sender is not None:
         flush.run(partial(_flush_and_close, sender))
     flush.reject()
-    return peft
 
 
-def gather_and_send_weights(model: torch.nn.Module, sender: Any | None) -> bool:
+def gather_and_send_weights(model: torch.nn.Module, sender: Any | None) -> None:
     """Gather EP + dense/TP weights from ``model`` and forward to the engine via ``sender``.
 
     Runs on **every** rank (the gathers are collective); ``sender`` is the engine client on the
     forwarding rank and ``None`` elsewhere. PEFT/LoRA is folded into each base weight out of place and
     forwarded under base-model names. The caller flushes afterwards with ``sender.reset_prefix_cache()``.
-    Returns whether ``model`` is PEFT.
     """
     # FSDP2 leaves a forward's transient unsharded params registered while the optimizer steps the
     # shards, so the params a mid-training sync finds registered predate the last update: every
@@ -508,11 +511,10 @@ def gather_and_send_weights(model: torch.nn.Module, sender: Any | None) -> bool:
     # Collective on every rank. Raises on all of them with the forwarding rank's cause; the sync
     # writes none of the trainer's own weights, so a failed one leaves them untouched.
     guard.reject()
-    return peft
 
 
-def sync_trainer_weights(trainer, client: Any | None) -> bool:
-    """Gather a distributed trainer's policy and push it to ``client``. Returns is-PEFT.
+def sync_trainer_weights(trainer, client: Any | None) -> None:
+    """Gather a distributed trainer's policy and push it to ``client``.
 
     Every rank must call this (all ranks join the gathers; only global-main forwards). ``client`` is
     the caller's own handle, the only difference between the online and env sync paths.
@@ -531,7 +533,7 @@ def sync_trainer_weights(trainer, client: Any | None) -> bool:
     # against a mid-update engine. Fenced because the push is main-rank-only, so a raise must not skip
     # the barrier its peers block in.
     with barrier_on_exit():
-        peft = sync_weights_to_client(model, client, is_main, is_tp_main)
+        sync_weights_to_client(model, client, is_main, is_tp_main)
 
     if log_memory:
         log_cuda_memory("weight-sync post")
@@ -539,6 +541,5 @@ def sync_trainer_weights(trainer, client: Any | None) -> bool:
     logger.debug(
         f"Synced distributed weights to the rollout engine at step {trainer.state.global_step} "
         f"(ep={config.is_ep_mode}, tp={config.is_tp_mode}, "
-        f"expert_tp={config.is_expert_tp_mode}, peft={peft})"
+        f"expert_tp={config.is_expert_tp_mode}, peft={is_peft_model(model)})"
     )
-    return peft

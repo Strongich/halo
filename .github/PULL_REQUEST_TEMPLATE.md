@@ -1,4 +1,4 @@
-<!-- Heads up: PRs without an accepted issue + maintainer approval are auto-closed — to keep review
+<!-- PRs without an accepted issue + maintainer approval are auto-closed — to keep review
      focused and AI-slop out, not to reject you. Before opening, both should be true:
        1. an accepted issue exists for this work, and
        2. a maintainer commented `/approve @your-handle` on it (you're on .github/APPROVED_CONTRIBUTORS).
@@ -39,7 +39,7 @@
 <!-- Helpful for perf numbers and reproduction. Skip for docs-only / pure-refactor PRs. -->
 
 - GPU(s): <!-- e.g. 8x B300 / 8x H200 -->
-- Image tag: <!-- halo:blackwell / hopper, or public.ecr.aws/whitecircle/halo:blackwell-1.0.0 -->
+- Image tag: <!-- halo:blackwell / hopper, or public.ecr.aws/whitecircle/halo:blackwell-1.1.0 -->
 - Parallelism / model: <!-- FSDP / EP=? / CP=? / TP=? / ETP=?  +  HF id + config -->
 
 ## AI assistance

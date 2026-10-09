@@ -58,7 +58,7 @@ def _stub_module(monkeypatch, module, *, rows, existing, request_impl):
 
     async def fake_requests(**kwargs):
         calls.append(kwargs)
-        return request_impl(kwargs["user_messages"])
+        return request_impl(kwargs["messages"])
 
     monkeypatch.setattr(module, "load_prompts_with_resume", lambda args: (rows, existing))
     monkeypatch.setattr(module, "create_openai_client", lambda **kwargs: object())
@@ -168,7 +168,7 @@ def test_tool_call_only_first_turn_is_replayed_with_a_null_content(monkeypatch):
     asyncio.run(batched.main())
 
     assert len(calls) == 2, "the follow-up pass is the request that replays the first turn"
-    sent = next(msg for msg in calls[1]["user_messages"][0] if msg["role"] == "assistant")
+    sent = next(msg for msg in calls[1]["messages"][0] if msg["role"] == "assistant")
     assert sent["content"] is None, 'str(None) sends the literal text "None" as the assistant\'s answer'
     assert sent["tool_calls"] == [_TOOL_CALL], "the call the turn actually carried must survive the replay"
 
@@ -210,6 +210,15 @@ def test_a_resume_over_another_record_layout_keeps_the_fresh_batch_columns(monke
     fresh = saved[len(existing)]
     assert fresh["conversation"][-1]["content"] == "fresh-0", "the fresh batch's own columns must survive the merge"
     assert fresh["chosen"] is None, "a column only the resumed rows carry is filled, not dropped"
+
+
+def test_an_empty_follow_up_is_no_follow_up():
+    """Both generation paths read the follow-up column through one predicate: an empty list (or a null)
+    sends no second request, which would follow the answer with a second assistant turn."""
+    turn = [{"role": "user", "content": "And why?"}]
+    assert _common.follow_up_messages({"follow_up_prompt": turn}, "follow_up_prompt") == turn
+    for row in ({"follow_up_prompt": []}, {"follow_up_prompt": None}, {}):
+        assert _common.follow_up_messages(row, "follow_up_prompt") is None
 
 
 if __name__ == "__main__":

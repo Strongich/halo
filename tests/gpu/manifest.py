@@ -147,6 +147,7 @@ _PRECOMPUTE_CORE_ROWS = (
     "--trainer dpo --family qwen3_moe --mode ep1",
     "--trainer dpo --family qwen3_moe --mode etp2",
     "--trainer dpo --family qwen3_moe --mode tp2",
+    "--trainer dpo --family qwen3_moe --mode ep2tp2",
     "--trainer dpo --family dense --mode dp2",
     "--trainer dpo --family dense --mode tp2",
     "--trainer kto --family dense --mode tp2",
@@ -155,10 +156,19 @@ _PRECOMPUTE_CORE_ROWS = (
 )
 # The core rows cover Qwen3-MoE; the family sweep runs every other family.
 _PRECOMPUTE_SWEEP_FAMILIES = tuple(family for family in _TINY_MOE_FAMILIES if family != "qwen3_moe")
+# The families whose attention the selective-TP path shards; tests/cpu/conventions/test_tiny_family_roster.py
+# holds this to src/distributed/tensor_parallel/module_types.py.
+_TP_FAMILIES = ("cohere2_moe", "glm4_moe_lite", "gpt_oss", "lfm2_moe", "mistral4", "qwen3_5_moe_text", "qwen3_moe")
 _PRECOMPUTE_FAMILY_ROWS = tuple(
     f"--trainer {trainer} --family {family}{mode}"
     for family in _PRECOMPUTE_SWEEP_FAMILIES
-    for trainer, mode in (("dpo", ""), ("dpo", " --mode ep1"), ("kto", ""))
+    for trainer, mode in (
+        ("dpo", ""),
+        ("dpo", " --mode ep1"),
+        ("kto", ""),
+        ("dpo", " --mode etp2"),
+        *((("dpo", " --mode tp2"), ("dpo", " --mode ep2tp2")) if family in _TP_FAMILIES else ()),
+    )
 )
 # GPT-OSS on every two-rank layout of the full_determinism backward replay, Qwen3-MoE on ep2; the sweep
 # runs ep2 on every other family. tests/cpu/conventions/test_tiny_family_roster.py holds both to the
@@ -394,9 +404,19 @@ MANIFEST: dict[str, TestSpec] = {
         nproc=2, markers=("gpu", "full", "2gpu", "ep", "moe"), timeout=1500
     ),
     "parallelism/ep/test_ep_sharded_merge_roundtrip.py": TestSpec(
-        # Hermetic tiny models, no DeepEP dispatch: merged-from-sharded == gathered for six families.
+        # Hermetic tiny models, no DeepEP dispatch: merged-from-sharded == gathered for six families,
+        # and the sharded save refused for three whose names the merge cannot respell.
         nproc=2,
-        markers=("gpu", "core", "2gpu", "ep", "moe", "gptoss", "qwen3"),
+        markers=(
+            "gpu",
+            "core",
+            "2gpu",
+            "ep",
+            "moe",
+            *_family_markers(
+                ("gpt_oss", "qwen3_moe", "qwen3_5_moe_text", "laguna", "cohere2_moe", "deepseek_v4", "glm5_next")
+            ),
+        ),
         timeout=900,
     ),
     "parallelism/ep/test_routing_replay.py": TestSpec(
@@ -690,7 +710,10 @@ MANIFEST: dict[str, TestSpec] = {
         nproc=8, markers=("gpu", "full", "8gpu", "ep", "moe", "lora", "qwen3"), timeout=1800
     ),
     "trainers/grpo/test_offline_grpo_ep_reference.py": TestSpec(
-        nproc=8, markers=("gpu", "full", "8gpu", "ep", "moe", "qwen3"), timeout=1800
+        nproc=8,
+        markers=("gpu", "full", "8gpu", "ep", "moe", "qwen3"),
+        args_matrix=("--ep-loading lazy", "--ep-loading eager"),
+        timeout=1800,
     ),
     "trainers/grpo/test_offline_grpo_sibling_reference.py": TestSpec(
         nproc=4,
@@ -705,9 +728,9 @@ MANIFEST: dict[str, TestSpec] = {
         markers=("gpu", "core", "2gpu", "tp", "qwen3"),
         timeout=2400,
     ),
-    # One node per leg: each leg holds its trainer-side weight-transfer port for the life of the
-    # process (only close_communicator frees it, which a leg never calls), and the environmental legs
-    # additionally stand up Ray actors.
+    # One node per leg: each leg binds its own trainer-side weight-transfer port. The online legs hold
+    # it until the client's atexit close_communicator; the environmental legs close it when train()
+    # ends and additionally stand up Ray actors.
     "trainers/grpo/test_online_grpo_vllm_e2e.py": TestSpec(
         nproc=1,
         markers=("gpu", "full", "1gpu", "lora", "qwen3", "vllm_server"),
@@ -757,6 +780,7 @@ MANIFEST: dict[str, TestSpec] = {
             "--trainer sdpg --mode lora_fsdp",
             "--trainer online --mode lora_tp2_rejected",
             "--trainer sdpg --mode lora_tp2_rejected",
+            "--trainer online --mode full_fsdp_kl",
             "--trainer online --mode full_tp2 --resume",
             "--trainer sdpg --mode full_tp2 --resume",
             "--trainer online --mode lora_fsdp --resume",
@@ -1119,11 +1143,19 @@ MANIFEST: dict[str, TestSpec] = {
     "trainers/preference/test_kto_fsdp_multi_gpu.py": TestSpec(
         nproc=2, markers=("gpu", "core", "2gpu", "qwen3"), timeout=600
     ),
-    # Every other MoE family: DPO at ep2 and ep1, KTO at ep2.
+    # Every other MoE family: DPO at ep2, ep1 and etp2, plus tp2 and ep2tp2 where its attention has a TP
+    # plan; KTO at ep2.
     "trainers/preference/test_preference_precompute_resume_families.py": TestSpec(
         nproc=2,
-        markers=("gpu", "full", "2gpu", "ep", "moe", *_family_markers(_PRECOMPUTE_SWEEP_FAMILIES)),
+        markers=("gpu", "full", "2gpu", "ep", "etp", "tp", "moe", *_family_markers(_PRECOMPUTE_SWEEP_FAMILIES)),
         args_matrix=_PRECOMPUTE_FAMILY_ROWS,
+        timeout=900,
+    ),
+    # EP+ETP needs an expert group of four: DPO at ep2etp2 on every MoE family.
+    "trainers/preference/test_preference_precompute_resume_ep_etp.py": TestSpec(
+        nproc=4,
+        markers=("gpu", "full", "4gpu", "ep", "etp", "moe", *_family_markers(_TINY_MOE_FAMILIES)),
+        args_matrix=tuple(f"--trainer dpo --family {family} --mode ep2etp2" for family in _TINY_MOE_FAMILIES),
         timeout=900,
     ),
     "trainers/preference/test_pref_ep_expert_lora_reference.py": TestSpec(
@@ -1161,8 +1193,8 @@ MANIFEST: dict[str, TestSpec] = {
     "trainers/sft/test_optimizer_shard_save_after_eval.py": TestSpec(
         nproc=2,
         markers=("gpu", "core", "2gpu", "ep", "moe", "vlm", "qwen3"),
-        # Both modes: fsdp pins the family-agnostic FSDP2 mechanism, ep the reported
-        # composite-VLM + plain-expert + AdamWBF16 shape.
+        # Both modes: fsdp pins the family-agnostic FSDP2 mechanism, ep the composite-VLM +
+        # plain-expert + AdamWBF16 shape.
         args_matrix=("--mode fsdp", "--mode ep"),
         timeout=900,
     ),
@@ -1172,8 +1204,8 @@ MANIFEST: dict[str, TestSpec] = {
     "trainers/sft/test_sft_bailing_moe.py": TestSpec(
         nproc=2,
         markers=("gpu", "full", "2gpu", "ep", "moe", "bailing"),
-        # Both modes: an fsdp-only launch leaves the EP lazy-load path untested.
-        args_matrix=("--mode fsdp", "--mode ep"),
+        # An fsdp-only launch leaves the EP lazy-load path untested; ep_no_gmm runs EP on the per-expert loop.
+        args_matrix=("--mode fsdp", "--mode ep", "--mode ep_no_gmm"),
         timeout=1500,
     ),
     "trainers/sft/test_sft_checkpoint_resume.py": TestSpec(
@@ -1364,7 +1396,10 @@ MANIFEST: dict[str, TestSpec] = {
         nproc=4, markers=("gpu", "full", "4gpu", "ep", "moe", "qwen3"), timeout=1500
     ),
     "trainers/sft/test_sft_qwen3_5_moe.py": TestSpec(
-        nproc=2, markers=("gpu", "full", "2gpu", "ep", "tp", "etp", "moe", "qwen3"), timeout=1500
+        nproc=2,
+        markers=("gpu", "full", "2gpu", "ep", "etp", "moe", "qwen3"),
+        args_matrix=("--mode ep", "--mode ep_no_gmm", "--mode etp"),
+        timeout=1500,
     ),
     "trainers/sft/test_sft_qwen3_dense.py": TestSpec(
         nproc=2,

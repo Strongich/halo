@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """CPU tests: the environment registry must not override per-class defaults it didn't configure.
 
-``_common_kwargs`` must not inject ``max_turns=10`` into every factory call: that silently clobbers
+The registry must not inject ``max_turns=10`` into every factory call: that silently clobbers
 the per-class defaults. Class defaults win unless the user set ``max_turns`` in the env config —
 and because ``max_turns: null`` is what the shipped templates rely on, the ``EnvironmentConfig``
 help that tells users which default they are getting is held to the classes themselves here.
@@ -15,7 +15,7 @@ from src.configs.environment_config import EnvironmentConfig
 from src.environments.base import EPISODE_INVALID_KEY, EPISODE_INVALID_REASON_KEY, BaseEnvironment
 from src.environments.envs.protocols.react import create_react_math_environment
 from src.environments.registry import get_registered_environments, resolve_environment
-from src.rewards.spec import EnvironmentTerm
+from src.rewards.terms import EnvironmentTerm
 
 # Minimal valid construction kwargs per registered env. ``sandbox_backend`` is declared only by the
 # sandboxed coding envs; passing it to the others raises instead of being absorbed and ignored,
@@ -44,6 +44,9 @@ _CLASS_DEFAULT_MAX_TURNS = {"code_contests": 15, "codeforces": 15, "swe": 20, "e
 # Written out for the same reason as the table above: it is the roster the docs and the trainer's
 # dataset gate are held to, and deriving it from the classes would make the check agree with itself.
 _REQUIRES_ANSWER = {"code_contests", "codeforces", "exam_qa", "qa_search", "react_math", "react_search", "swe"}
+
+# The environments that register ``web_search``, with the options that make them register it.
+_SEARCH_ENV_KWARGS = {"exam_qa": {"open_book": True}, "native_combined": {}, "qa_search": {}, "react_search": {}}
 
 
 def _base_default_max_turns() -> int:
@@ -76,15 +79,15 @@ def test_class_default_table_names_every_environment_that_declares_one():
 
 
 def test_every_registered_environment_is_covered():
-    """A new env_type must arrive with its own turn-budget assertion, else the table below (and the
-    user-facing help it holds to account) silently stops covering the registry."""
+    """A new env_type must arrive with its own turn-budget assertion, else the tables above (and the
+    user-facing help they hold to account) silently stop covering the registry."""
     assert sorted(_ENV_KWARGS) == get_registered_environments()
 
 
 def test_max_turns_help_names_every_environment_that_overrides_the_base_default():
     """An env that declares its own budget while the help enumerates only the others leaves the
-    shipped template's ``max_turns: null`` documenting no budget at all. Derived from the
-    classes, not restated — a new env with its own budget fails here until the help says so."""
+    shipped template's ``max_turns: null`` documenting no budget at all. The table read here is
+    tied to the classes above, so a new env with its own budget fails until the help says so."""
     help_text = EnvironmentConfig.__dataclass_fields__["max_turns"].metadata["help"]
     for env_type, default in _CLASS_DEFAULT_MAX_TURNS.items():
         assert f"{env_type} {default}" in help_text, (
@@ -174,6 +177,30 @@ def test_valid_environment_kwarg_still_reaches_the_environment():
     """Guards the rejection above from being satisfied by rejecting everything."""
     env = resolve_environment("code_contests", {"timeout_per_test": 3, "sandbox_backend": "local"})
     assert env.grading_spec.default_timeout == 3
+
+
+@pytest.mark.parametrize("env_type", sorted(_SEARCH_ENV_KWARGS))
+def test_every_search_environment_takes_its_backend_from_the_config(env_type, monkeypatch):
+    """``search_backend`` picks the backend of every environment that registers ``web_search``, and a
+    name no backend answers to is refused when the env is built. Refused as an unknown option instead,
+    a preset can only auto-select, so a run searches on whichever API key its actor nodes hold."""
+    monkeypatch.setenv("HALO_ALLOW_MOCK_SEARCH", "1")
+    config = {**_ENV_KWARGS[env_type], **_SEARCH_ENV_KWARGS[env_type]}
+    env = resolve_environment(env_type, {**config, "search_backend": "mock"})
+    assert "Wikipedia: pytest" in env.registry.get("web_search").execute(query="pytest")
+    with pytest.raises(ValueError, match="Unknown search backend: nonexistent"):
+        resolve_environment(env_type, {**config, "search_backend": "nonexistent"})
+
+
+def test_the_search_table_names_every_environment_that_registers_web_search():
+    """Anti-rot: a preset that gains a ``web_search`` tool must arrive in the table above, so the backend
+    knob is held to it too."""
+    registering = set()
+    for env_type, kwargs in _ENV_KWARGS.items():
+        env = resolve_environment(env_type, {**kwargs, **_SEARCH_ENV_KWARGS.get(env_type, {})})
+        if "web_search" in env.registry.names():
+            registering.add(env_type)
+    assert registering == set(_SEARCH_ENV_KWARGS)
 
 
 @pytest.mark.parametrize("max_turns", [0, -1])

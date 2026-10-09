@@ -33,6 +33,8 @@ The checked set is derived from `PreprocessingConfig`: each field declares its o
 knob the metadata does not record warns instead. `--mode text`
 artifacts render no template and skip the render check entirely. A training config setting
 `packing: true` against an unpacked artifact warns — preprocessed rows are never packed at runtime.
+A `model_name_or_path` other than the prep `--model-name` only warns, so train with the tokenizer
+the rows were baked with.
 
 `--mode` is validated on the config, not only by the CLI's choices: an unvalidated typo like `txt`
 falls through every `mode == "text"` branch and chat-templates a raw pretraining corpus. A knob belonging
@@ -139,7 +141,7 @@ artifact would carry `is_vlm: true` over rows holding no pixels, which training 
 | `--no-system-role` | `False` | Merge system prompt into first user message (models without system role) |
 | `--train-on-completions-only` / `--no-train-on-completions-only` | `True` in `--mode chat`, `False` in `--mode text` | Mask user turns; train only on assistant responses. The chat default matches the training side and requires `--assistant-message-template`; asking for masking under `--mode text` is rejected (raw documents have no assistant turns) |
 | `--assistant-message-template` | `None` | Template marking start of assistant response |
-| `--pack-sequences` | `False` | Pack multiple sequences (text SFT only) |
+| `--pack-sequences` | `False` | Pack multiple sequences (text SFT only; refused for a model with compressed-KV layers, such as DeepSeek-V4) |
 | `--packing-strategy` | `bfd` | TRL strategy: `bfd` (best-fit-decreasing, drops overflow), `bfd_split` (carries overflow into later examples) or `wrapped` (concatenate-and-chunk — emits no document boundaries, so a packed row attends across itself) |
 | `--vlm` | `False` | VLM mode (stores `pixel_values`, `image_grid_thw`) |
 | `--images-field` | `None` | (`--vlm`) column holding the row's image(s) for datasets that keep them outside the conversation; merged into the messages like the runtime path. An image column named by nothing is refused |
@@ -191,6 +193,12 @@ Its `version` stamp is compared on load: a stamp this build does not read raises
 fall-back to the raw (re-tokenizing) path. Unknown fields at a stamp this build *does* read raise the
 same way (a diverged build). A `metadata.json` carrying no `preprocessed` key is somebody else's
 file; the dataset is treated as raw with a warning.
+
+One rank per input-filesystem scope runs the detection probe, so its answer is the scope's. Only a
+confirmed absence reads as raw: no file, an S3 404, a Hub repo without it (offline, a cache without
+it). A stamp that does not parse or a Hub it cannot reach raises on every rank instead. The one
+tolerated failure is an S3 outage with no local mirror of the stamp, read as raw with a warning: an
+absence is never mirrored, and a warm-cache raw dataset loads without S3.
 
 Each split's `shard_index.json` (`ShardIndex`, `src/data/shard_index.py`) carries the same
 `version` stamp and is held to it the same way: a stamp this build does not read, or a field it does

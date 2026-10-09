@@ -14,18 +14,29 @@ Run: python tests/cpu/environments/test_length_cutoff_recovery.py  (or pytest)
 """
 
 import importlib
+import json
 import pkgutil
+from dataclasses import replace
 
 import pytest
 
 import src.environments.envs
-from src.environments.base import REWARD_COMPONENTS_KEY, BaseEnvironment, Message, Trajectory
+from src.environments.base import (
+    CUT_TOOL_CALLS_KEY,
+    REWARD_COMPONENTS_KEY,
+    TOOL_CALL_COUNTS_KEY,
+    BaseEnvironment,
+    Message,
+    Trajectory,
+    engine_view,
+)
 from src.environments.envs.protocols.native import NativeToolUseEnvironment
 from src.environments.envs.protocols.react import ReActEnvironment
+from src.environments.envs.tasks.qa import ExamQAEnvironment
 from src.environments.episode import TurnGeneration, step_context_from_generation
 from src.environments.tools.definitions import NativeTool, NativeToolRegistry, ToolParameter
 from src.inference.response import ENGINE_CUT_FINISH_REASONS, FINISH_REASON_LENGTH
-from src.trainers.grpo.environmental import DistributedAsyncEnvironmentalGRPOTrainer
+from src.trainers.grpo.environmental import BatchBuildFence, DistributedAsyncEnvironmentalGRPOTrainer
 
 
 def _environment_classes(cls: type = BaseEnvironment) -> list[type]:
@@ -93,6 +104,7 @@ def test_a_turn_cut_before_any_call_keeps_the_plain_nudge():
     env.step([eid], [""], [ctx])
     traj = env.get_trajectories([eid])[0]
     assert traj.messages[-1].content == NativeToolUseEnvironment.LENGTH_CUTOFF_NUDGE
+    assert traj.messages[-2].truncated and traj.messages[-2].cut_tool_calls is None
     assert env.rollout_metrics(traj)["episode/length_cutoff_in_call_turns"] == 0.0
 
 
@@ -176,6 +188,9 @@ def test_a_cut_turn_executes_nothing_the_parser_salvaged(finish_reason):
     fragment, nudge = traj.messages[-2], traj.messages[-1]
     assert fragment.role == "assistant" and fragment.truncated is True and not fragment.tool_calls
     in_call = finish_reason == FINISH_REASON_LENGTH
+    # The calls stay on the turn for a judge only where the engine cut it at its cap; an abort keeps nothing.
+    assert fragment.cut_tool_calls == (_SALVAGED_CALL if in_call else None)
+    assert step.observation[-2] == {"role": "assistant", "content": "Let me implement this"}
     expected = "LENGTH_CUTOFF_IN_CALL_NUDGE" if in_call else "LENGTH_CUTOFF_NUDGE"
     assert nudge.content == getattr(NativeToolUseEnvironment, expected)
     assert env.rollout_metrics(traj)["episode/length_cutoff_in_call_turns"] == float(in_call)
@@ -183,7 +198,51 @@ def test_a_cut_turn_executes_nothing_the_parser_salvaged(finish_reason):
 
 def test_a_completed_turn_keeps_its_tool_calls():
     ctx = step_context_from_generation({}, _generation("tool_calls"))
-    assert ctx["tool_calls"] == _SALVAGED_CALL
+    assert ctx["tool_calls"] == _SALVAGED_CALL and CUT_TOOL_CALLS_KEY not in ctx
+    env = _make_env()
+    eid = _reset(env)
+    env.step([eid], ["Let me implement this"], [ctx])
+    turn = next(m for m in env.get_trajectories([eid])[0].messages if m.role == "assistant")
+    assert turn.tool_calls == _SALVAGED_CALL and turn.cut_tool_calls is None
+
+
+@pytest.mark.parametrize("carry_reasoning", [False, True])
+def test_a_cut_turn_keeps_the_calls_it_was_writing_for_the_judge_alone(carry_reasoning):
+    """What a turn cut inside its call wrote stays on its message, where a judge's view reads it, and
+    nowhere else: the call never runs or spends budget, and the conversation the engine is told on the next
+    turn, like the training render, is byte for byte the one the turn renders without it."""
+    ran = []
+    registry = NativeToolRegistry()
+    registry.register(
+        NativeTool(
+            name="echo",
+            description="echo",
+            parameters=[ToolParameter("text", "string", "text")],
+            handler=lambda text: ran.append(text) or text,
+        )
+    )
+    partial = [{"id": "c1", "type": "function", "function": {"name": "echo", "arguments": '{"text": "# still thin'}}]
+    gen = TurnGeneration(
+        text="Let me implement this",
+        tool_calls=partial,
+        reasoning="r",
+        tokens=4300,
+        finish_reason=FINISH_REASON_LENGTH,
+    )
+    env = NativeToolUseEnvironment(tool_registry=registry, max_turns=4, carry_reasoning=carry_reasoning)
+    eid = _reset(env)
+    step = env.step([eid], [gen.text], [step_context_from_generation({}, gen)])[0]
+
+    traj = env.get_trajectories([eid])[0]
+    fragment = traj.messages[-2]
+    assert fragment.cut_tool_calls == partial and fragment.tool_calls is None
+    assert ran == [] and traj.info["total_tool_calls"] == 0 and not traj.info.get(TOOL_CALL_COUNTS_KEY)
+    without = [replace(m, cut_tool_calls=None) for m in traj.messages]
+    assert json.dumps(step.observation) == json.dumps(
+        [m.to_dict(include_thinking=True) for m in engine_view(without, carry_reasoning)]
+    )
+    assert "still thin" not in json.dumps(step.observation)
+    assert fragment.to_dict(include_thinking=True) == without[-2].to_dict(include_thinking=True)
 
 
 @pytest.mark.parametrize("finish_reason", ENGINE_CUT_FINISH_REASONS)
@@ -228,9 +287,12 @@ def test_react_invented_tool_turn_is_flagged_untrainable():
 
 
 def test_the_nudge_roster_reaches_every_protocol():
-    assert {"NativeToolUseEnvironment.LENGTH_CUTOFF_IN_CALL_NUDGE", "ReActEnvironment.EMPTY_TURN_NUDGE"} <= set(
-        _NUDGES
-    )
+    assert {
+        "NativeToolUseEnvironment.LENGTH_CUTOFF_IN_CALL_NUDGE",
+        "NativeToolUseEnvironment.TOOLLESS_LENGTH_CUTOFF_NUDGE",
+        "NativeToolUseEnvironment.TOOLLESS_EMPTY_TURN_NUDGE",
+        "ReActEnvironment.EMPTY_TURN_NUDGE",
+    } <= set(_NUDGES)
 
 
 @pytest.mark.parametrize("name", sorted(_NUDGES))
@@ -243,6 +305,48 @@ def test_the_nudge_never_asks_for_shorter_reasoning(name):
     # in-call one is sent on a token-cap cut alone.
     if not name.endswith("IN_CALL_NUDGE"):
         assert "length limit" not in lowered
+
+
+@pytest.mark.parametrize("name", sorted(name for name in _NUDGES if ".TOOLLESS_" in name))
+def test_a_tool_less_nudge_never_asks_for_a_tool_call(name):
+    # Sent only where the registry is empty: a call is a move the model cannot make there, and the turn
+    # that answers the nudge is trained.
+    lowered = _NUDGES[name].lower()
+    assert "tool" not in lowered and "call" not in lowered
+
+
+_UNPRODUCTIVE_TURNS = [
+    ("a thought that ran out of room", {"finish_reason": "length"}, "LENGTH_CUTOFF_NUDGE"),
+    ("", {"finish_reason": "stop"}, "EMPTY_TURN_NUDGE"),
+]
+
+
+@pytest.mark.parametrize(("action", "ctx", "attr"), _UNPRODUCTIVE_TURNS, ids=["cut", "empty"])
+def test_a_closed_book_exam_recovers_in_tool_less_words_and_a_tooled_env_in_the_regular_ones(action, ctx, attr):
+    exam = ExamQAEnvironment(max_turns=4)
+    assert not exam.registry.names()
+    eid = _reset(exam)
+    assert not exam.step([eid], [action], [ctx])[0].done
+    sent = exam.get_trajectories([eid])[0].messages[-1].content
+    assert sent == getattr(NativeToolUseEnvironment, f"TOOLLESS_{attr}")
+
+    tooled = _make_env()
+    eid = _reset(tooled)
+    assert not tooled.step([eid], [action], [ctx])[0].done
+    assert tooled.get_trajectories([eid])[0].messages[-1].content == getattr(NativeToolUseEnvironment, attr)
+
+
+def test_a_tool_less_cut_inside_a_call_falls_back_to_the_tool_less_length_nudge():
+    """The in-call nudge asks for the call again; with no tool to call, the tool-less cut nudge is the
+    one that names a move the model can make. The turn is still counted as cut inside a call."""
+    env = NativeToolUseEnvironment(tool_registry=NativeToolRegistry(), max_turns=4)
+    ctx = step_context_from_generation({}, _generation(FINISH_REASON_LENGTH))
+    assert ctx[CUT_TOOL_CALLS_KEY] == _SALVAGED_CALL
+    eid = _reset(env)
+    assert not env.step([eid], ["Let me implement this"], [ctx])[0].done
+    traj = env.get_trajectories([eid])[0]
+    assert traj.messages[-1].content == NativeToolUseEnvironment.TOOLLESS_LENGTH_CUTOFF_NUDGE
+    assert env.rollout_metrics(traj)["episode/length_cutoff_in_call_turns"] == 1.0
 
 
 def test_cut_off_turn_is_flagged_for_the_trainer():
@@ -426,7 +530,7 @@ def test_a_tools_own_not_found_message_is_not_a_model_rejection():
 def _turns_trainer():
     trainer = object.__new__(DistributedAsyncEnvironmentalGRPOTrainer)
     trainer._rollout_routing_replay = False
-    trainer._batch_build_error = None
+    trainer._batch_errors = BatchBuildFence()
     trainer._warned_once = set()
     trainer._rollout_template_kwargs = {}
     trainer._carry_reasoning = False
@@ -475,7 +579,7 @@ def _flat_render(msgs, add_generation_prompt, _include_thinking):
 
 def _render_trainer():
     trainer = object.__new__(DistributedAsyncEnvironmentalGRPOTrainer)
-    trainer._batch_build_error = None
+    trainer._batch_errors = BatchBuildFence()
     trainer._rollout_template_kwargs = {}
     trainer._carry_reasoning = False
     trainer._max_train_row_tokens = None
@@ -571,7 +675,7 @@ def test_an_all_unproductive_episode_trains_only_negative_only_rows():
 
     assert [r.completion_ids.tolist() for r in rows] == [[1, 2, 3], [6]]
     assert all(r.negative_only for r in rows)
-    assert trainer._batch_build_error is None
+    assert trainer._batch_errors.reason is None
 
 
 def test_all_unproductive_turns_without_ids_train_a_zero_weight_row():
@@ -590,7 +694,7 @@ def test_all_unproductive_turns_without_ids_train_a_zero_weight_row():
 
     assert len(rows) == 1 and not rows[0].negative_only
     assert rows[0].completion_mask.sum().item() == 0
-    assert trainer._batch_build_error is None
+    assert trainer._batch_errors.reason is None
 
 
 def test_recovery_cap_ends_the_episode_truncated_at_the_cut_past_it():

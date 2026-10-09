@@ -3,7 +3,7 @@
 LoRA trains small rank-decomposed adapter matrices while the base model stays frozen, eliminating optimizer
 states for frozen parameters.
 
-It runs under DDP/FSDP, EP, CP and pure ETP; **TP**, **EP+TP** and **PP** reject it, and QLoRA runs only
+It runs under DDP/FSDP, EP, CP and pure ETP; **TP** and **EP+TP** reject it, and QLoRA runs only
 under DDP/FSDP and CP-on-dense (full matrix and reasons: [Parallelism compatibility](#parallelism-compatibility)).
 Under EP, LoRA targets both attention (via PEFT) and the MoE experts (via native grouped adapters).
 
@@ -230,7 +230,6 @@ own ([Data Parallelism](../parallelism/data-parallelism.md#fsdp2-strategy-by-mod
 | EP+CP | Yes | No | Attention + experts | Both active |
 | EP+TP | **No** | No | — | Both adapter kinds rejected: attention LoRA as under TP, native expert LoRA by the gate's `has_ep_lora` arm |
 | ETP | Yes | No | Attention only | Expert adapters rejected at config time by `ParallelismConfig` (`expert_tp_size > 1` gives the replicated adapter half a partial, never-synced gradient) |
-| PP | **No** | No | — | Attention PEFT rejected at trainer construction, expert LoRA earlier by `ParallelismConfig`. The adapter save/resume path is not stage-aware: it would write stage-local layer indices |
 
 **EP.** The expert names [above](#moe-models--expert-targets-and-full-trained-modules) route to **native grouped
 LoRA** — grouped `[E_local, K, r]`/`[E_local, r, N]` adapters stored alongside each expert weight, applied in
@@ -255,7 +254,7 @@ before the checkpoint downloads.
 
 ## Measured cost
 
-Both tables measured 2026-10-03 at commit 0bc3a22a5 on the Blackwell image.
+Both tables measured on the Blackwell image.
 
 Dense — 1× B300 (SM103), `DistributedSFTTrainer`, AdamWBF16, Liger, FA4, Qwen3-8B, seq 16384, BS=1, GC,
 10 steps / 3 warmup (full fine-tuning at this shape: [Liger → Benchmarks](liger-kernels.md#benchmarks)):
@@ -310,24 +309,25 @@ before peft's exit, so the restore lands on the sharded params, and the next for
 them once. A pass behind the policy forward (DPO, KTO, offline GRPO) enters and exits on the same unsharded
 params and reshards nothing.
 
-DPO and KTO reject an **explicit** `ref_model` under EP and TP (it is never parallelized, so its log-probs
-would not match the policy's), as self-distillation does its KL `reference_model`: use LoRA with
-`ref_model=None`, or `precompute_ref_log_probs=True`. Under TP, LoRA is rejected too, so DPO/KTO there
-must precompute. SMPO is reference-free. Offline GRPO full fine-tuning sweeps and checkpoints its
-run-start reference without a second resident model; only native expert-only LoRA retains an
-explicit frozen base `ref_model`, which the script loads
+An explicit `ref_model` (DPO, KTO) or self-distillation's KL `reference_model` is never parallelized, so
+under EP or TP it is a whole dense replica on every rank. Its log-probs match the policy's up to kernel
+numerics, so it is warned about, not refused: LoRA with `ref_model=None`, or `precompute_ref_log_probs=True`,
+avoids the replica. Under TP, LoRA is rejected, so DPO/KTO there precompute or hold the replica. SMPO is
+reference-free. Offline GRPO full fine-tuning sweeps and checkpoints its run-start reference without a
+second resident model; only native expert-only LoRA retains an explicit frozen base `ref_model`, which
+the script loads
 ([Offline GRPO → Reference model](../training-methods/grpo/offline-grpo.md#reference-model)).
 
 On online / async GRPO, where no adapter wraps the model — a full fine-tune, or an expert-only LoRA
-run, which builds no `PeftModel` — TRL builds its own reference model at `beta != 0`: an
-unparallelized fp32 replica per rank. `_validate_implicit_reference_model` warns about that under EP,
-and **raises** whenever the policy carries live attention sinks (`reset_sinks: false`), where the two
-models would compute different log-probs for identical tokens. Add an attention LoRA target (it wraps the
-model, and the disabled adapter is the reference) or set `beta: 0`.
+run, which builds no `PeftModel` — `beta != 0` holds a frozen reference: the script loads the base the
+way the policy loads and the trainer hands it to TRL in place of the fp32 copy TRL would build
+([Online GRPO](../training-methods/grpo/online-grpo.md#grpo-objective-for-verifiable-rewards)). It is an
+unparallelized replica per rank, warned about under EP and TP. Add an attention LoRA target (it wraps the
+model, and the disabled adapter is the reference) or set `beta: 0` to hold none.
 
-The DPO/KTO scripts never leave the reference to TRL: a full fine-tune gets a frozen copy on plain data
-parallelism and needs `precompute_ref_log_probs: true` under EP, TP or PP; an expert-only LoRA run needs it
-in every mode ([DPO → Reference model](../training-methods/preference/dpo.md#reference-model)).
+The DPO/KTO scripts never leave the reference to TRL: a full fine-tune gets a frozen copy, or no reference
+under `precompute_ref_log_probs: true` with EP or TP (plain data parallelism still loads the copy); an
+expert-only LoRA run needs precompute in every mode ([DPO → Reference model](../training-methods/preference/dpo.md#reference-model)).
 
 ## Online RL — rollout-server weight sync
 
@@ -365,9 +365,9 @@ QLoRA combines LoRA with 4-bit/8-bit base quantization under DDP/FSDP, and under
 keeps the standard `from_pretrained` loader, which preserves `Params4bit`. AdamWBF16 optimizes only the bf16
 adapter params; the frozen quantized base is skipped.
 
-`load_distributed_model` raises for EP, TP, PP, and the grouped-GEMM MoE loader — pure ETP included, since
+`load_distributed_model` raises for EP, TP, and the grouped-GEMM MoE loader — pure ETP included, since
 the gate reads `ep_group_size = ep_size × expert_tp_size`. Those loaders materialize plain de-quantized
-weights, so `Params4bit` are lost and PEFT's 4-bit adapter dispatch fails (PP rejects PEFT outright anyway).
+weights, so `Params4bit` are lost and PEFT's 4-bit adapter dispatch fails.
 
 The 4-bit **compute** dtype follows the run's own precision (`bf16`/`fp16` on the training config), not
 TRL's `ModelConfig.dtype` — whose `"float32"` default nothing else here reads, and which would otherwise

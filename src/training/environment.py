@@ -18,8 +18,6 @@ import datasets
 import torch.distributed as dist
 from accelerate.logging import get_logger
 from transformers import set_seed
-from transformers.trainer import TRAINER_STATE_NAME
-from transformers.trainer_utils import get_last_checkpoint
 
 from src.checkpoint.format import (
     REFERENCE_CACHE_DIR_NAME,
@@ -30,6 +28,7 @@ from src.checkpoint.format import (
     resume_adapter_dir,
 )
 from src.data.pipeline.processing import ensure_cache_dir
+from src.distributed.checkpoint.coordination import resolve_resume_checkpoint
 from src.distributed.expert_parallel.dispatcher import destroy_all_dispatchers
 from src.distributed.filesystem import OUTPUT_FS_PROBE_PREFIX, RUN_LOG_DIR_NAME
 from src.distributed.runtime import (
@@ -38,9 +37,9 @@ from src.distributed.runtime import (
     fs_aware_load_rank,
     fs_aware_save_rank,
     is_global_main_process,
-    rank_consensus,
     reject_across_ranks,
 )
+from src.log import KEY_PREVIEW_COUNT
 from src.models.loading.dtype import configure_float32_matmul_precision
 from src.models.patches.attention import anchor_jit_cache_dir, ensure_fa4_kernel_cache_env
 from src.training.parser import is_true_string
@@ -80,7 +79,8 @@ def _validate_output_dir(output_dir: str) -> None:
         if contents:
             raise ValueError(
                 f"Output directory '{output_dir}' already exists and is not empty. "
-                f"Found {len(contents)} items: {contents[:5]}{'...' if len(contents) > 5 else ''}. "
+                f"Found {len(contents)} items: {contents[:KEY_PREVIEW_COUNT]}"
+                f"{'...' if len(contents) > KEY_PREVIEW_COUNT else ''}. "
                 f"Set resume_from_checkpoint to resume training, or use a new output_dir "
                 f"(or clear this one) to avoid overwriting previous runs."
             )
@@ -102,14 +102,14 @@ def _validate_output_dir_across_ranks(output_dir: str) -> None:
 
 
 def run_training(main_fn):
-    """Wrap a training entry point so distributed teardown runs on the success path and on a
+    """Wrap a training entry point so distributed teardown runs on the SUCCESS path and on a
     :class:`TrainingStoppedEarly` exit only.
 
     Usage: ``run_training(main)()`` under ``if __name__ == "__main__":``. Dispatchers are destroyed
     before the process group — a DeepEP Gin buffer outliving the group communicator faults with a
     sticky ``cudaErrorIllegalAddress`` that hides the original traceback.
 
-    Any other exception propagates with no teardown at all. Both teardown halves are collectives
+    Any other exception propagates with no teardown at all. Both halves are collectives
     (``destroy_all_dispatchers`` opens with a barrier, ``destroy_process_group`` is one), and a rank
     failing mid-step — an OOM in backward, say — has peers still inside the step's own collective,
     so entering another parks the failed rank in the NCCL watchdog for the full timeout while
@@ -137,7 +137,7 @@ def _tear_down_distributed() -> None:
         dist.destroy_process_group()
 
 
-def setup_training_environment(args, training_config, script_name: str = "train") -> None:
+def setup_training_environment(args, training_config, script_name: str) -> None:
     """Setup common training environment: logging, seeds, and environment variables."""
     # Both kernel caches, anchored on HF_HOME, before any model/attention import: they read their env
     # lazily at first compile, and a cold cache re-benchmarks per packed-row width (fla keys on
@@ -149,9 +149,6 @@ def setup_training_environment(args, training_config, script_name: str = "train"
     # does not load through load_distributed_model, and the image's TF32 default collapses adjacent
     # RoPE positions past 2048 tokens.
     configure_float32_matmul_precision()
-
-    # output_dir may carry per-rank strftime codes; broadcast rank 0's value so all ranks agree.
-    training_config.output_dir = broadcast_from_rank0(getattr(training_config, "output_dir", None))
 
     # Config-derived → rank-uniform; a resume request defers this guard to detect_resume_checkpoint.
     skip_validation = getattr(training_config, "resume_from_checkpoint", None) or getattr(
@@ -198,71 +195,27 @@ def _setup_tracking_env_vars(args, training_config, script_name: str) -> None:
 def detect_resume_checkpoint(training_config) -> str | None:
     """Detect the checkpoint to resume from, per ``training_config.resume_from_checkpoint``.
 
-    ``True`` auto-detects the last checkpoint in ``output_dir``; ``str`` uses that path and raises
-    when it does not exist (falling back to a from-scratch run would overwrite the output_dir);
-    ``None``/``False`` skips resume. Rank 0 decides and broadcasts the detection error too, so every
-    rank raises the same exception with its original type. Auto-detecting nothing means the run is
-    fresh, so the output_dir guard ``setup_training_environment`` skipped runs here instead.
+    ``True`` (or its YAML string forms) auto-detects the newest checkpoint in ``output_dir`` complete on
+    every rank, and a path must be complete on every rank (degrading to a from-scratch run would
+    overwrite the output_dir); ``None``/``False`` skips resume. Either way the incomplete step
+    directories are moved out of rotation's sight (:func:`resolve_resume_checkpoint`). Auto-detecting
+    nothing means the run is fresh, so the output_dir guard ``setup_training_environment`` skipped
+    re-runs here.
     """
     resume = getattr(training_config, "resume_from_checkpoint", None)
     if not resume:
         return None
-
-    checkpoint = detection_error = None
-    if is_global_main_process():
-        try:
-            checkpoint = _detect_checkpoint_path(resume, training_config.output_dir)
-        except (ValueError, OSError) as e:
-            detection_error = e
-
-    checkpoint, detection_error = broadcast_from_rank0((checkpoint, detection_error))
-    if detection_error is not None:
-        raise detection_error
-
-    if checkpoint is None and not getattr(training_config, "overwrite_output_dir", False):
-        _validate_output_dir_across_ranks(training_config.output_dir)
-
-    # On a non-shared FS each node reads its own trainer_state.json, so verify everywhere.
-    state_on_every_rank = (
-        checkpoint is None or rank_consensus(os.path.isfile(os.path.join(checkpoint, TRAINER_STATE_NAME)))[0]
-    )
-    if not state_on_every_rank:
-        raise RuntimeError(
-            f"Resume checkpoint {checkpoint} is incomplete on at least one node (missing "
-            f"trainer_state.json) — torn save on a non-shared filesystem. Resume from an "
-            f"earlier complete checkpoint or remove the torn one."
-        )
-
-    return checkpoint
-
-
-def _detect_checkpoint_path(resume, output_dir: str) -> str | None:
-    """Detect checkpoint path on the main process. Raises for an explicit path that does not exist."""
-    if isinstance(resume, str) and not is_true_string(resume):
-        if not os.path.isdir(resume):
-            raise ValueError(
-                f"resume_from_checkpoint path does not exist: '{resume}'. "
-                f"Fix the path, or set resume_from_checkpoint: true to auto-detect the last "
-                f"checkpoint in output_dir (or remove it to start from scratch)."
+    auto = not isinstance(resume, str) or is_true_string(resume)
+    checkpoint = resolve_resume_checkpoint(training_config.output_dir, None if auto else resume)
+    if checkpoint is None:
+        if is_global_main_process():
+            logger.warning(
+                f"resume_from_checkpoint=True but no checkpoint found in '{training_config.output_dir}'. "
+                f"Starting training from scratch."
             )
-        return resume
-
-    if not os.path.isdir(output_dir):
-        logger.warning(
-            f"resume_from_checkpoint=True but output_dir '{output_dir}' "
-            f"does not exist. Starting training from scratch."
-        )
-        return None
-
-    last_ckpt = get_last_checkpoint(output_dir)
-    if last_ckpt is not None:
-        logger.info(f"Auto-detected last checkpoint: {last_ckpt}")
-        return last_ckpt
-
-    logger.warning(
-        f"resume_from_checkpoint=True but no checkpoint found in '{output_dir}'. Starting training from scratch."
-    )
-    return None
+        if not getattr(training_config, "overwrite_output_dir", False):
+            _validate_output_dir_across_ranks(training_config.output_dir)
+    return checkpoint
 
 
 def _checkpoint_has_full_model_weights(checkpoint: str) -> bool:

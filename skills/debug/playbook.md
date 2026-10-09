@@ -1,20 +1,22 @@
 # Debug playbook — symptom → cause → fix
 
 Companion to `SKILL.md`. Sources: `src/diagnostics/debugging.py`,
+`src/diagnostics/profiling.py` (CUDA-memory helpers),
 `src/callbacks/profiler.py` (`TorchProfilerCallback`),
-`src/callbacks/wiring.py` (wiring), and the user-facing guide
+`src/callbacks/wiring.py` (wiring), `src/env.py` (`env_flag`, `DIST_NCCL_TIMEOUT_MINUTES`),
+`src/models/patches/flex_sliding_attention.py` (`HALO_FLEX_SLIDING`), and the user-facing guide
 `agent-docs/reference/debugging.md`. Every env var / helper name below is verbatim
-from those files — do not paraphrase them.
+from those files or the file cited beside it — do not paraphrase them.
 
 ## 1. Known failure modes
 
 | Symptom | Likely cause | Enable / inspect | Fix |
 |---------|--------------|------------------|-----|
-| EP job stops at startup, before any model load: `ValueError: parallelism config failed on … First (rank 0): expert_parallel_size=N on a single M-GPU NVLink domain forms K concurrent >2-rank DeepEP dispatch groups …` | Multiple >2-rank DeepEP dispatch groups inside ONE NVLink domain — `num_nvlink_domains == 1 and ep_size > 2 and nvlink_domain_size > ep_group_size` (e.g. ep4 on an 8-GPU domain; the unit is the **domain**, not the OS node). Their combine barriers would race FSDP2's DP-wide NCCL (`elastic` faults with `Invalid access of peer GPU memory over nvlink`, `legacy` deadlocks) — full mechanism and evidence in the `parallelism` skill (`matrix.md`, row *Multi-group >2-rank EP on one NVLink domain*) | Rejected at config time (`_validate_single_domain_multigroup_ep`, `src/distributed/parallelism_config.py`); `EpIntrospectionMixin._setup_ep_gradient_checkpointing` (`src/trainers/mixins/ep_introspection.py`) re-checks a hand-built config | Use **ep_size=2 or ep_size = nvlink_domain_size** (one dispatch group per domain). For finer expert sharding combine EP with **ETP** (`ep4+etp2` fills the domain and passes) — attention TP leaves `ep_group_size` untouched and lands on the same rejection |
+| EP job stops at startup, before any model load: `ValueError: parallelism config failed on … First (rank 0): expert_parallel_size=N on a single M-GPU NVLink domain forms K concurrent >2-rank DeepEP dispatch groups …` | Multiple >2-rank DeepEP dispatch groups inside ONE NVLink domain — `num_nvlink_domains == 1 and ep_size > 2 and nvlink_domain_size > ep_group_size` (e.g. ep4 on an 8-GPU domain; the unit is the **domain**, not the OS node). Their combine barriers would race FSDP2's DP-wide NCCL (`elastic` faults with `Invalid access of peer GPU memory over nvlink`, `legacy` deadlocks) — full mechanism and evidence in the `parallelism` skill (`matrix.md`, row *Multi-group >2-rank EP on one NVLink domain*) | Rejected at config time (`_validate_single_domain_multigroup_ep`, `src/distributed/parallelism_config.py`), hand-built configs included | Use **ep_size=2 or ep_size = nvlink_domain_size** (one dispatch group per domain). For finer expert sharding combine EP with **ETP** (`ep4+etp2` fills the domain and passes) — attention TP leaves `ep_group_size` untouched and lands on the same rejection |
 | loss=NaN on the **first backward**, qwen3.5 / qwen3.6 / Qwen3-Next / GLM-4 MoE Lite | FA4 beta + head_dim 256 + partial rotary (qwen3.x output-gate + GQA 16:2; GLM-4 MoE Lite MLA 256-wide qk/v) | Confirm the auto fallback fired (`model_fa4_backward_nan_prone` → SDPA in `resolve_attn_implementation`, `src/models/patches/attention.py`) | Do **not** force `flash_attention_4`; let it fall back to SDPA. gpt-oss is unaffected |
-| OOM / attention error on **gemma4** at long seq | head_dim=512 global layers block every flash kernel and cuDNN SDPA | — | Auto-applied via `apply_family_attention_patches` (`src/models/loading/model_preparation.py`): the FA→SDPA swap in `resolve_attn_implementation`, `patch_sdpa_for_wide_heads` (mem-efficient pin + manual KV repeat, `src/models/patches/attention.py`), and the `sdpa_flex_sliding` build (`src/models/patches/flex_sliding_attention.py`: FlexAttention on sliding layers, matmul attention on global layers within a 2 GiB per-layer score budget). `HALO_FLEX_SLIDING=0` builds plain SDPA. Still OOM: gradient checkpointing or a wider EP group |
+| OOM / attention error on **gemma4** at long seq | head_dim=512 global layers block every flash kernel and cuDNN SDPA | — | Auto-applied in two steps: `resolve_attn_implementation` (`src/models/patches/attention.py`) swaps FA→SDPA (`head_dim_exceeds_flash`); `apply_family_attention_patches` (`src/models/loading/model_preparation.py`) then pins `patch_sdpa_for_wide_heads` (mem-efficient pin + manual KV repeat) and resolves the `sdpa_flex_sliding` build (`src/models/patches/flex_sliding_attention.py`: FlexAttention on sliding layers, matmul attention on global layers within a 2 GiB per-layer score budget). `HALO_FLEX_SLIDING=0` builds plain SDPA. Still OOM: gradient checkpointing or a wider EP group |
 | `gradient_checkpointing_enable` raises on **Zaya** | A toolkit patch clears the family's GC support flag: backward recompute through CCA's `nn.Conv1d` is an env-level cuDNN/CUDA 13.2 fault on the Blackwell image | — | Run Zaya **without GC** (plain FSDP2, EP, or EP+ETP all work GC-off). EP+GC unsupported by design (CCA+EDA recompute cascades); TP/CP incompatible |
-| `CheckpointError` (recomputed tensor shape ≠ forward) under **EP or any MoE + gradient checkpointing**, often in GRPO | `use_reentrant=False` validates recompute shapes; the extra no-grad GRPO forwards make the recompute take a different path than the forward it must reproduce, and a recomputed router can flip a near-tie pick, changing the routing tensors' shapes | Watch for the override warning at trainer init | The mixin forces `use_reentrant=True` under EP, CP or any MoE (`forces_reentrant_checkpointing` in `src/trainers/mixins/ep_introspection.py`, applied by `_init_distributed_config` in `src/trainers/mixins/base.py`), except under PP (which requires non-reentrant), even when the config sets `false`. Let it; do not pin `use_reentrant: false` there |
+| `CheckpointError` (recomputed tensor shape ≠ forward) under **EP or any MoE + gradient checkpointing**, often in GRPO | `use_reentrant=False` validates recompute shapes; the extra no-grad GRPO forwards make the recompute take a different path than the forward it must reproduce, and a recomputed router can flip a near-tie pick, changing the routing tensors' shapes | Watch for the override warning at trainer init | The mixin forces `use_reentrant=True` under EP, CP or any MoE (`forces_reentrant_checkpointing` in `src/trainers/mixins/ep_introspection.py`, applied by `_init_distributed_config` in `src/trainers/mixins/base.py`), even when the config sets `false`. Let it; do not pin `use_reentrant: false` there |
 | Embedding index OOB / CUDA assert early in training after switching model | A `.map` input the cache key cannot fingerprint, so two runs differing only in it share one cache file → cross-model token-ID reuse. The key already folds the closure-captured tokenizer by **content** (plus its chat template and special-token ids) and `functools.partial` bound args (`src/data/pipeline/processing.py`) | The one-time `Dataset-map cache fingerprint … skips a value of type …` warning | Thread that value through `cache_key_extras`; clearing `HF_DATASETS_CACHE` is the blunt fallback |
 | Every resume re-runs the dataset map, or rows tokenized by an old tokenizer after editing it in place | Reading the tokenizer's content raised (a custom Python component the fast backend cannot serialize, a remote-code `get_vocab`), so the map cache keys on its `name_or_path` | The one-time `Dataset-map cache key cannot hash the content of tokenizer … and keys on its name_or_path … instead` warning (`_tokenizer_content_sig`, `src/data/pipeline/processing.py`) names the tokenizer class and the error | The re-map on resume is the only cost for an unchanged tokenizer; after editing one in place, save it to a new path or clear `HF_DATASETS_CACHE` |
 | A serving engine rejects a gathered EP checkpoint (missing per-expert keys) | The engine reads only per-expert `experts.{i}.*` keys (vLLM's `glm4_moe_lite`) and the export is fused | — | Re-emit the family's per-expert layout with `scripts/after_training/unfuse_moe_experts.py` |
@@ -33,9 +35,7 @@ helpers (§2.2, §2.4) run when you invoke `py_spy_diag.py` or call them in-scri
 
 ### 2.1 Cross-rank consistency — `assert_consistent` / `assert_tensor_shape_consistent`
 
-Catches a shape/value divergence as a clear error instead of a downstream NCCL hang. The toolkit
-ships **no call sites**, so setting the env var alone does nothing — add the call at the suspect
-seam first.
+Catches a shape/value divergence as a clear error instead of a downstream NCCL hang.
 
 ```bash
 export HALO_TP_CONSISTENCY_CHECK=1   # makes assert_consistent RAISE on mismatch (else just warns)
@@ -59,12 +59,11 @@ python scripts/profiling/py_spy_diag.py dump              # every torchrun rank 
 python scripts/profiling/py_spy_diag.py dump --pid 1234   # explicit pid, repeatable
 ```
 
-Output: a timestamped `$TMPDIR/halo_diag_stacks/<ts>-rank00/pid<pid>.txt` per pid (`STACK_DUMP_DIR`;
-`--output-dir` to change; `torchrun_python_pids()` walks torchrun's python children, so one
-invocation dumps the whole job). The rank NOT
+Output: a timestamped `$TMPDIR/halo_diag_stacks/<ts>-rank00/pid<pid>.txt` per pid (`--output-dir` to
+change; it walks torchrun's python children, so one invocation dumps the whole job). The rank NOT
 inside a collective is the culprit. Requires `py-spy` on `PATH` (ships in the image's `profiling`
-group) and `--cap-add=SYS_PTRACE` on the container (in the standard launch command), else py-spy
-fails with `Permission denied`. In-script equivalent: `dump_distributed_stacks`.
+group) and ptrace access: `--cap-add=SYS_PTRACE` on the container (in the standard launch command)
+unless the host's `kernel.yama.ptrace_scope` is 0, else py-spy fails with `Permission denied`. In-script equivalent: `dump_distributed_stacks`.
 
 ### 2.3 NCCL watchdog + flight recorder
 
@@ -94,7 +93,8 @@ record_distributed_flamegraph(duration=30)                  # this rank only
 record_distributed_flamegraph(duration=30, this_rank_only=False)  # every rank on node (spot a straggler)
 ```
 
-py-spy ships in the image (`profiling` dependency group); attach needs `--cap-add=SYS_PTRACE`.
+py-spy ships in the image (`profiling` dependency group); attach needs `--cap-add=SYS_PTRACE` unless the
+host's `kernel.yama.ptrace_scope` is 0.
 
 ## 3. GPU memory profiling (OOM)
 

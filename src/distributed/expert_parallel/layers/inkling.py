@@ -16,7 +16,7 @@ class EPInklingMoELayer(EPMoELayerBase):
 
     ``InklingTopkRouter`` is unusual: one projection emits ``n_routed_experts + n_shared_experts``
     logits, and the routed top-k and the shared experts are normalised jointly (``logsumexp`` over
-    ``top_k + n_shared`` logits), so the shared experts compete for probability mass (the
+    ``top_k + n_shared_experts`` logits), so the shared experts compete for probability mass (the
     "shared-expert sink"). The shared FFN is then scaled by its share (``gammas``), which is why this
     layer cannot use :class:`EPSharedExpertsMoELayerBase`, whose shared-expert call takes no extra
     arguments.
@@ -42,13 +42,12 @@ class EPInklingMoELayer(EPMoELayerBase):
     # The hub checkpoint keeps Thinking Machines' original namespace (``model.llm.*``,
     # ``wq_du``/``wk_dv``, interleaved ``w13_weight``); the lazy loaders translate it through the
     # transformers conversion entry declared here (renames + de-interleave, ``hub_conversion.py``).
-    # Weight sync stays off because it sends live module-tree names, which a server loading hub names
-    # skips without error.
+    # Weight sync stays off: no sync into either pinned engine's Inkling loader has been validated.
     _HUB_CONVERSION_KEYS = ("inkling_mm_model",)
     _supports_weight_sync = False
 
-    # ``gate.weight`` is ``[n_routed + n_shared, hidden]``, so it over-counts by ``n_shared`` and
-    # cannot be used to infer the routed-expert count.
+    # ``gate.weight`` is ``[n_routed_experts + n_shared_experts, hidden]``, so it over-counts by
+    # ``n_shared_experts`` and cannot be used to infer the routed-expert count.
     _NUM_EXPERTS_ATTR_PATHS = ("experts.num_experts",)
 
     _SHARED_EXPERT_ATTRS = ("shared_experts",)

@@ -30,10 +30,12 @@ from src.configs.rollout_config import RolloutConfig
 from src.data.sources.paths import parse_dataset_source
 from src.environments.base import (
     ANSWER_KEY,
+    CUT_TOOL_CALLS_KEY,
     EPISODE_ERROR_KEY,
     EPISODE_INVALID_REASON_KEY,
     RANDOM_REASONING_EFFORT,
     BaseEnvironment,
+    Message,
     Trajectory,
     solve_verdict,
     stable_reasoning_effort,
@@ -49,24 +51,29 @@ from src.environments.episode import (
     generate_turn,
     is_context_overflow,
     is_engine_fault,
+    recovering_turn,
     step_context_from_generation,
-    validate_thinking_budget_scope,
+    thinking_caps_by_level,
 )
 from src.inference.openai_client import generate_openai_response
 from src.inference.response import FINISH_REASON_LENGTH, get_finish_reason
 
 logger = logging.getLogger(__name__)
 
-# Per-generation HTTP timeout (seconds). Generous by default: eval runs many episodes concurrently
-# against one endpoint, and a long reasoning turn queued behind them takes minutes to come back.
-DEFAULT_REQUEST_TIMEOUT_S = 180.0
 # ``info`` keys a persisted trajectory leaves out: the row payload; ``_``-prefixed grading stamps
 # (hidden tests, checker source) go with it.
 _SERIALIZED_INFO_DROP = frozenset({"context"})
+# Message fields a persisted turn carries beside its render: the reasoning cap the turn ran under, and the
+# calls a cut turn never ran, apart from the ``tool_calls`` the re-grader replays. ``Message.to_dict`` is the
+# chat-template and API render, which must not carry them.
+_SERIALIZED_TURN_FIELDS = ("thinking_cap", CUT_TOOL_CALLS_KEY)
 # The sample-record key of an episode that lost a generation on the driver's side past every retry: it
 # carries no verdict. Stamped on the trajectory under the private key, which the serializer drops.
 GENERATION_ERROR_KEY = "generation_error"
 _DRIVER_FAULT_KEY = "_driver_fault"
+# The driver's per-episode telemetry (generations, completion tokens, tool calls), stamped on ``info`` once
+# the episode closes; a persisted trajectory carries it as ``eval_stats``.
+EVAL_STATS_KEY = "_eval_stats"
 
 
 def load_hf_split(dataset: str, config: str | None, split: str) -> Dataset:
@@ -95,15 +102,22 @@ def load_hf_split(dataset: str, config: str | None, split: str) -> Dataset:
     return ds[split]
 
 
+def _serialized_message(message: Message) -> dict[str, Any]:
+    """A message's render plus the :data:`_SERIALIZED_TURN_FIELDS` it recorded."""
+    record = message.to_dict()
+    record.update({name: value for name in _SERIALIZED_TURN_FIELDS if (value := getattr(message, name)) is not None})
+    return record
+
+
 def serialize_trajectory(traj: Trajectory | None) -> dict[str, Any] | None:
     """Serialize a finished episode for persistence: the full message list plus ``info`` without the
     ``_``-prefixed grading stamps and :data:`_SERIALIZED_INFO_DROP`."""
     if traj is None:
         return None
     info = {k: v for k, v in traj.info.items() if not k.startswith("_") and k not in _SERIALIZED_INFO_DROP}
-    info["eval_stats"] = traj.info.get("_eval_stats")
+    info["eval_stats"] = traj.info.get(EVAL_STATS_KEY)
     return {
-        "messages": [m.to_dict() for m in traj.messages],
+        "messages": [_serialized_message(m) for m in traj.messages],
         "total_reward": traj.total_reward,
         "done": traj.done,
         "truncated": traj.truncated,
@@ -212,12 +226,12 @@ async def _request_turn(
 ) -> TurnGeneration:
     """One generation request for the turn ``rollout`` caps, as the turn the environment steps with."""
     resp = await generate_openai_response(
-        model=rollout.model_name or NOT_GIVEN,
-        user_message=messages,
+        rollout.model_name or NOT_GIVEN,
+        messages,
         temperature=rollout.temperature,
         max_tokens=rollout.max_tokens,
         top_p=rollout.top_p,
-        custom_client=client,
+        client=client,
         tools=tools,
         request_timeout=rollout.request_timeout,
         extra_body=generation_control_fields(rollout, effort.level, effort.thinking_budget),
@@ -230,7 +244,6 @@ async def _request_turn(
         reasoning=resp.reasoning or "",
         tokens=resp.completion_tokens or 0,
         finish_reason=get_finish_reason(resp, completion_tokens=resp.completion_tokens, max_tokens=rollout.max_tokens),
-        token_ids=resp.token_ids,
     )
 
 
@@ -263,12 +276,12 @@ async def run_episode(
         env,
         max_tokens=rollout.max_tokens,
         max_thinking_tokens=rollout.max_thinking_tokens,
-        scope=rollout.thinking_budget_scope,
-        turn_reserve=rollout.thinking_turn_reserve,
+        max_episode_tokens=rollout.max_episode_tokens,
+        max_answer_tokens=rollout.max_answer_tokens,
     )
     if effort.level is not None:
         context = {**(context or {}), "reasoning_effort": effort.level}
-    reasoning_spent = 0
+    generated = 0
 
     episode = EpisodeDispatcher(env)
     episode_ids, steps = await episode.reset([prompt], [context])
@@ -279,20 +292,17 @@ async def run_episode(
 
     try:
         finish_reasons: list[str | None] = []
-        completion_tokens = 0
         generation_error: str | None = None
         driver_fault = False
 
         for _ in range(env.max_turns):
-            if step.done:
+            # The per-turn contract, narrowed as the training actor narrows it, so the request sets the
+            # level's CoT budget here too (vLLM enforces it) rather than the trajectory only recording it.
+            recovery = recovering_turn(step.trajectory)
+            caps = effort.turn_caps(generated, recovery=recovery)
+            if step.done or caps is None:
                 break
-            # The per-turn contract, narrowed as the training actor narrows it, so the engine enforces
-            # the level's CoT budget here too rather than the trajectory only recording it.
-            turn_rollout = replace(
-                rollout,
-                max_tokens=effort.turn_max_tokens(reasoning_spent),
-                max_thinking_tokens=effort.turn_thinking_cap(reasoning_spent),
-            )
+            turn_rollout = replace(rollout, **caps)
             try:
                 gen = await generate_turn(
                     partial(_request_turn, client, step.observation, tools, turn_rollout, effort),
@@ -309,14 +319,19 @@ async def run_episode(
                 break
 
             finish_reasons.append(gen.finish_reason)
-            completion_tokens += gen.tokens
-            reasoning_spent += effort.spend_of(gen, rollout.reasoning_end_token_id)
-            steps = await episode.step([eid], [gen.text], [step_context_from_generation(context, gen)])
+            generated += gen.tokens
+            step_ctx = step_context_from_generation(
+                context,
+                gen,
+                thinking_cap=effort.turn_thinking_cap(recovery),
+                last_turn=effort.turn_caps(generated) is None,
+            )
+            steps = await episode.step([eid], [gen.text], [step_ctx])
             step = steps[0]
 
         traj = env.get_trajectories([eid])[0]
-        # An episode can exit the loop still open (generation raised, or the turn cap hit). Closed by
-        # explicit truncation rather than a synthetic empty turn, which would mark it ``completed``
+        # An episode can exit the loop still open (a generation raised, or the output budget holds no
+        # further turn). Closed by explicit truncation rather than a synthetic empty turn, which would mark it ``completed``
         # and pay completion-rewarded envs; reward already accrued still counts. A lost generation is
         # stamped first, so the env prices the truncation as the driver's fault, not a turn overflow.
         if traj is not None and not traj.done:
@@ -328,12 +343,12 @@ async def run_episode(
             if driver_fault:
                 traj.info[_DRIVER_FAULT_KEY] = generation_error
 
-        effort.stamp(traj, reasoning_spent)
+        effort.stamp(traj, generated)
         if traj is not None:
-            traj.info["_eval_stats"] = {
+            traj.info[EVAL_STATS_KEY] = {
                 "generations": len(finish_reasons),
                 "tool_calls": traj.info.get("total_tool_calls", 0),
-                "completion_tokens": completion_tokens,
+                "completion_tokens": generated,
                 "length_capped": any(fr == FINISH_REASON_LENGTH for fr in finish_reasons),
                 "empty_turns": traj.info.get("empty_turns", 0),
             }
@@ -371,14 +386,15 @@ async def collect_results(
     retry carries :data:`GENERATION_ERROR_KEY` and no verdict (``reward`` and ``success`` are ``None``).
     ``collect_trajectories=True`` adds a ``"trajectory"`` per sample for :func:`write_trajectories_jsonl`.
 
-    The contract passes the trainer's thinking-scope gate first, so a gap refuses the run rather than
-    scoring every episode that lands on it as an error sample.
+    The contract passes the trainer's turn-cap gate first (:func:`thinking_caps_by_level`), so a level
+    whose cap fills the turn refuses the run rather than scoring every episode as an error sample.
     """
-    validate_thinking_budget_scope(
+    thinking_caps_by_level(
         env,
-        scope=rollout.thinking_budget_scope,
+        max_tokens=rollout.max_tokens,
         max_thinking_tokens=rollout.max_thinking_tokens,
-        turn_reserve=rollout.thinking_turn_reserve,
+        max_episode_tokens=rollout.max_episode_tokens,
+        max_answer_tokens=rollout.max_answer_tokens,
     )
     tasks = [task_prompt(example["prompt"]) for example in examples]
     semaphore = asyncio.Semaphore(max_workers)
@@ -390,7 +406,7 @@ async def collect_results(
                 async with semaphore:
                     traj = await run_episode(env, task, example["context"], client, rollout=rollout)
                 reward = traj.total_reward if traj and traj.done else 0.0
-                stats = (traj.info.get("_eval_stats") if traj else None) or {}
+                stats = (traj.info.get(EVAL_STATS_KEY) if traj else None) or {}
                 rec: dict[str, Any]
                 if traj is not None and _DRIVER_FAULT_KEY in traj.info:
                     # The episode stopped on the driver's fault, not the policy's: what it earned before

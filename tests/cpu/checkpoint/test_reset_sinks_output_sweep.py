@@ -9,9 +9,9 @@ its own ``-00001-of-00002`` numbering regex matches, so a stale index survives i
 ``from_pretrained`` and the toolkit's index-first readers can resolve the OLD weights — or shards
 that no longer exist — from a directory the tool reported as successfully reset.
 
-The sweep therefore sits at the dispatcher, after whichever branch ran, and only when the output
-directory is not the input: rewriting a checkpoint where it stands is this tool's documented default,
-and there the directory's other weight files are not the tool's to delete.
+The single-file branch sweeps at the dispatcher, and only when the output directory is not the
+input: under ``--in_place`` the directory's other weight files are not the tool's to delete. The
+``from_pretrained`` branch sweeps its own output after its staged swap.
 
 The other way this tool hands back a directory it should not: the ``from_pretrained`` branch applies
 the trainers' own sink policy, so a layout that walk does not recognize must RAISE there instead of
@@ -174,6 +174,27 @@ def test_the_single_file_branch_stamps_the_safetensors_format(tmp_path):
         assert handle.metadata() == SAFETENSORS_METADATA
 
 
+def test_an_interrupted_single_file_write_leaves_the_target_and_no_stage(tmp_path, monkeypatch):
+    """A kill mid-write under ``--in_place`` must leave the only copy untouched and no partial file
+    behind: an unrecognized leftover beside the weights rides along into every later aux-file copy."""
+    source = tmp_path / "src"
+    _build_source(source, sharded=False)
+    before = sorted(os.listdir(source))
+    original = (source / SINGLE).read_bytes()
+
+    def interrupted(tensors, filename, metadata=None):
+        with open(filename, "wb") as handle:
+            handle.write(b"partial")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(reset_sinks_mod, "save_file", interrupted)
+    with pytest.raises(OSError, match="No space left"):
+        reset_sinks(str(source), in_place=True)
+
+    assert sorted(os.listdir(source)) == before, "the interrupted write left a staged file behind"
+    assert (source / SINGLE).read_bytes() == original
+
+
 def test_the_sharded_branch_sweeps_the_previous_runs_index(tmp_path):
     """The ``from_pretrained`` branch: ``save_pretrained`` removes the numbered shards it did not
     write but leaves the index naming them, so index-first readers resolve files that are gone."""
@@ -188,7 +209,7 @@ def test_the_sharded_branch_sweeps_the_previous_runs_index(tmp_path):
 
 
 def test_an_in_place_run_sweeps_nothing(tmp_path):
-    """In place is this tool's default, and there the directory is not its to prune: the other weight
+    """An ``--in_place`` reset does not prune the directory: the other weight
     files belong to whoever put them there, and the reset still has to happen."""
     source = tmp_path / "src"
     sinks = _build_source(source, sharded=False)
@@ -215,7 +236,7 @@ def _sinks_across_shards(directory) -> dict[str, torch.Tensor]:
 
 
 def test_an_in_place_sharded_reset_is_staged_verified_and_swapped(tmp_path, monkeypatch):
-    """The sharded (from_pretrained) branch's default is in place over the only copy, so WHERE the
+    """Under ``--in_place`` the sharded (from_pretrained) branch writes over the only copy, so WHERE the
     reset is written before it lands is the contract, not just the end state: a save straight into
     the target reaches the same final bytes and loses the checkpoint on any failure along the way.
     Recorded at the swap seam — the staged copy must already be reset while the target still holds

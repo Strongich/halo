@@ -2,11 +2,10 @@
 
 One figure per path, drawn on the same grid so the pair reads as a before/after: the standard
 path shards batches by **global rank** (one distinct batch per rank), the custom path by **DP
-rank** (the ranks of a TP/CP/ETP group, and of a pipeline chain, read the same batch). The worked
+rank** (the ranks of a TP/CP/ETP group read the same batch). The worked
 shape is world 16 with `tp_size=2` → `data_parallel_size = 8`.
 """
 
-import matplotlib.pyplot as plt
 from _pipeline_style import *
 
 W, H = 11.6, 5.7
@@ -20,7 +19,7 @@ RANKS, CELL_GAP = 16, 0.1
 # The strip is its own page: the cells span STRIP_W with no margin, offset by STRIP_X.
 CELL_XS, CELL_W = columns(STRIP_W, RANKS, 0.0, CELL_GAP)
 
-GATE_FLAGS = "is_tp_mode · is_cp_mode · is_expert_tp_mode · is_pp_mode · _dataset_presharded"
+GATE_FLAGS = "non_dp_replication_factor > 1 · _dataset_presharded"
 SAMPLER = ("Sampler (not distributed)", ["_get_train_sampler()", "→ RandomSampler"], TEAL)
 
 
@@ -50,11 +49,7 @@ def custom_batches(ax):
 
 def panel(name, head, sub, gate_title, gate_note, stages, batches, strip_caption, foot):
     """Gate strip → four stage cards → the rank/batch strip → the takeaway."""
-    fig, ax = plt.subplots(figsize=(W, H))
-    fig.patch.set_facecolor(BG)
-    ax.set_xlim(0, W)
-    ax.set_ylim(0, H)
-    ax.axis("off")
+    fig, ax = canvas(W, H)
 
     title(ax, head, sub)
 
@@ -79,8 +74,6 @@ def panel(name, head, sub, gate_title, gate_note, stages, batches, strip_caption
     footnote(ax, STRIP_X, 0.3, STRIP_W, foot)
 
     save(fig, name)
-    plt.close(fig)
-    print(f"✓ {name}.png")
 
 
 panel(
@@ -88,7 +81,7 @@ panel(
     "Standard dataloader path",
     "world 16 · DDP / FSDP / EP-only · dp = world = 16",
     "_needs_custom_dataloader() → False",
-    "— none set",
+    "— neither holds",
     [
         ("Trainer (HF / TRL)", ["get_train_dataloader()", "accelerator.prepare(dl)"], SLATE),
         SAMPLER,
@@ -103,9 +96,9 @@ panel(
 panel(
     "dataloader_custom",
     "Custom dataloader path",
-    "tp 2 · dp = (world / pp) / max(cp, tp, etp) = 16 / 2 = 8",
+    "tp 2 · dp = world / max(cp, tp, etp) = 16 / 2 = 8",
     "_needs_custom_dataloader() → True",
-    "— any one set",
+    "— either holds",
     [
         ("Trainer (toolkit)", ["get_train_dataloader()", "_prepare_dataloader(dl)"], SLATE),
         SAMPLER,
@@ -114,6 +107,6 @@ panel(
     ],
     custom_batches,
     "What each rank reads — 8 distinct batches, one per TP group",
-    "dp_rank = stage_local_rank // max(tp, cp), so a pipeline chain shares it too;"
+    "dp_rank = rank // max(tp, cp) (ETP partners share their dispatch rank);"
     " a pre-sharded dataset passes num_processes = 1.",
 )

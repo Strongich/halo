@@ -38,7 +38,7 @@ run reaching it would teach the policy that invented evidence works.
 
 ## Reward
 
-Grading is all-or-nothing, through `src/rewards/matching.py`: `exact_match` (case-insensitive
+Grading is all-or-nothing, through `src/rewards/graders/matching.py`: `exact_match` (case-insensitive
 after normalization), then `numeric_match` — every number in the response against the one value the
 expected answer states (read the same way, so `$18` and `18 dollars` expect 18), at `rtol=0.01` /
 `atol=1e-6`, percentages divided by 100 and `3,500` or `10\,000` read as one number. The response must
@@ -64,7 +64,10 @@ survives. It does not split a GSM8K-style `#### N` suffix: reduce such an
 
 A row with `choices` switches `exam_qa` to letter grading: the response's choice letter (A–J) is
 extracted from "A", "(A)", "A.", "The answer is A" and compared to the expected letter, and the
-choices are appended to the prompt.
+choices are appended to the prompt, each led by its letter (a choice already labelled with its own
+letter, `"B: Jupiter"`, is shown as written; more than ten choices are refused). In prose only an uppercase letter standing alone counts ("the
+answer is a tie" and "the answer is definitely C" name no choice); a bracketed or bare letter may be
+lowercase.
 
 `answer` may be that letter or a 0-based int index into `choices` (MMLU ships the index). A digit
 string raises: ARC's `answerKey` is sometimes a 1-based label (`"1"`–`"5"`), so convert it to a

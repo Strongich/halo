@@ -1,7 +1,7 @@
 """The ``metadata.json`` contract of a preprocessed dataset: the recorded
 :class:`PreprocessingConfig`, the stamp written beside the rows, and the compatibility verdicts the
-training path reads. Kept separate from the bake (:mod:`src.data.pipeline.preprocessing`) so a run
-that only reads the stamp does not import the tokenizers, collators and VLM machinery.
+training path reads. Split from the bake (:mod:`src.data.pipeline.preprocessing`) so a run that only
+reads the stamp does not import the tokenizers, collators and VLM machinery that wrote the rows.
 """
 
 import json
@@ -12,8 +12,8 @@ from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from typing import Any
 
-from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+from huggingface_hub import hf_hub_download, is_offline_mode
+from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError, RepositoryNotFoundError
 
 from src.data.shard_index import (
     PREPROCESSING_VERSION,
@@ -31,11 +31,11 @@ PREPROCESSING_MODES = ("chat", "text")
 # The strategies TRL's pack_dataset accepts.
 PACKING_STRATEGIES = ("bfd", "bfd_split", "wrapped")
 
-# Per-field metadata rather than hand-kept lists, so a new knob declares its own applicability where
-# it is defined. ``modes``: a knob set outside the mode that consumes it has no effect, and
+# Per-field metadata rather than hand-kept lists, so a new knob states its own applicability where it
+# is defined. ``modes``: a knob set outside the mode that consumes it does not do what it says, and
 # ``__post_init__`` refuses it. ``render_check=False`` exempts a field from
-# :func:`_validate_render_compatibility`; every other field is compared, since preprocessed rows are
-# baked and a differing runtime render knob would train something other than the YAML.
+# :func:`_validate_render_compatibility`; every other field is compared, because preprocessed rows are
+# baked and a differing runtime render knob would silently train something other than the YAML.
 _CHAT_ONLY = {"modes": ("chat",)}
 _TEXT_ONLY = {"modes": ("text",)}
 _NO_RENDER_CHECK = {"render_check": False}
@@ -59,37 +59,37 @@ class PreprocessingConfig:
     model_supports_system_role: bool = field(default=True, metadata=_CHAT_ONLY)
     tools_field: str | None = field(default=None, metadata=_CHAT_ONLY)
     interleaved_thinking: bool = field(default=False, metadata=_CHAT_ONLY)
-    # Top-level image column merged into the conversation, as the runtime VLM row processor does:
-    # hub VLM datasets keep images outside the messages, so without this the column is dropped and
-    # the artifact bakes text only.
+    # Top-level image column merged into the conversation, exactly as the runtime VLM row processor
+    # does: hub VLM datasets keep images outside the messages, so without this the column is dropped
+    # and the artifact bakes text.
     images_field: str | None = field(default=None, metadata=_CHAT_ONLY)
 
     # "chat" = chat-template conversation_field (SFT); "text" = raw text_field documents (pretraining).
-    # No render check on these three: the training scripts expose no mode / text_field / append_eos,
-    # so a text-mode artifact's tokenization is entirely baked.
+    # No render check on the three: the training scripts expose no mode / text_field / append_eos, so
+    # a text-mode artifact's tokenization is entirely baked.
     mode: str = field(default="chat", metadata=_NO_RENDER_CHECK)
     text_field: str = field(default="text", metadata=_TEXT_ONLY | _NO_RENDER_CHECK)
     # text mode only: document boundary marker
     append_eos: bool = field(default=True, metadata=_TEXT_ONLY | _NO_RENDER_CHECK)
 
-    # Default False, unlike the training side: it reads as "not set" for the mode check above, and
-    # True is inert without assistant_message_template (prepare_dataset's CLI defaults it on and
-    # requires the marker). No render check; the baked-label mismatch raises instead.
+    # Default False, unlike the training side: it reads as "not set" for the mode check above, and a
+    # True here is inert without assistant_message_template (prepare_dataset's CLI defaults it ON and
+    # demands the marker). No render check — the baked-label mismatch raises instead.
     train_on_completions_only: bool = field(default=False, metadata=_CHAT_ONLY | _NO_RENDER_CHECK)
     assistant_message_template: str | None = field(default=None, metadata=_CHAT_ONLY)
 
-    # No render check: covered by validate_preprocessing_compatibility's packed warning. The strategy
-    # is baked into the rows and the collator follows metadata.packed rather than the runtime flag.
+    # No render check: covered by validate_preprocessing_compatibility's packed warning; the strategy
+    # is baked into the rows and the collator follows metadata.packed, never the runtime flag.
     pack_sequences: bool = field(default=False, metadata=_NO_RENDER_CHECK)
     packing_strategy: str = field(default="bfd", metadata=_NO_RENDER_CHECK)  # one of PACKING_STRATEGIES
 
     # Tokenizer mutations, recorded because they change the produced ids: an EOS override moves the
-    # completion-mask boundaries and a template override re-renders every turn, while the artifact is
-    # otherwise indistinguishable from an unmutated one.
+    # completion-mask boundaries and a template override re-renders every turn, yet the artifact is
+    # otherwise byte-indistinguishable from an unmutated one.
     pad_token: str | None = None
     eos_token: str | None = None
     bos_token: str | None = None
-    chat_template: str | None = None  # resolved template text, not the file path it may have come from
+    chat_template: str | None = None  # RESOLVED template text, never the file path it may have come from
 
     # Prep-only execution knobs with no effect on the produced tokens, hence no render check:
     # sharding/process counts change layout only, and a non-hf backend emits identical ids.
@@ -139,7 +139,7 @@ class PreprocessingConfig:
             )
 
 
-# The render knobs a run's args are compared against (:func:`_validate_render_compatibility`):
+# The render knobs a run's args are compared against (:func:`_validate_render_compatibility`) —
 # every field that did not declare itself exempt, so a newly added knob is compared by default.
 _RENDER_CHECKED_FIELDS = tuple(
     f.name for f in dataclass_fields(PreprocessingConfig) if f.metadata.get("render_check", True)
@@ -179,10 +179,11 @@ class PreprocessedDatasetMetadata:
     def claims_payload(cls, data: Any) -> bool:
         """Whether a ``metadata.json`` payload is a toolkit preprocessing stamp at all.
 
-        ``metadata.json`` is a common file name: a hub dataset may ship its own beside raw rows.
-        Judging such a payload against this build's schema would turn an ordinary raw dataset into a
-        startup failure, so identity is checked first, keyed on the field every stamp this toolkit
-        writes.
+        ``metadata.json`` is a common file name: a hub dataset may ship its own (a card, a license
+        blob, a producer's provenance) beside raw rows. Judging such a payload against this build's
+        schema turns an ordinary raw dataset into a hard startup failure, so identity comes first —
+        keyed on the field every stamp this toolkit ever wrote carries, which is also the one the
+        detection verdict reads.
         """
         return isinstance(data, dict) and "preprocessed" in data
 
@@ -190,11 +191,11 @@ class PreprocessedDatasetMetadata:
     def from_dict(cls, data: dict[str, Any]) -> "PreprocessedDatasetMetadata":
         """Create from a ``metadata.json`` payload, refusing a stamp this build cannot read.
 
-        An unreadable stamp (a bumped version, a retired or unknown key) raises rather than falling
-        back to the raw path, which would re-tokenize pre-tokenized rows. Retired spellings are not
-        migrated: a stamp records what was baked, and re-spelling one would claim a knob was recorded
-        when nothing verified it. Only payloads this toolkit wrote (:meth:`claims_payload`) reach
-        here.
+        An unreadable stamp — a bumped version, a retired or unknown key — raises rather than
+        downgrading to the raw path, which would silently re-tokenize pre-tokenized rows. Retired
+        spellings are not migrated: a stamp is the record of what was baked, and re-spelling one
+        would claim a knob was recorded when nothing verified it. Only payloads this toolkit wrote
+        (:meth:`claims_payload`) reach here; a foreign one is not this schema's business.
         """
         reject_incompatible_stamp(cls, data, "Preprocessed dataset metadata")
         return cls(**data)
@@ -204,56 +205,69 @@ class PreprocessedDatasetMetadata:
         write_stamped_sidecar(path, self.to_dict())
 
 
-def _read_metadata_payload(path: str, *, best_effort: bool) -> dict[str, Any] | None:
+def _read_metadata_payload(path: str, *, s3_outage_reads_absent: bool) -> dict[str, Any] | None:
     """Raw ``metadata.json`` payload for a dataset path (local, S3 or Hub), or None if there is none.
 
-    Shared by the detection probe and the metadata load, so the three sources cannot drift apart.
-    ``best_effort`` turns a transient failure into None after a warning; an absent metadata.json is
-    the normal raw-dataset case and stays silent.
+    One reader behind both the detection probe and the metadata load, so the three sources cannot
+    drift apart. None only on a confirmed absence: no file in the directory, a live S3 404, a Hub repo
+    without the file or a repo that is not there (offline, the cache stands for the repo). Every other
+    failure raises, so an unreachable source never reads as a raw dataset. The one exception is
+    ``s3_outage_reads_absent`` (the probe's): an S3 outage with no local mirror is read as absent with
+    a warning, since an absence is never mirrored and a warm-cache raw dataset loads without S3.
     """
     source_type, bucket, key = parse_dataset_source(path)
-    try:
-        if source_type == "s3":
-            # Mirrored read: an S3/SSO outage serves the local mirror, so a warm-cache run still
-            # classifies as preprocessed instead of falling back to "raw" and failing on the stripped
-            # source columns. A live absence still raises FileNotFoundError, the raw-dataset case.
-            try:
-                return read_control_json_with_cache(bucket, f"{key.rstrip('/')}/{METADATA_FILE}")
-            except FileNotFoundError:
-                return None
-
-        if source_type == "hf_hub":
-            local_path = hf_hub_download(hub_repo_id(path), METADATA_FILE, repo_type="dataset")
-            with open(local_path) as f:
-                return json.load(f)
-
-        metadata_path = os.path.join(path, METADATA_FILE)
-        if not os.path.exists(metadata_path):
+    if source_type == "s3":
+        # Mirrored read: an S3/SSO outage serves the local mirror, so a warm-cache run keeps
+        # classifying as preprocessed instead of degrading to "raw" and dying on the stripped
+        # source columns. A live absence still raises FileNotFoundError, the raw-dataset case.
+        try:
+            return read_control_json_with_cache(bucket, f"{key.rstrip('/')}/{METADATA_FILE}")
+        except FileNotFoundError:
             return None
-        with open(metadata_path) as f:
+        except ValueError:
+            # The live read parses the stamp itself: a stamp that does not parse is no outage.
+            raise
+        except Exception as e:
+            if not s3_outage_reads_absent:
+                raise
+            logger.warning(
+                f"S3 is unreachable for {path}/{METADATA_FILE} and no local mirror of it exists "
+                f"({type(e).__name__}: {e}); treating the dataset as raw."
+            )
+            return None
+
+    if source_type == "hf_hub":
+        try:
+            local_path = hf_hub_download(hub_repo_id(path), METADATA_FILE, repo_type="dataset")
+        except LocalEntryNotFoundError as e:
+            if is_offline_mode():
+                return None
+            raise ConnectionError(
+                f"The Hub could not be reached for {path}/{METADATA_FILE}, so whether the dataset is "
+                f"preprocessed is unknown. Retry, or set HF_HUB_OFFLINE=1 to run from the local cache."
+            ) from e
+        except (EntryNotFoundError, RepositoryNotFoundError):
+            return None
+        with open(local_path) as f:
             return json.load(f)
 
-    except (EntryNotFoundError, RepositoryNotFoundError):
-        # A Hub dataset without metadata.json is a raw dataset: the common case, not an error.
+    metadata_path = os.path.join(path, METADATA_FILE)
+    if not os.path.exists(metadata_path):
         return None
-    except Exception as e:  # a transient creds/throttle/torn read must not kill one rank
-        if not best_effort:
-            raise
-        logger.warning(f"Metadata probe for {path} failed ({type(e).__name__}: {e}); treating as raw.")
-        return None
+    with open(metadata_path) as f:
+        return json.load(f)
 
 
 def is_preprocessed_dataset(path: str) -> bool:
     """True if ``path`` holds a toolkit ``metadata.json`` with ``preprocessed=True``.
 
-    Absent, unreadable, or someone else's ``metadata.json`` errs toward "raw"; the caller reconciles
-    the verdict across ranks. This probe never raises: it runs per rank right before a consensus
-    all-reduce, where a rank-local raise would block its peers. An incompatible toolkit stamp
-    therefore reports True, so every rank takes the same branch and
-    :func:`load_preprocessed_metadata` raises the version error on all of them instead of the run
-    re-tokenizing pre-tokenized rows.
+    Absent or someone else's ``metadata.json`` reads as "raw"; a read that fails raises
+    (:func:`_read_metadata_payload`), which the caller's input-probe consensus raises on every rank.
+    An INCOMPATIBLE toolkit stamp reports True: every rank takes the same branch and
+    :func:`load_preprocessed_metadata` raises the version error on all of them, rather than the run
+    silently re-tokenizing pre-tokenized rows.
     """
-    payload = _read_metadata_payload(path, best_effort=True)
+    payload = _read_metadata_payload(path, s3_outage_reads_absent=True)
     if payload is None:
         return False
     if not PreprocessedDatasetMetadata.claims_payload(payload):
@@ -270,7 +284,7 @@ def is_preprocessed_dataset(path: str) -> bool:
 
 def load_preprocessed_metadata(path: str) -> PreprocessedDatasetMetadata:
     """Load metadata from a preprocessed dataset (local, S3 or HF Hub)."""
-    payload = _read_metadata_payload(path, best_effort=False)
+    payload = _read_metadata_payload(path, s3_outage_reads_absent=False)
     if payload is None:
         raise FileNotFoundError(f"No {METADATA_FILE} at {path}: not a preprocessed dataset.")
     if not PreprocessedDatasetMetadata.claims_payload(payload):
@@ -282,12 +296,13 @@ def load_preprocessed_metadata(path: str) -> PreprocessedDatasetMetadata:
 
 
 def _stated_render_knobs(render_args: Any) -> frozenset[str] | None:
-    """Knob names the run's args state explicitly: those holding something other than their default.
+    """Knob names the run's args actually STATE — those holding something other than their default.
 
-    ``None`` when the defaults cannot be read off ``render_args`` (not a dataclass), in which case
-    every knob counts as stated. A value the YAML never set makes no claim about the baked artifact,
-    and the two sides' defaults move independently, so comparing default against default would fail
-    every artifact prepared before a default moved. An explicitly set knob still raises.
+    ``None`` when the defaults cannot be read off ``render_args`` (not a dataclass) — treat every
+    knob as stated. A value the YAML never set makes no claim about the baked artifact, and the two
+    sides' defaults move independently, so comparing default against default would turn every
+    artifact prepared before a default moved into a hard startup failure. An explicitly set knob
+    still raises: that YAML says something the run cannot deliver.
     """
     if not is_dataclass(render_args) or isinstance(render_args, type):
         return None
@@ -300,23 +315,22 @@ def _stated_render_knobs(render_args: Any) -> frozenset[str] | None:
 
 
 def _validate_render_compatibility(metadata: PreprocessedDatasetMetadata, render_args: Any) -> None:
-    """Raise when a render knob the run states explicitly differs from the value baked into the artifact.
+    """Raise when a render knob the run STATES differs from the value baked into the artifact.
 
     The checked set is :data:`_RENDER_CHECKED_FIELDS`, derived from the fields' own ``render_check``
-    metadata, so a newly added render knob is compared by default. Knobs the metadata predates, that
-    ``render_args`` does not carry, or that the run leaves at its own default
-    (:func:`_stated_render_knobs`) are reported rather than raised, since the prepared value is what
-    trains either way.
+    metadata, so a newly added render knob is compared by default instead of silently skipped. Knobs the metadata
+    predates, that ``render_args`` does not carry, or that the run leaves at its own default
+    (:func:`_stated_render_knobs`) are reported rather than raised — the prepared value is what
+    trained either way.
     """
     recorded = metadata.config or {}
     if recorded.get("mode") == "text":
         # Raw-text pretraining artifacts render no chat template: every knob below was inert at
         # preparation time, so there is nothing baked for the run's values to disagree with.
         return
-    checked = _RENDER_CHECKED_FIELDS
     stated = _stated_render_knobs(render_args)
 
-    unrecorded = [name for name in checked if name not in recorded and hasattr(render_args, name)]
+    unrecorded = [name for name in _RENDER_CHECKED_FIELDS if name not in recorded and hasattr(render_args, name)]
     if unrecorded:
         logger.warning(
             f"Preprocessed dataset metadata predates recording of {unrecorded}; cannot verify these "
@@ -325,18 +339,18 @@ def _validate_render_compatibility(metadata: PreprocessedDatasetMetadata, render
 
     mismatched: dict[str, tuple[Any, Any]] = {}
     unstated: dict[str, tuple[Any, Any]] = {}
-    for name in checked:
+    for name in _RENDER_CHECKED_FIELDS:
         if name not in recorded or not hasattr(render_args, name):
             continue
         if name == "assistant_message_template" and not metadata.train_on_completions_only:
-            # Without completion masking the template touches nothing baked, so a differing value
-            # changes neither the prepared labels nor the run; the earlier baked-label check already
-            # forces the masking flags to agree.
+            # Without completion masking the template touches nothing baked — a differing value
+            # changes neither the prepared labels nor the run (the earlier baked-label check
+            # already forces the masking flags to agree).
             continue
         run_value = getattr(render_args, name)
         if name == "chat_template":
-            # Both sides may spell the same template as a path or as the text itself. The config
-            # records the resolved text, so resolve the run's value through the same helper rather
+            # Both sides may spell the same template as a path or as the text itself; the config
+            # records the RESOLVED text, so resolve the run's value through the same helper rather
             # than reporting a path-vs-text difference as a template change.
             run_value = load_chat_template(run_value) if run_value else None
         if recorded[name] != run_value:
@@ -376,7 +390,7 @@ def validate_preprocessing_compatibility(
     and on ``packing`` requested against an unpacked artifact.
 
     ``render_args`` is the run's script-args object; every :class:`PreprocessingConfig` render knob
-    it carries (minus the separately-checked and exempt fields) is compared against the recorded
+    it carries (minus the separately-checked/exempt fields) is compared against the recorded
     metadata. ``required_packing`` is the run's ``packing`` flag.
     """
     if metadata.max_length < required_max_length:
@@ -385,8 +399,8 @@ def validate_preprocessing_compatibility(
             f"required max_length ({required_max_length}). Re-preprocess with larger max_length."
         )
     if metadata.max_length > required_max_length:
-        # Rows are already baked at metadata.max_length and never re-truncated at runtime, so
-        # training would exceed the configured activation budget.
+        # The dangerous direction: rows are already baked at metadata.max_length and never re-truncated
+        # at runtime, so training would silently exceed the configured activation budget.
         raise ValueError(
             f"Preprocessed dataset max_length ({metadata.max_length}) exceeds the configured "
             f"max_length ({required_max_length}) and preprocessed rows are not re-truncated at "
@@ -394,7 +408,7 @@ def validate_preprocessing_compatibility(
         )
 
     if required_train_on_completions_only is not None:
-        # Labels are baked at preparation time, so a mismatch trains the opposite of the YAML.
+        # Labels are baked at preparation time, so a mismatch silently trains the opposite of the YAML.
         if "train_on_completions_only" not in (metadata.config or {}):
             logger.warning(
                 "Preprocessed dataset metadata predates the train_on_completions_only field; cannot "

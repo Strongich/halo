@@ -32,8 +32,8 @@ Whatever the server advertises. Tools are discovered on the first episode from t
 | `fetch` | — | HTTP fetch for web content (`uvx`) |
 | `memory` | — | knowledge-graph memory |
 | `brave_search` | `BRAVE_API_KEY` | Brave web search |
-| `github` | `GITHUB_TOKEN` | GitHub API |
-| `slack` | `SLACK_TOKEN` | Slack messaging |
+| `github` | `GITHUB_PERSONAL_ACCESS_TOKEN` | GitHub API |
+| `slack` | `SLACK_BOT_TOKEN`, `SLACK_TEAM_ID` | Slack messaging |
 
 ## Evaluation
 
@@ -51,8 +51,8 @@ from src.environments.envs.protocols.mcp import NativeMCPClientEnvironment
 
 env = NativeMCPClientEnvironment(
     server_command="npx",
-    server_args=["-y", "@your-org/mcp-server-custom"],
-    server_env={"CUSTOM_API_KEY": "..."},
+    server_args=["-y", "<npm-package>"],
+    server_env={"API_KEY": "..."},
 )
 ```
 

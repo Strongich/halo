@@ -292,7 +292,7 @@ def test_post_process_qwen3():
         f"{PREFIX}.mlp.down_proj": torch.randn(E, M, H),
         f"{PREFIX}.mlp.gate.weight": torch.randn(E, H),  # router
     }
-    result = post_process_merged_weights(weights, "qwen3_moe", verbose=False)
+    result = _merge_via_tool(weights, "qwen3_moe")
 
     expert_keys = [k for k in result if ".experts." in k]
     assert len(expert_keys) == 3 * E
@@ -309,7 +309,7 @@ def test_post_process_gptoss_gmm():
         f"{PREFIX}.mlp.down_proj": torch.randn(E, M, H),
         f"{PREFIX}.mlp.router.weight": torch.randn(E, H),
     }
-    result = post_process_merged_weights(weights, "gpt_oss", verbose=False)
+    result = _merge_via_tool(weights, "gpt_oss")
 
     assert result[f"{PREFIX}.mlp.experts.gate_up_proj"].shape == (E, H, 2 * M)
     assert result[f"{PREFIX}.mlp.experts.down_proj"].shape == (E, M, H)
@@ -330,7 +330,7 @@ def test_post_process_glm4():
         f"{PREFIX}.mlp.gate.weight": torch.randn(E, H),
         f"{PREFIX}.mlp.shared_experts.gate_proj.weight": torch.randn(M, H),
     }
-    result = post_process_merged_weights(weights, "glm4_moe_lite", verbose=False)
+    result = _merge_via_tool(weights, "glm4_moe_lite")
 
     expert_keys = {k for k in result if f"{PREFIX}.mlp.experts." in k}
     assert expert_keys == {
@@ -348,8 +348,8 @@ def test_post_process_glm4():
 
 
 def test_post_process_lfm2_feed_forward_container():
-    """LFM2 MoE: experts live under ``feed_forward`` (regression: the merge once required ``.mlp.``
-    so LFM2 experts passed through unmerged → dropped on reload) and the hub layout is per-expert
+    """LFM2 MoE: experts live under ``feed_forward`` (a merge requiring ``.mlp.``
+    would pass LFM2 experts through unmerged → dropped on reload) and the hub layout is per-expert
     Llama-style names ``experts.{i}.w{1,3,2}.weight`` (w1 = gate, w3 = up, w2 = down) — the split
     order must match the class-declared _PER_EXPERT_UNFUSED_KEYS exactly (a swap has identical
     shapes and corrupts the SwiGLU silently)."""
@@ -360,7 +360,7 @@ def test_post_process_lfm2_feed_forward_container():
         f"{PREFIX}.feed_forward.down_proj": down,
         f"{PREFIX}.feed_forward.gate.weight": torch.randn(E, H),
     }
-    result = post_process_merged_weights(weights, "lfm2_moe", verbose=False)
+    result = _merge_via_tool(weights, "lfm2_moe")
 
     expert_keys = {k for k in result if f"{PREFIX}.feed_forward.experts." in k}
     assert expert_keys == {f"{PREFIX}.feed_forward.experts.{i}.w{n}.weight" for i in range(E) for n in (1, 2, 3)}
@@ -382,7 +382,7 @@ def test_post_process_glm4_unexpected_expert_param_raises():
         f"{PREFIX}.mlp.gate_up_proj_bias": torch.randn(E, 2 * M),
     }
     with pytest.raises(ValueError, match="unexpected expert params"):
-        post_process_merged_weights(weights, "glm4_moe_lite", verbose=False)
+        _merge_via_tool(weights, "glm4_moe_lite")
 
 
 def test_post_process_deepseek_v4():
@@ -397,7 +397,7 @@ def test_post_process_deepseek_v4():
         f"{PREFIX}.mlp.gate.weight": torch.randn(E, H),
         f"{PREFIX}.mlp.shared_experts.gate_proj.weight": torch.randn(M, H),
     }
-    result = post_process_merged_weights(weights, "deepseek_v4", verbose=False)
+    result = _merge_via_tool(weights, "deepseek_v4")
 
     assert result[f"{PREFIX}.mlp.experts.gate_up_proj"].shape == (E, 2 * M, H)
     assert result[f"{PREFIX}.mlp.experts.down_proj"].shape == (E, H, M)
@@ -415,7 +415,7 @@ def test_post_process_bailing():
         f"{PREFIX}.mlp.up_proj": torch.randn(E, H, M),
         f"{PREFIX}.mlp.down_proj": torch.randn(E, M, H),
     }
-    result = post_process_merged_weights(weights, "bailing_moe", verbose=False)
+    result = _merge_via_tool(weights, "bailing_moe")
 
     assert len([k for k in result if "experts." in k]) == 3 * E
     assert result[f"{PREFIX}.mlp.experts.0.gate_proj.weight"].shape == (M, H)
@@ -423,13 +423,14 @@ def test_post_process_bailing():
 
 
 def test_post_process_no_expert_weights_is_noop():
-    """A dense (non-MoE) state dict has no EP expert keys and is returned as-is."""
+    """A dense (non-MoE) state dict has no EP expert keys and passes through unchanged."""
     weights = {
         f"{PREFIX}.self_attn.q_proj.weight": torch.randn(H, H),
         f"{PREFIX}.mlp.gate.weight": torch.randn(E, H),
     }
-    result = post_process_merged_weights(weights, "unknown_model", verbose=False)
-    assert result is weights
+    result = _merge_via_tool(weights, "unknown_model")
+    assert set(result) == set(weights)
+    assert all(torch.equal(result[key], tensor) for key, tensor in weights.items())
 
 
 def test_post_process_unknown_type_with_experts_raises():
@@ -440,7 +441,7 @@ def test_post_process_unknown_type_with_experts_raises():
         f"{PREFIX}.mlp.down_proj": torch.randn(E, M, H),
     }
     with pytest.raises(ValueError, match="no HF-layout transform"):
-        post_process_merged_weights(weights, "mistral4_moe", verbose=False)
+        _merge_via_tool(weights, "mistral4_moe")
 
 
 def test_model_type_resolves_to_the_transform_of_its_layer_class():
@@ -478,6 +479,21 @@ def _load_merged(output_dir):
         if f.endswith(".safetensors"):
             merged.update(load_file(os.path.join(output_dir, f)))
     return merged
+
+
+def _merge_via_tool(weights: dict, model_type: str, ep_size: int = 2) -> dict:
+    """``weights`` merged by ``merge_ep_shards`` from the layout the per-rank EP save writes: each
+    expert tensor split on its expert dim into ``.shard_<rank>`` slices, every other tensor on rank 0."""
+    expert_groups, non_expert = _group_expert_weights(weights)
+    shards = [dict(non_expert)] + [{} for _ in range(ep_size - 1)]
+    for prefix, params in expert_groups.items():
+        for suffix, tensor in params.items():
+            for rank, part in enumerate(tensor.chunk(ep_size)):
+                shards[rank][f"{prefix}.{suffix}.shard_{rank}"] = part.clone()
+    with tempfile.TemporaryDirectory() as input_dir, tempfile.TemporaryDirectory() as output_dir:
+        _write_ep_checkpoint(input_dir, model_type, shards, ep_size)
+        merge_ep_shards(input_dir, output_dir, verbose=False)
+        return _load_merged(output_dir)
 
 
 def test_full_merge_qwen3_round_trip_values():
@@ -548,7 +564,7 @@ def test_full_merge_re_emits_every_tensor_at_its_stored_dtype():
     """The sharded writer already applied ``save_dtype_caster`` (bf16 everywhere except the
     module-tree keep-set: norms, balancing tensors, the family's fp32 pins), so the merge must
     re-emit each tensor exactly as stored. A second, name-only cast has no model tree to derive the
-    pins from and folded them to bf16 — GLM-5 Next's ``A_log``/``dt_bias``, Inkling's short
+    pins from and would fold them to bf16 — GLM-5 Next's ``A_log``/``dt_bias``, Inkling's short
     convolutions, DeepSeek-V4's ``attn_hc`` — breaking merged-from-sharded == gathered on the very
     tensors pinned because bf16 breaks their arithmetic."""
     ep_size = 2
@@ -855,9 +871,9 @@ def _assert_failed_merge_preserves_inputs(monkeypatch, writer_method, failing):
 
 
 def test_delete_input_shards_survives_midstream_write_failure(monkeypatch):
-    """A merge that fails while streaming tensors out must leave every input shard on disk — the
-    pre-streaming code once deleted each shard right after loading it, so a failed save destroyed
-    the only copy of the trained weights."""
+    """A merge that fails while streaming tensors out must leave every input shard on disk — a merge
+    that deleted each shard right after loading it would let a failed save destroy the only copy of
+    the trained weights."""
 
     def exploding_add(self, key, tensor):
         raise OSError("No space left on device")
@@ -893,7 +909,7 @@ def test_delete_input_shards_after_successful_merge():
 def test_expert_suffixes_cover_every_class_declared_root():
     """Every expert-weight root any EP family declares (_EXPERT_WEIGHT_ATTR_ROOTS union) must be
     captured by the merge pattern — a missed root passes expert shards through as 'non-expert'
-    weights and silently corrupts the merged checkpoint. Pre-derivation the hand list missed the
+    weights and silently corrupts the merged checkpoint. A hand list misses roots such as the
     GptOss ETP-layout biases (gate_proj_bias/up_proj_bias)."""
     roots = expert_weight_roots()
     assert roots, "EP layer classes declare no expert-weight roots — the subclass walk is broken"
@@ -985,7 +1001,8 @@ def test_merge_refuses_a_checkpoint_that_is_not_ep_sharded(metadata):
 
 
 def test_merge_refuses_to_write_into_its_own_input_dir():
-    """save_sharded_state_dict deletes the ``model*.safetensors`` it does not own, so an in-place
+    """``StageShardWriter.close_as_hf_checkpoint`` deletes the ``model*.safetensors`` it did not
+    write, so an in-place
     merge destroys the source shards — and ``--delete_input_shards`` would then remove the freshly
     written merged ones."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -998,7 +1015,7 @@ def test_merge_refuses_to_write_into_its_own_input_dir():
 
 
 def test_the_reader_accepts_exactly_what_the_writer_names():
-    """The per-rank shard filename has ONE home — ``save_ep_model``'s ``ep_shard_filename``.
+    """The per-rank shard filename has ONE home — ``src.checkpoint.format.ep_shard_filename``.
 
     A reader carrying its own copy of the pattern matches nothing after a writer-side rename (an
     empty merge on a full directory), and a loosened copy sweeps in a sibling adapter or a stale

@@ -39,7 +39,8 @@ from accelerate.logging import get_logger
 from trl import GRPOConfig, ModelConfig
 
 from src.args.distributed_args import DistributedArguments
-from src.args.environmental_grpo_args import DEFAULT_ANSWER_FIELD, EnvironmentalGRPOScriptArguments
+from src.args.environmental_grpo_args import EnvironmentalGRPOScriptArguments
+from src.args.mixins import DEFAULT_ANSWER_FIELD
 from src.configs.async_training_config import AsyncTrainingConfig
 from src.configs.environment_config import EnvironmentConfig
 from src.data.pipeline.conversation import as_conversation
@@ -49,7 +50,9 @@ from src.data.pipeline.processing import (
     require_render_column,
 )
 from src.data.pipeline.rendered import render_generation_prompt
+from src.data.pipeline.row_processors import blank_conversation
 from src.data.sources.loading import reject_image_columns
+from src.distributed.loading.frozen_models import load_reference_model_for_on_policy_grpo
 from src.distributed.loading.peft_setup import setup_peft_model
 from src.distributed.runtime import barrier
 from src.environments.base import ANSWER_KEY
@@ -60,6 +63,7 @@ from src.trainers.grpo.environmental import DistributedAsyncEnvironmentalGRPOTra
 from src.trainers.grpo.rollout.trajectory_tokenize import rollout_template_kwargs
 from src.trainers.grpo.rollout.weight_sync_clients import (
     verify_context_window_synced,
+    verify_engine_prompt_logprobs_synced,
     verify_sampler_logprob_reference_synced,
 )
 from src.training.environment import run_training
@@ -90,13 +94,13 @@ def measure_env_prompt_overhead(environment, tokenizer, template_kwargs: dict) -
 
     The dataset prompt filter measures only the templated user prompt, while the rollout prompt is
     built by the environment: its own system prompt plus the tool schema the chat template renders
-    into the context. The startup context-window check includes that overhead, or it validates a
-    prompt smaller than any the model will see. Rendered under ``template_kwargs`` — the rollout's
-    chat-template variables and effort steer (:func:`rollout_template_kwargs`) — since the template's
-    preamble depends on them. Falls back to a conservative margin when the template cannot render the
-    preamble (logged with the assumption). An MCP environment learns its tools only when its first
-    reset connects to the server, and ``environment`` here is never reset, so its schema is absent and
-    the overhead under-counts by it, which is warned.
+    into the context. The startup context-window check must include that overhead or it validates a
+    prompt smaller than any the model will ever see. Rendered under ``template_kwargs`` — the
+    rollout's chat-template variables and effort steer (:func:`rollout_template_kwargs`) — since the
+    template's preamble depends on them. Falls back to a conservative margin when the template cannot
+    render the preamble (logged with the assumption). An MCP environment learns its tools only when
+    its first reset connects to the server, and ``environment`` here is never reset, so its schema is
+    absent and the overhead under-counts by it, which is warned.
     """
     messages = ([{"role": "system", "content": environment.system_prompt}] if environment.system_prompt else []) + [
         {"role": "user", "content": ""}
@@ -130,17 +134,24 @@ def probe_template_kwargs(async_config: AsyncTrainingConfig, environment) -> dic
     """The chat-template kwargs a rollout request of this run carries, for the prompt-overhead probe:
     the run's template variables plus the level and thinking budget an episode binds through
     :func:`bind_episode_effort` (a ``'random'`` env setting draws one level, as an episode does), so the
-    probe renders the budget an episode's requests state: under the per-turn scope, the level's budget
-    clamped to ``rollout_max_thinking_tokens``."""
+    probe renders the budget an episode's requests state: the level's budget clamped to
+    ``rollout_max_thinking_tokens``."""
     effort = bind_episode_effort(
         None,
         environment,
         max_tokens=async_config.rollout_max_tokens,
         max_thinking_tokens=async_config.rollout_max_thinking_tokens,
-        scope=async_config.rollout_thinking_budget_scope,
-        turn_reserve=async_config.rollout_thinking_turn_reserve,
     )
-    return rollout_template_kwargs(async_config.rollout_template_variables(), effort.level, effort.thinking_budget)
+    return rollout_template_kwargs(async_config.rollout_chat_template_kwargs, effort.level, effort.thinking_budget)
+
+
+def worst_case_generation(async_config: AsyncTrainingConfig, max_turns: int) -> int:
+    """The most an episode can generate, for the context-window check: ``max_turns`` turns of
+    ``rollout_max_tokens``, or the episode output budget where it binds first."""
+    generated = max_turns * async_config.rollout_max_tokens
+    if async_config.rollout_max_episode_tokens is not None:
+        generated = min(generated, async_config.rollout_max_episode_tokens)
+    return generated
 
 
 def rollout_start_log(env_settings: dict, async_config: AsyncTrainingConfig) -> list[str]:
@@ -180,11 +191,7 @@ def process_dataset(args: EnvironmentalGRPOScriptArguments, tokenizer, ds):
         return result
 
     def rejected_row(row, messages=None):
-        """Type-stable rejection sentinel: a blank message list, never None — an all-rejected first
-        writer batch of None rows makes Arrow infer a null prompt column and crash casting later
-        real batches. is_valid_example drops all-blank-content conversations downstream."""
-        blank = [{**m, "content": ""} for m in messages] if messages else [{"role": "user", "content": ""}]
-        return {"prompt": blank, **carried_columns(row)}
+        return {"prompt": blank_conversation(messages), **carried_columns(row)}
 
     def process_for_grpo(row):
         messages = as_conversation(row.get(args.prompt_field))
@@ -326,10 +333,11 @@ def main():
     max_turns = probe_env.max_turns
     template_kwargs = probe_template_kwargs(async_config, probe_env)
     prompt_budget = (args.max_prompt_length or 0) + measure_env_prompt_overhead(probe_env, tokenizer, template_kwargs)
+    full_trajectory_tokens = prompt_budget + worst_case_generation(async_config, max_turns)
     verify_context_window_synced(
         async_config.get_server_urls(),
         single_turn_tokens=prompt_budget + async_config.rollout_max_tokens,
-        full_trajectory_tokens=prompt_budget + max_turns * async_config.rollout_max_tokens,
+        full_trajectory_tokens=full_trajectory_tokens,
         backend=async_config.rollout_backend,
     )
     # The IS ratio divides by the engine's logprobs: they must be the sampling distribution's.
@@ -337,15 +345,35 @@ def main():
         async_config.get_server_urls(),
         temperature=async_config.rollout_temperature,
         top_p=async_config.rollout_top_p,
-        sequence_ratio_active=async_config.isr_geo_band_min is not None or async_config.isr_opsm_delta is not None,
+        top_k=async_config.rollout_top_k,
+        min_p=async_config.rollout_min_p,
+        repetition_penalty=async_config.rollout_repetition_penalty,
+        sequence_ratio_active=async_config.build_is_mask_config().sums_sequence_logratio,
         backend=async_config.rollout_backend,
     )
+    # The engine re-score reads each train row off the prompt log-probs: they must not depend on the batch.
+    if async_config.isr_engine_reference:
+        verify_engine_prompt_logprobs_synced(
+            async_config.get_server_urls(), tokenizer, backend=async_config.rollout_backend
+        )
 
     # Environments that score through an external backend (an LLM judge) probe it here: a bad
     # URL/key/model would otherwise mark every episode invalid and the job would train on zero
     # advantage.
     verify_backend_on_rank0(
         probe_env.verify_backend, f"Environment backend of environment_type={env_config.environment_type!r}"
+    )
+    # The KL reference TRL would otherwise build itself; None where the run holds none. Loaded after the
+    # server preflights, so a misconfigured server fails before a second model load.
+    ref_model = load_reference_model_for_on_policy_grpo(
+        args,
+        model_config,
+        grpo_config,
+        parallelism_config,
+        tokenizer,
+        peft_config=peft_config,
+        reset_sinks=dist_args.reset_sinks,
+        attn_default=requested_attn,
     )
 
     grpo_config.reward_weights = [1.0]
@@ -360,9 +388,9 @@ def main():
         parallelism_config,
         policy_gradient_loss=True,
         syncs_to_external_generator=True,
-        # A trajectory accumulates every turn, so throughput/MFU is reported against the full
-        # multi-turn length rather than the declared prompt and per-turn budgets.
-        max_seq_len=prompt_budget + max_turns * async_config.rollout_max_tokens,
+        # A trajectory accumulates every turn, so the declared prompt + per-turn budgets are not its
+        # bound — throughput/MFU would be reported against a length the batches routinely exceed.
+        max_seq_len=full_trajectory_tokens,
     )
     trainer = DistributedAsyncEnvironmentalGRPOTrainer(
         model=model,
@@ -371,6 +399,7 @@ def main():
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
+        ref_model=ref_model,
         callbacks=callbacks,
         async_config=async_config,
         environment_config=env_config,

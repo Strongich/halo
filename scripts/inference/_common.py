@@ -22,8 +22,7 @@ from typing import TYPE_CHECKING
 
 from datasets import Dataset
 
-from src.data.sources.s3_client import build_s3_uri, exists, load_dataset_from_s3_uri, push_dataset_to_s3_uri
-from src.inference.response import OpenAIResponse
+from src.data.sources.s3_client import S3Client, build_s3_uri, load_dataset_from_s3_uri, push_dataset_to_s3_uri
 from src.log import configure_cli_logging
 
 if TYPE_CHECKING:
@@ -169,7 +168,7 @@ def load_prompts_with_resume(args) -> tuple[list[dict], list[dict]]:
 
     processed_ids: set = set()
     existing_results: list[dict] = []
-    if exists(args.output_path, subfolder=args.subfolder):
+    if S3Client().exists(args.output_path, subfolder=args.subfolder):
         logger.info(f"Loading existing results from S3: {args.output_path}")
         existing_dataset = load_dataset_from_s3_uri(build_s3_uri(args.output_path, args.subfolder))
         processed_ids = set(existing_dataset[args.id_field])
@@ -213,15 +212,25 @@ def save_results_to_s3(existing_results: list[dict], results: list[dict], *, out
     logger.info("Done!")
 
 
-def assistant_message_from_response(response: OpenAIResponse) -> dict:
-    """The assistant turn for a generated response, as the wire and the saved record both spell it.
+def follow_up_messages(row, field: str) -> list[dict] | None:
+    """The row's follow-up turns (``--follow_up_prompt_field``), sent after its first answer: a non-empty
+    message list, else ``None``. An empty list is no follow-up: a second request on a conversation that
+    already ends on the assistant's answer would record two assistant turns in a row."""
+    follow_up = row.get(field)
+    return follow_up if isinstance(follow_up, list) and follow_up else None
+
+
+def assistant_turn(content: str | None, tool_calls: list | None = None) -> dict:
+    """A generated assistant turn as the wire and every saved record spell it: ``role`` and
+    ``content``, plus ``tool_calls`` where the reply made any — never the reply object's other,
+    mostly null, SDK and engine fields.
 
     ``content`` stays ``None`` on a tool-call-only or empty reply: ``str(None)`` sends the literal
     text "None" to the next turn, which the model reads as the assistant's answer.
     """
-    message: dict = {"role": "assistant", "content": response.answer if isinstance(response.answer, str) else None}
-    if response.tool_calls:
-        message["tool_calls"] = [tool_call.model_dump() for tool_call in response.tool_calls]
+    message: dict = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = [tool_call.model_dump() for tool_call in tool_calls]
     return message
 
 

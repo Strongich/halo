@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Distributed off-policy distillation (text or VLM) with EP and TP support.
+"""Distributed off-policy distillation (text or VLM).
 
 Trains a student to match a frozen teacher's token distribution. One script serves both text and
 vision-language models: ``load_model_for_training`` auto-detects the student modality and the
@@ -17,24 +17,26 @@ EP applies to the student, so the dense-student config above takes no --expert_p
 """
 
 from accelerate.logging import get_logger
-from transformers import DataCollatorForLanguageModeling, PreTrainedModel
+from transformers import AutoConfig, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 from trl import ModelConfig
 
 from src.args.distill_args import DistillScriptArguments
 from src.args.distributed_args import DistributedArguments
 from src.configs.distillation_config import DistillationConfig
 from src.data.collators.factory import select_data_collator
+from src.data.collators.packing import DataCollatorForCausalLMWithPadding
 from src.data.collators.vlm import VLMDataCollator
-from src.data.pipeline.processing import coordinated_map, filter_by_length, resolve_map_num_proc
-from src.data.pipeline.rendered import tokenize_rendered
-from src.data.pipeline.row_processors import apply_chat_template_to_conversations, text_render_kwargs
+from src.data.pipeline.processing import process_dataset_with_map_and_filter, resolve_map_num_proc
+from src.data.pipeline.row_processors import create_llm_processor, text_render_kwargs
 from src.data.pipeline.vlm_dataset import prepare_vlm_dataset
+from src.distributed.filesystem import hub_metadata_main_first
 from src.distributed.loading.frozen_models import load_frozen_auxiliary_model
-from src.distributed.loading.peft_setup import prepare_peft_model, setup_peft_model
+from src.distributed.loading.peft_setup import setup_peft_model
 from src.distributed.loading.vlm_setup import load_model_for_training
 from src.distributed.runtime import barrier, is_global_main_process
 from src.models.loading.dtype import resolve_training_dtype
 from src.models.loading.model_preparation import log_model_info
+from src.trainers.distillation.losses import shared_vocab_width
 from src.trainers.distillation.teacher_distillation import DistributedDistillationTrainer
 from src.training.environment import run_training
 from src.training.parser import H4ArgumentParser
@@ -87,53 +89,54 @@ def _load_distill_teacher(
     )
 
 
-def _prepare_text_distill_data(ds, args, training_config, tokenizer, model_config):
-    """Chat-template → length-filter → tokenize; the collator derives the labels the losses mask on."""
-    num_proc_kwargs = {"num_proc": resolve_map_num_proc(training_config.dataset_num_proc)}
-    render_kwargs = text_render_kwargs(args)
-    ds = coordinated_map(
-        ds,
-        lambda row: {"text": apply_chat_template_to_conversations(row, tokenizer, **render_kwargs)},
-        desc="Applying chat template",
-        cache_key_extras=render_kwargs,
-        **num_proc_kwargs,
-    )
-    train_dataset = filter_by_length(ds["train"], training_config.max_length, tokenizer, **num_proc_kwargs)
-    # Same policy as train: drop over-length conversations instead of truncating them mid-turn.
-    eval_dataset = filter_by_length(ds["test"], training_config.max_length, tokenizer, **num_proc_kwargs)
+def _load_teacher_tokenizer(*, args, model_config, student_config, student_tokenizer) -> PreTrainedTokenizerBase:
+    """The teacher repo's own tokenizer, at the teacher's pin, checked with its config against the
+    student's token ids and logit rows before any teacher weight loads (the trainer checks again).
+    """
 
-    def _tokenize(row):
-        # tokenize_rendered applies the tokenizer's own special-token post-processing exactly once.
-        enc = tokenize_rendered(tokenizer, row["text"], truncation=True, max_length=training_config.max_length)
-        return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
+    def fetch():
+        kwargs = {"revision": args.teacher_model_revision or None, "trust_remote_code": model_config.trust_remote_code}
+        return (
+            AutoTokenizer.from_pretrained(args.teacher_model, **kwargs),
+            AutoConfig.from_pretrained(args.teacher_model, **kwargs),
+        )
 
-    train_dataset = coordinated_map(
-        train_dataset,
-        _tokenize,
-        remove_columns=train_dataset.column_names,
-        desc="Tokenizing train",
-        cache_key_extras={"max_length": training_config.max_length},
-        **num_proc_kwargs,
-    )
-    eval_dataset = coordinated_map(
-        eval_dataset,
-        _tokenize,
-        remove_columns=eval_dataset.column_names,
-        desc="Tokenizing eval",
-        cache_key_extras={"max_length": training_config.max_length},
-        **num_proc_kwargs,
-    )
-    # Both distillation terms mask on ``labels`` (the distill KL as well as the CLM term), so
-    # completions-only masking reaches the same tokens here as on the VLM path. The factory returns
-    # None when nothing is masked, and the losses read ``inputs["labels"]``, so the CLM collator that
-    # derives them from input_ids is the minimum.
-    collator = select_data_collator(
+    teacher_tokenizer, teacher_config = hub_metadata_main_first("teacher_metadata", fetch)
+    shared_vocab_width(student_config, teacher_config, student_tokenizer, teacher_tokenizer)
+    return teacher_tokenizer
+
+
+def _text_distill_collator(args, tokenizer, model_config):
+    """The completions-only collator, else the padded causal-LM one; the losses mask on its ``labels``.
+
+    The padded collator restores a turn-ending EOS where pad == eos, which a plain LM collator masks as
+    padding, leaving the student no stop signal to learn.
+    """
+    return select_data_collator(
         tokenizer=tokenizer,
         train_on_completions_only=args.train_on_completions_only,
         assistant_message_template=args.assistant_message_template,
         model_config=model_config,
-    ) or DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    return train_dataset, eval_dataset, collator
+    ) or DataCollatorForCausalLMWithPadding(tokenizer=tokenizer, mlm=False)
+
+
+def _prepare_text_distill_data(ds, args, training_config, tokenizer, model_config):
+    """SFT's chat row processor: each conversation is templated and tokenized once, and one over
+    ``max_length`` is dropped rather than truncated mid-turn, measured on the ids it trains on. The
+    collator derives the labels the losses mask on."""
+    render_kwargs = text_render_kwargs(args)
+    ds = process_dataset_with_map_and_filter(
+        ds,
+        create_llm_processor(
+            tokenizer=tokenizer, max_length=training_config.max_length, use_padding=False, **render_kwargs
+        ),
+        # sorted: this list feeds the coordinated-map cache key — set order is hash-randomized per process.
+        remove_columns=sorted(set(ds["train"].column_names)),
+        desc="Processing distillation dataset",
+        cache_key_extras={**render_kwargs, "add_generation_prompt": False},
+        num_proc=resolve_map_num_proc(training_config.dataset_num_proc),
+    )
+    return ds["train"], ds["test"], _text_distill_collator(args, tokenizer, model_config)
 
 
 def _prepare_vlm_distill_data(ds, args, training_config, processor, tokenizer, model_config):
@@ -205,12 +208,11 @@ def main():
     processing_class = install_resolved_tokenizer(processing_class, tokenizer)
     enforce_text_path_padding_side(tokenizer, is_vlm)
 
-    # The distillation trainer is a plain Trainer (no peft_config kwarg), so PEFT is applied here via
-    # prepare_peft_model (k-bit prep before the wrap, then the bf16 adapter cast).
     peft_config = setup_peft_model(args, student_model, model_config, "CAUSAL_LM")
-    if peft_config is not None:
-        student_model, _ = prepare_peft_model(student_model, peft_config, training_config)
 
+    teacher_tokenizer = _load_teacher_tokenizer(
+        args=args, model_config=model_config, student_config=student_model.config, student_tokenizer=tokenizer
+    )
     teacher_model = _load_distill_teacher(
         args=args,
         model_config=model_config,
@@ -245,12 +247,14 @@ def main():
     trainer = DistributedDistillationTrainer(
         student_model=student_model,
         teacher_model=teacher_model,
+        teacher_tokenizer=teacher_tokenizer,
         args=training_config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
         processing_class=processing_class,
         callbacks=callbacks,
+        peft_config=peft_config,
         **distributed_trainer_kwargs(args, dist_args, parallelism_config, dataset_presharded=dataset_presharded),
     )
     run_trainer(

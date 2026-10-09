@@ -54,12 +54,12 @@ MCP_SERVERS = {
     "github": {
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-github"],
-        "env": ["GITHUB_TOKEN"],
+        "env": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
     },
     "slack": {
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-slack"],
-        "env": ["SLACK_TOKEN"],
+        "env": ["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"],
     },
 }
 
@@ -95,7 +95,6 @@ class NativeMCPClientEnvironment(AsyncNativeToolUseEnvironment):
 
         self._session = None
         self._conn_task: asyncio.Task | None = None
-        self._close_task: asyncio.Task | None = None
         self._stop: asyncio.Event | None = None
         # Serialize the lazy first-episode connect so concurrent episodes don't each spawn a server.
         self._connect_lock = asyncio.Lock()
@@ -161,7 +160,7 @@ class NativeMCPClientEnvironment(AsyncNativeToolUseEnvironment):
     def _discover_tools(self, list_tools_response) -> None:
         """Register the server's tools in native OpenAI format."""
         for mcp_tool in list_tools_response.tools:
-            self.registry.register(self._create_mcp_tool(mcp_tool.name, mcp_tool))
+            self.registry.register(self._create_mcp_tool(mcp_tool))
         logger.info(f"MCP connected: {len(self.registry)} tools discovered")
 
     async def connect(self) -> None:
@@ -178,10 +177,11 @@ class NativeMCPClientEnvironment(AsyncNativeToolUseEnvironment):
             raise
         self._conn_task = task
 
-    def _create_mcp_tool(self, name: str, mcp_tool: Any) -> NativeTool:
+    def _create_mcp_tool(self, mcp_tool: Any) -> NativeTool:
         """Create a NativeTool from an MCP tool definition."""
+        name = mcp_tool.name
         parameters = []
-        schema = getattr(mcp_tool, "inputSchema", {})
+        schema = mcp_tool.inputSchema
         properties = schema.get("properties", {})
         required = schema.get("required", [])
 
@@ -189,7 +189,7 @@ class NativeMCPClientEnvironment(AsyncNativeToolUseEnvironment):
             parameters.append(
                 ToolParameter(
                     name=param_name,
-                    type=param_info.get("type", "string"),
+                    type=param_info.get("type"),
                     description=param_info.get("description", ""),
                     enum=param_info.get("enum"),
                     required=param_name in required,
@@ -263,7 +263,7 @@ class NativeMCPClientEnvironment(AsyncNativeToolUseEnvironment):
             except RuntimeError:
                 running = None
             if running is loop:
-                self._close_task = loop.create_task(self.disconnect())
+                self._run_or_schedule(self.disconnect())
             elif loop.is_running():
                 asyncio.run_coroutine_threadsafe(self.disconnect(), loop).result(timeout=MCP_DISCONNECT_TIMEOUT_S)
             else:

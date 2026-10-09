@@ -67,7 +67,7 @@ Each rank's shard loads join across the world on the c10d store (`DIST_STORE_TIM
 
 Force a re-download with `load_dataset_from_s3_uri(..., use_cache=False)`. Clear it by removing the resolved cache directory (`$HALO_DATA_ROOT/s3_datasets` unless overridden above).
 
-On multi-node with a shared filesystem (NFS/Lustre) the cache is shared — only one node downloads. With per-node local storage each node caches independently; set `DIST_SHARED_FILESYSTEM=0` (see [Filesystem Handling](filesystem-handling.md)).
+On multi-node with a shared filesystem (NFS/Lustre) the cache is shared — only one node downloads. With per-node local storage each node caches independently; set `DIST_SHARED_FILESYSTEM=0` (see [Filesystem Handling](filesystem-handling.md)). Since a node can serve its own stale cache while S3 is unreachable from it, the load agrees the rows across ranks and fails the launch on a disagreement ([Distributed Data Loading](../parallelism/data-loading.md)).
 
 ## Authentication
 
@@ -84,7 +84,6 @@ Import from `src.data.sources.s3_client`. The module surface (see the package fo
 |----------|---------|
 | `load_dataset_from_s3_uri(s3_uri, keep_in_memory=None, use_cache=True)` | Load HF dataset by URI; cached with file locking |
 | `push_dataset_to_s3_uri(dataset, s3_uri, overwrite=True)` | Push HF dataset by URI through the staged protocol: the tree uploads whole to a `.staging-*` sibling prefix, is sealed, then promoted by server-side copy with the load gates (`state.json`/`dataset_dict.json`) deleted first and copied last. A crash leaves either a complete copy at the destination or the sealed staging tree, which `load_dataset_from_s3_uri` falls back to; the next successful push heals and sweeps. One writer per destination at a time |
-| `exists(key, subfolder=None)` | Object/prefix existence under the default bucket. Only an authoritative absence of the key is `False`: a 403, an expired SSO or a throttle raises, and a missing bucket raises naming the bucket |
 | `build_s3_uri(key, subfolder=None)` | Full S3 URI from key (+ optional subfolder) under `HALO_S3_DEFAULT_BUCKET` (`default_bucket()`, which raises while it is unset), without constructing a client |
 
 `subfolder` is prepended to `key`; key paths may be nested. Everything else — folder transfers, listings,

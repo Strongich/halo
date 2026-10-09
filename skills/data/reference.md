@@ -13,7 +13,11 @@ Authoritative: `agent-docs/data/dataset-formats.md`. Messages are OpenAI ChatML
 - **SFT / SFT-VLM** — `prompt: List[Dict]` (field = `conversation_field`). VLM runs through the same
   `scripts/training/sft.py`: images ride embedded in message content or in an `images_field` column
   (`agent-docs/training-methods/sft.md#vision-language-models`).
-- **DPO / SMPO** — `prompt`, `chosen`, `rejected`, all `List[Dict]`.
+- **DPO / SMPO** — `chosen`, `rejected` (`List[Dict]`) and an optional `prompt` (`List[Dict]`, or a
+  `str` that becomes a user turn). A missing prompt is the shared leading turns of chosen/rejected,
+  and chosen/rejected that repeat the prompt keep only the continuation (`normalize_preference_row`,
+  `src/data/pipeline/preferences.py`). Vision preference rows skip that normalization (the trainers render them
+  themselves), so they arrive as three `List[Dict]` columns.
 - **Offline GRPO** — `prompt: List[Dict]`, `completions: List[List[Dict]]`, `rewards: List[float]`;
   `len(rewards) == len(completions)`, variable group size. A full-fine-tuning KL run scores its own
   reference and needs a finite, unsharded dataset: pre-sharded KL inputs and a supplied grouped
@@ -31,17 +35,18 @@ Authoritative: `agent-docs/data/dataset-formats.md`. Messages are OpenAI ChatML
   `prompt_field` / `answer_field` (a renamed answer still lands in the row as `answer`); an unknown
   name raises at startup.
 - **Reward** — `chosen`, `rejected` (`List[Dict]`), optional `prompt` (implicit-prompt sets like
-  Skywork-Reward keep the shared turns inside chosen/rejected) and `images`. There is **no
-  pre-tokenization pass**: TRL's `RewardTrainer` chat-templates and tokenizes the raw columns.
+  Skywork-Reward keep the shared turns inside chosen/rejected) and `images` → TRL's Bradley-Terry
+  columns `chosen_ids` / `rejected_ids` (+ optional `margin`).
 - **KTO** — `prompt` and `completion` (`List[Dict]`), `label` (`bool`).
-- **Classification** — `prompt: List[Dict]` or a raw text column named by `text_field`, plus
-  `label: str | List[str]` (multi-label); labels sorted alphabetically, `-1` reserved/filtered.
+- **Classification** — `prompt: List[Dict]` or a raw-text column named by `text_field`, plus
+  `label: str | List[str]` (multi-label); labels stringified and sorted. `-1` marks an unlabeled row:
+  dropped from a multi-label set, refused in a single-label split the run reads
+  (`agent-docs/training-methods/classification.md#dataset`).
 - **Distillation** — standard SFT conversation field (default `messages`); over-length rows are
   dropped at `max_length` (`agent-docs/training-methods/distillation/teacher-distillation.md`).
-- **Embedding** — read **positionally** by `SentenceTransformerDataCollator`: the first column named
-  `label`/`labels`/`score`/`scores` is the label, every remaining column in dataset order is one text
-  input. Column names carry no meaning; the objective comes from `loss_type`, not from the schema
-  (`agent-docs/training-methods/embedding.md`).
+- **Embedding** — positional, names carry no meaning: the label is the first of `label`, `labels`,
+  `score`, `scores` present, every other column (in dataset order) a text input — pairs, triplets,
+  scored or 0/1-labeled pairs, or labeled single texts (`agent-docs/training-methods/embedding.md#dataset-formats`).
 
 ## `prepare_dataset.py` (SFT-only offline prep)
 
@@ -107,7 +112,8 @@ JSON or a JSON file path).
 CP attention path has no per-document boundaries, so packed documents would attend across each
 other); `padding_free` on a non-varlen `attn_implementation`, and `packing` on a dense-mask backend
 for a family whose forward drops `position_ids` (gpt-oss); packing/padding-free for the
-GatedDeltaNet families without `causal_conv1d` + `fla>=0.2.2`, and GDN packing under PP;
+GatedDeltaNet families without `causal_conv1d` + `fla>=0.2.2`, and on a compressed-KV model
+(DeepSeek-V4's CSA/HCA layers, `reject_compressed_kv_rows`);
 `train_on_completions_only` needs `assistant_message_template` (and it must occur in the rendered
 chat template); `train_on_last_assistant_only` needs `train_on_completions_only`.
 
@@ -115,8 +121,8 @@ chat template); `train_on_last_assistant_only` needs `train_on_completions_only`
 |---|---|
 | CP + completions | `DataCollatorForCompletionOnlyLM` (pad_to_multiple_of=cp_size) |
 | CP | `DataCollatorForCausalLMWithPadding` (pad_to_multiple_of=cp_size) |
-| padding_free + completions | `DataCollatorWithFlatteningAndCompletionMask` (FA2, flash-attn kwargs) |
-| padding_free | `DataCollatorWithFlattening` (FA2, `cu_seq_lens`) |
+| padding_free + completions | `DataCollatorWithFlatteningAndCompletionMask` (varlen FA2/FA3/FA4, flash-attn kwargs) |
+| padding_free | `DataCollatorWithFlattening` (varlen FA2/FA3/FA4, `cu_seq_lens`) |
 | packing + completions | `DataCollatorForCompletionOnlyLMWithPacking` |
 | packing | `DataCollatorWithPacking` |
 | completions only | `DataCollatorForCompletionOnlyLM` |
@@ -128,10 +134,12 @@ that rows are flattened, as does packing on a dense-mask backend for a family th
 
 `bfd` packing emits `seq_lengths` per packed doc; collators reset `position_ids` at each boundary and
 build flash-attn `cu_seq_lens`. `wrapped` has no `seq_lengths` (cross-document attention — avoid with
-FlashAttention). VLM: packing/padding-free both unsupported. The scripts call
-`disable_trl_dataset_prep` (`src/training/script_runner.py`) after building the collator, which
-clears TRL's `packing` / `padding_free` and sets `skip_prepare_dataset`; do not set these in YAML
-(that turns the padding-free collator off). A custom script must call it.
+FlashAttention). VLM: packing/padding-free both unsupported. `packing` / `padding_free` in YAML
+choose the collator; after building it the scripts call `disable_trl_dataset_prep`
+(`src/training/script_runner.py`), which clears both on the TRL config and sets
+`dataset_kwargs: {skip_prepare_dataset: true}` so TRL keeps the script's collator. A custom script
+must call it. A non-default `dataset_kwargs` (or `dataset_text_field`) is refused at startup
+(`reject_trl_dataset_prep_args`).
 
 ## Footguns (source-cited)
 
@@ -152,7 +160,7 @@ clears TRL's `packing` / `padding_free` and sets `skip_prepare_dataset`; do not 
   through `cache_key_extras`.
 - **Rank-unstable HF fingerprints** — HF `_fingerprint`/`cache_files` diverge across ranks → each rank
   writes its own packed copy. The deterministic `_toolkit_cache_key` stamp is what keeps the
-  key rank-stable; `pack_dataset_coordinated` packs once on the main rank under `fs_aware_main_first`.
+  key rank-stable; `pack_dataset_coordinated` packs once per filesystem scope under `run_load_rank_first`, store-joined.
 - **Presharded re-shard trap** — a sharded dataset already gives each DP rank a disjoint slice; if
   `dataset_presharded` isn't passed, the DataLoader re-shards and drops ~(N-1)/N of each slice.
 - **Offline completion masking is baked at preprocess time** (`src/data/pipeline/preprocessing.py`):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Distributed embedding training with Expert and Tensor Parallelism support.
+"""Distributed embedding training.
 
 Fine-tunes embedding models with sentence-transformers losses over the common dataset shapes (pairs,
 triplets, scored pairs, labeled texts).
@@ -26,7 +26,8 @@ from src.args.embedding_args import EmbeddingScriptArguments
 from src.checkpoint.model_card import HUB_TAGS
 from src.configs.embedding_config import EmbeddingConfig
 from src.data.sources.loading import reject_image_columns
-from src.distributed.filesystem import fs_aware_main_first
+from src.distributed.filesystem import joined_node_load
+from src.distributed.loading.model_source import resolve_model_source
 from src.distributed.loading.peft_setup import build_peft_config
 from src.distributed.runtime import barrier, is_global_main_process
 from src.models.loading.dtype import cast_parameters_to_run_dtype, resolve_training_dtype
@@ -34,9 +35,11 @@ from src.models.loading.model_preparation import finalize_run_model
 from src.models.loading.tokenizer_setup import resolve_length_to_context
 from src.models.patches.buffer_fixes import finalize_loaded_model
 from src.models.patches.gpt_oss_sinks import SinksPolicy
+from src.models.patches.remote_code_compat import apply_remote_code_compat_shims
 from src.models.structure import tuner_adapter_param_ids
 from src.trainers.embedding.sentence_transformers_compat import PreloadedTransformer
-from src.trainers.embedding.trainer import EmbeddingTrainer
+from src.trainers.embedding.trainer import EmbeddingTrainer, reject_uneven_sentence_transformers_batches
+from src.trainers.mixins.dataloader import needs_dp_sharded_loader
 from src.training.environment import run_training
 from src.training.parser import H4ArgumentParser
 from src.training.script_runner import (
@@ -47,6 +50,7 @@ from src.training.script_runner import (
     init_training_script,
     load_script_datasets,
     load_script_model,
+    reject_non_default_args,
     reject_unsupported_args,
     run_trainer,
 )
@@ -111,12 +115,20 @@ def build_sentence_transformer(
         if model_config.attn_implementation:
             model_kwargs["attn_implementation"] = model_config.attn_implementation
 
-        # Main-first like every other load path, otherwise every rank downloads and materializes the
-        # model at once. revision is threaded as on the EP/TP branch so a pin holds on both.
-        with fs_aware_main_first("embedding_model"):
+        # The parallel loader's two seams, since sentence-transformers loads the backbone itself: the
+        # source fetched once per scope and agreed across ranks (revision threaded as on the EP/TP
+        # branch, so a pinned checkpoint does not depend on flags), then a node-batched load joined
+        # over the store. The whole repo: the pipeline's pooling and dense modules sit in subfolders.
+        apply_remote_code_compat_shims()
+        revision = resolve_model_source(
+            runtime.model_source, model_config.model_revision, tag="embedding_model", whole_repo=True
+        )
+        with joined_node_load(
+            f"Embedding model load from {runtime.model_source}", parallelism_config.max_concurrent_loading
+        ):
             st_model = SentenceTransformer(
                 runtime.model_source,
-                revision=model_config.model_revision,
+                revision=revision,
                 trust_remote_code=model_config.trust_remote_code,
                 model_kwargs=model_kwargs,
             )
@@ -256,8 +268,6 @@ def main():
         added_special_tokens=args.added_special_tokens,
         unfreeze_layers_patterns=args.unfreeze_layers_patterns,
         freeze_layers_patterns=args.freeze_layers_patterns,
-        # SentenceTransformer owns tokenization; "hf" (the default) is not a request.
-        tokenizer_backend=args.tokenizer_backend if args.tokenizer_backend != "hf" else None,
         # No chat-template rendering and no log_dataset_examples stage on this path.
         tools_field=args.tools_field,
         log_decoded_samples=args.log_decoded_samples,
@@ -265,6 +275,8 @@ def main():
         # only warns), and the SentenceTransformer branch never reads the flag.
         text_only_model=dist_args.text_only_model,
     )
+    # SentenceTransformer owns tokenization, so only the default backend is accepted.
+    reject_non_default_args("Embedding training", args, "tokenizer_backend")
 
     # LoRA on the SentenceTransformer path is injected below via inject_adapter_in_model (not the EP
     # grouped-adapter split, which is rejected together with EP/TP further down).
@@ -283,6 +295,10 @@ def main():
     reject_image_columns(ds, "Embedding training")
     train_dataset = ds["train"]
     eval_dataset = ds.get("test")
+    # Here, ahead of the model load: the trainer would refuse the same run only after it.
+    reject_uneven_sentence_transformers_batches(
+        embedding_config, train_dataset, toolkit_loader=needs_dp_sharded_loader(parallelism_config, dataset_presharded)
+    )
 
     if is_global_main_process():
         logger.info(f"Train dataset: {len(train_dataset)} examples")

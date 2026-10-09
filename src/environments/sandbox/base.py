@@ -5,15 +5,9 @@ One-shot :meth:`SandboxExecutor.run` uses a throwaway working dir; a :class:`San
 its working dir across calls (one per episode isolates concurrent rollouts).
 """
 
-import os
 import signal
-import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-
-from src.env import env_int
 
 # Per-execution wall-clock cap (seconds); large enough that a slower but correct CPython solution passes.
 SANDBOX_DEFAULT_TIMEOUT = 15.0
@@ -21,15 +15,11 @@ SANDBOX_DEFAULT_MEMORY_MB = 1024
 # Build-step wall-clock cap (seconds); bounds an #include bomb in untrusted source.
 SANDBOX_DEFAULT_COMPILE_TIMEOUT = 30.0
 SANDBOX_DEFAULT_COMPILE_MEMORY_MB = 2048
-# Largest file a local-backend child may write (bytes); bounds FS disk-fill and binary size.
-LOCAL_FSIZE_LIMIT = 64 * 1024 * 1024
-# RLIMIT_NPROC for the run step. The kernel ignores it for root (how the training containers run), so
-# it binds only unprivileged runs such as a bubblewrap jail; the timeout's process-group kill remains
-# the primary fork-bomb defense. It counts the user's entire task set, so it must clear the
-# trainer + Ray baseline.
-LOCAL_NPROC_LIMIT = 4096
 
 INTERPRETER_PLACEHOLDER = "$INTERPRETER"
+# The shell's exit code for a command it could not exec: on a build step, a missing compiler (a backend
+# failure), never a verdict on the source.
+COMMAND_NOT_FOUND_RETURNCODE = 127
 
 # Shared REPL observation for a run that produced no output, so every backend uses the same wording.
 REPL_NO_OUTPUT_MESSAGE = "Code executed successfully (no output)"
@@ -100,45 +90,12 @@ def stderr_tail(text: str, limit: int) -> str:
     return text if len(text) <= limit else "…" + text[-limit:]
 
 
-def _usable_cpus() -> int:
-    """CPUs this process may run on: its affinity set (a container cpuset), else the host count."""
-    if hasattr(os, "sched_getaffinity"):
-        return len(os.sched_getaffinity(0))
-    return os.cpu_count() or 1
+class SandboxFault(RuntimeError):
+    """A tool call ended on its sandbox rather than on a verdict about the program: the protocols catch
+    it ahead of any other exception and book it by its class."""
 
 
-def _resolve_execution_slots() -> int:
-    """Max concurrent sandboxed executions; the usable CPU count by default, ``HALO_SANDBOX_MAX_CONCURRENCY``
-    overrides (parsed via :func:`env_int` — a malformed value warns and falls back to the default)."""
-    override = env_int("HALO_SANDBOX_MAX_CONCURRENCY", None)
-    if override is not None:
-        return max(1, override)
-    return max(1, _usable_cpus())
-
-
-class ExecutionGate:
-    """Fixed pool of execution slots; caps host oversubscription so a per-test wall-clock limit
-    measures near-dedicated-core time. Thread-safe; a run acquires its slot before its timeout starts.
-    """
-
-    def __init__(self, slots: int):
-        self._semaphore = threading.BoundedSemaphore(max(1, slots))
-
-    @contextmanager
-    def slot(self) -> Iterator[None]:
-        """Hold one execution slot for the ``with`` block, queueing if saturated."""
-        self._semaphore.acquire()
-        try:
-            yield
-        finally:
-            self._semaphore.release()
-
-
-# One gate per process, shared by every env instance in it; processes sharing a host each hold their own.
-SANDBOX_EXECUTION_GATE = ExecutionGate(_resolve_execution_slots())
-
-
-class SandboxInfraError(RuntimeError):
+class SandboxInfraError(SandboxFault):
     """A sandbox run was lost to a backend/transport failure (remote HTTP error, missing compiler).
 
     Distinct from the program's own non-zero exit, compile error, or timeout; those are verdicts on
@@ -148,7 +105,7 @@ class SandboxInfraError(RuntimeError):
     """
 
 
-class SandboxAgentFault(RuntimeError):
+class SandboxAgentFault(SandboxFault):
     """The program's own action broke its sandbox beyond what the host can safely repair: it put a link
     or a file in its working directory's place, which only the ``local`` backend's unconfined program
     can do.
@@ -158,10 +115,6 @@ class SandboxAgentFault(RuntimeError):
     runtime error; the REPL layer raises it, the call is booked as a failed one, and the episode ends
     uncompleted, inside the baseline.
     """
-
-
-# The typed faults a tool call can end on; the protocols catch them ahead of any other exception.
-SANDBOX_FAULTS = (SandboxInfraError, SandboxAgentFault)
 
 
 @dataclass
@@ -200,6 +153,13 @@ def compile_limit_verdict(message: str) -> SandboxResult:
     return SandboxResult(stderr=message, compile_failed=True)
 
 
+def compile_failure_verdict(stderr: str, stdout: str, returncode: int) -> SandboxResult:
+    """A build the compiler rejected: the source's verdict, its diagnostics read off stderr (gcc/g++), else
+    off stdout for a toolchain that reports there."""
+    diagnostics = stderr.strip() or stdout.strip() or "compilation failed"
+    return SandboxResult(stderr=diagnostics, returncode=returncode, compile_failed=True)
+
+
 @dataclass(frozen=True)
 class LanguageSpec:
     """How a language's source is named, compiled, and launched inside a sandbox working dir.
@@ -213,6 +173,9 @@ class LanguageSpec:
     run_argv: tuple[str, ...]
     compile_argv: tuple[str, ...] | None = None
     aliases: tuple[str, ...] = field(default_factory=tuple)
+    # The language's comment syntax, what the coding environments' comment stripping reads.
+    line_comment: str = "#"
+    block_comment: tuple[str, str] | None = None
 
     @property
     def is_compiled(self) -> bool:
@@ -241,6 +204,8 @@ LANGUAGES: dict[str, LanguageSpec] = {
         compile_argv=("g++", "-O2", "-pipe", "-std=c++17", "-o", "main", "main.cpp"),
         run_argv=("./main",),
         aliases=("c++", "cxx", "cc"),
+        line_comment="//",
+        block_comment=("/*", "*/"),
     ),
     "c": LanguageSpec(
         name="c",
@@ -248,6 +213,8 @@ LANGUAGES: dict[str, LanguageSpec] = {
         compile_argv=("gcc", "-O2", "-pipe", "-std=c11", "-o", "main", "main.c"),
         run_argv=("./main",),
         aliases=(),
+        line_comment="//",
+        block_comment=("/*", "*/"),
     ),
 }
 
@@ -261,16 +228,11 @@ def resolve_language(language: str) -> LanguageSpec | None:
     return None
 
 
-def supported_languages() -> list[str]:
-    """Canonical names of all registered languages."""
-    return list(LANGUAGES.keys())
-
-
 def require_language(language: str) -> LanguageSpec:
     """:func:`resolve_language`, raising ``ValueError`` instead of returning None for an unknown name."""
     spec = resolve_language(language)
     if spec is None:
-        raise ValueError(f"unsupported language {language!r}; supported: {', '.join(supported_languages())}")
+        raise ValueError(f"unsupported language {language!r}; supported: {', '.join(LANGUAGES)}")
     return spec
 
 
@@ -346,6 +308,12 @@ class SandboxExecutor(ABC):
     def open_session(self) -> SandboxSession:
         """Open a persistent :class:`SandboxSession` (one per episode for multi-turn rollouts)."""
         raise NotImplementedError
+
+    def toolchain(self, language: str) -> str | None:
+        """How this backend builds or runs a ``language`` program, as the predicate a tool description
+        states (``is compiled with g++ -O2 -pipe -std=c++17``, ``runs on CPython 3.12``); ``None`` where the
+        backend does not say, as a service answering for its own toolchain."""
+        return None
 
     def run(
         self,

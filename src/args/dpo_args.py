@@ -1,13 +1,17 @@
 """Script arguments for DPO training."""
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from src.args.common_script_args import CommonScriptArguments
 from src.args.mixins import GenerationEvalArguments
+from src.args.validation import present, require_positive_int
 
 
 @dataclass
 class DPOScriptArguments(GenerationEvalArguments, CommonScriptArguments):
+    PROJECT_NAME: ClassVar[str] = "dpo-tuning"
+
     images_field: str | None = field(
         default=None,
         metadata={
@@ -30,6 +34,8 @@ class DPOScriptArguments(GenerationEvalArguments, CommonScriptArguments):
         },
     )
 
-    def __post_init__(self):
-        self._apply_default_project_name("dpo-tuning")
-        self._validate_ranges()
+    def _validate_ranges(self) -> None:
+        super()._validate_ranges()
+        require_positive_int(
+            type(self).__name__, **present(generation_max_prompt_length=self.generation_max_prompt_length)
+        )

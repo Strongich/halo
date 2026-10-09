@@ -23,10 +23,12 @@ import types
 
 import pandas as pd
 import pytest
+from openai.types.chat import ChatCompletionMessage
 
 from scripts.inference import _common
 from scripts.inference.reward_model import _common as rm_common
 from scripts.inference.reward_model import rm_rejection_sampling, rm_scoring
+from src.inference.openai_client import EmptyChoicesError
 
 
 def _prompt_rows(count: int) -> list[dict]:
@@ -47,8 +49,8 @@ class _DeadClient:
 
 
 def test_rm_scoring_names_how_many_rows_the_endpoint_lost(monkeypatch, tmp_path):
-    """The guard fired on "nothing produced" but could not say why; the failure count is what points
-    at the endpoint rather than at the input columns."""
+    """A guard firing on "nothing produced" cannot say why; the failure count is what points at the
+    endpoint rather than at the input columns."""
     prompts = tmp_path / "prompts.jsonl"
     prompts.touch()
     df = pd.DataFrame({"id": [1, 2, 3], "prompt": [[{"role": "user", "content": "q"}] for _ in range(3)]})
@@ -82,7 +84,7 @@ class _TruncatingClient:
 
     def __init__(self):
         async def _create(**_kwargs):
-            message = types.SimpleNamespace(model_dump=lambda exclude=None: {"role": "assistant", "content": "frag"})
+            message = ChatCompletionMessage(role="assistant", content="frag")
             choice = types.SimpleNamespace(message=message, finish_reason="length")
             return types.SimpleNamespace(choices=[choice])
 
@@ -117,6 +119,25 @@ def test_generate_chat_message_reports_the_finish_reason():
     )
     assert finish_reason == "length"
     assert message["content"] == "frag"
+
+
+def test_generate_chat_message_names_a_reply_without_choices():
+    """An aggregator can answer 200 with no choices; that is a named per-row failure carrying the
+    reply's error body, never an ``IndexError`` from indexing the empty list."""
+
+    class _EmptyClient:
+        def __init__(self):
+            async def _create(**_kwargs):
+                return types.SimpleNamespace(choices=[], error={"code": 400, "message": "bad request"})
+
+            self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=_create))
+
+    with pytest.raises(EmptyChoicesError, match="'gen-model'.*bad request"):
+        asyncio.run(
+            rm_common.generate_chat_message(
+                _EmptyClient(), [{"role": "user", "content": "q"}], _rm_args(), {"type": "text"}
+            )
+        )
 
 
 def test_rm_scoring_drops_and_counts_a_truncated_hypothesis(monkeypatch, tmp_path):

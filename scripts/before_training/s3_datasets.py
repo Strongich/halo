@@ -2,8 +2,7 @@
 """CLI over the toolkit's S3 dataset transport: push, download, list and delete S3 folders.
 
 Every handler acts through an :class:`~src.data.sources.s3_client.S3Client` built for the
-invocation's ``--bucket`` rather than the module default, since rebinding that singleton would hand
-this invocation's bucket to every other caller in the process.
+invocation's ``--bucket``.
 
 Usage:
     python scripts/before_training/s3_datasets.py <push|download|list|exists|delete> ...
@@ -41,7 +40,7 @@ def _cli_download(args, client: S3Client):
 
 def _cli_list(args, client: S3Client):
     objects = client.list_objects(
-        prefix=args.prefix or "",
+        prefix=args.prefix,
         subfolder=args.subfolder,
         recursive=args.recursive,
         max_keys=args.max_keys,
@@ -61,7 +60,7 @@ def _cli_list(args, client: S3Client):
 
 
 def _cli_delete(args, client: S3Client):
-    s3_uri = client._get_s3_uri(args.s3_key, args.subfolder)
+    s3_uri = client.s3_uri(args.s3_key, args.subfolder)
 
     # Both no-op deletes report success at the API: DeleteObject on a prefix is idempotent (204), and
     # the recursive path returns True when zero objects matched. Resolve what is actually there first
@@ -95,7 +94,7 @@ def _cli_delete(args, client: S3Client):
 
 
 def _cli_exists(args, client: S3Client):
-    s3_uri = client._get_s3_uri(args.s3_key, args.subfolder)
+    s3_uri = client.s3_uri(args.s3_key, args.subfolder)
 
     if client.exists(args.s3_key, args.subfolder):
         print(f"✓ {s3_uri} exists")
@@ -177,8 +176,6 @@ Examples:
 
     args = parser.parse_args()
 
-    # The CLI is a process entry point, so it configures the root handler; imported as a library this
-    # module only emits to its own logger.
     configure_cli_logging(verbose=args.verbose)
     # Undo the library modules' INFO pins so ``-v`` widens the S3 code that emits the transfer
     # records, not only its dependencies.
@@ -186,8 +183,6 @@ Examples:
     for module_logger in (s3_client.logger, dataset_cache.logger):
         module_logger.setLevel(level)
 
-    # The client the handlers act through, passed rather than installed as the module default:
-    # rebinding that singleton would give every other caller in the process this --bucket.
     args.func(args, S3Client(bucket=args.bucket))
 
 

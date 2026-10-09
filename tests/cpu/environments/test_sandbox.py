@@ -27,16 +27,13 @@ import requests
 from src.environments.envs.tasks.coding.code_contests import CodeContestsEnvironment
 from src.environments.envs.tasks.coding.grading import run_solution_against_tests
 from src.environments.envs.tasks.coding.swe import SweEnvironment
-from src.environments.sandbox import base as sandbox_base
-from src.environments.sandbox.base import (
+from src.environments.sandbox.base import SANDBOX_DEFAULT_MEMORY_MB, SandboxInfraError, SandboxResult
+from src.environments.sandbox.local import (
     LOCAL_NPROC_LIMIT,
-    SANDBOX_DEFAULT_MEMORY_MB,
     ExecutionGate,
-    SandboxInfraError,
-    SandboxResult,
+    LocalSubprocessSandbox,
     _resolve_execution_slots,
 )
-from src.environments.sandbox.local import LocalSubprocessSandbox
 from src.environments.sandbox.remote import RemoteSandbox
 from src.environments.sandbox.repl import format_sandbox_repl_output, run_code_via_sandbox
 from src.environments.sandbox.resolve import resolve_sandbox
@@ -229,8 +226,8 @@ def test_execution_slots_default_to_the_cpus_the_process_may_use(monkeypatch):
     """A container cpuset leaves the process fewer CPUs than the host reports; sizing the gate off the
     host count oversubscribes the cores the runs actually get, and a correct solution then times out."""
     monkeypatch.delenv("HALO_SANDBOX_MAX_CONCURRENCY", raising=False)
-    monkeypatch.setattr(sandbox_base.os, "cpu_count", lambda: 240)
-    monkeypatch.setattr(sandbox_base.os, "sched_getaffinity", lambda pid: set(range(216)))
+    monkeypatch.setattr(os, "cpu_count", lambda: 240)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(216)))
     assert _resolve_execution_slots() == 216
 
 
@@ -281,10 +278,13 @@ def test_local_rejects_unsafe_aux_path():
     assert "unsafe" in res.error.lower()
 
 
-def test_local_isolated_mode_ignores_pythonpath():
-    """`-I` means an injected PYTHONPATH module is NOT importable inside the sandbox."""
+def test_local_ignores_an_inherited_pythonpath(tmp_path, monkeypatch):
+    """The child runs ``-s -E`` in a minimal environment (``_child_env``), so a module reachable
+    only through the parent's PYTHONPATH is NOT importable inside the sandbox."""
+    (tmp_path / "halo_pythonpath_probe.py").write_text("VALUE = 1\n")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     sb = LocalSubprocessSandbox()
-    res = sb.run("import definitely_not_a_real_module_xyz")
+    res = sb.run("import halo_pythonpath_probe")
     assert not res.ok
     assert "ModuleNotFoundError" in res.stderr or "ImportError" in res.stderr
 
@@ -503,11 +503,11 @@ def test_resolve_remote_from_env():
     saved_backend = os.environ.get("HALO_SANDBOX_BACKEND")
     saved_url = os.environ.get("HALO_SANDBOX_URL")
     os.environ["HALO_SANDBOX_BACKEND"] = "remote"
-    os.environ["HALO_SANDBOX_URL"] = "http://sandbox.internal:8080"
+    os.environ["HALO_SANDBOX_URL"] = "http://sandbox.example:8080"
     try:
         sb = resolve_sandbox()
         assert isinstance(sb, RemoteSandbox)
-        assert sb.endpoint == "http://sandbox.internal:8080/run_code"
+        assert sb.endpoint == "http://sandbox.example:8080/run_code"
     finally:
         for key, val in (("HALO_SANDBOX_BACKEND", saved_backend), ("HALO_SANDBOX_URL", saved_url)):
             if val is None:
@@ -623,8 +623,8 @@ def test_format_repl_renders_a_compile_failure_from_the_head_of_the_diagnostics(
 def test_format_repl_raises_on_backend_error_with_partial_output():
     """A backend/transport error must RAISE, even if a partial response carried stdout.
 
-    Returning it as a string made the tool protocol score an infrastructure outage as a successful
-    call (paying ``tool_success_reward`` for a run that never happened).
+    Returned as a string, it would score an infrastructure outage as a successful call (paying
+    ``tool_success_reward`` for a run that never happened).
     """
     res = SandboxResult(stdout="partial", stderr="", returncode=None, error="remote sandbox error: 503")
     try:
@@ -645,6 +645,13 @@ def test_run_code_via_sandbox_local():
     sb = LocalSubprocessSandbox()
     assert run_code_via_sandbox("print(6 * 7)", sb) == "42"
     assert run_code_via_sandbox("import math\nprint(math.gcd(12, 18))", sb) == "6"
+
+
+def test_run_code_via_sandbox_gives_the_program_an_empty_stdin():
+    """The REPL tools declare no stdin, so a program reading input reads end-of-file at once instead of
+    blocking until its timeout."""
+    reply = run_code_via_sandbox("print(input())", LocalSubprocessSandbox(), timeout=5.0)
+    assert reply.startswith("Error:") and "EOFError" in reply and "timeout" not in reply, reply
 
 
 # run_solution_against_tests on the local backend

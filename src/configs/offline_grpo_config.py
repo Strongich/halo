@@ -5,12 +5,18 @@ from typing import Literal
 
 from transformers import TrainingArguments
 
-from src.args.mixins import ChunkedLogprobsArguments
-from src.args.validation import RangeValidatedConfig
+from src.args.mixins import ChunkedLogprobsArguments, DatasetNumProcArguments, ModelInitKwargsArguments
+from src.args.validation import RangeValidatedConfig, present, require_finite, require_int, require_positive_int
 
 
 @dataclass
-class OfflineGRPOConfig(ChunkedLogprobsArguments, RangeValidatedConfig, TrainingArguments):
+class OfflineGRPOConfig(
+    ChunkedLogprobsArguments,
+    DatasetNumProcArguments,
+    ModelInitKwargsArguments,
+    RangeValidatedConfig,
+    TrainingArguments,
+):
     r"""Training arguments for [`OfflineGRPOTrainer`]; per-field docs are in each field's ``help`` metadata."""
 
     max_prompt_length: int | None = field(
@@ -55,16 +61,6 @@ class OfflineGRPOConfig(ChunkedLogprobsArguments, RangeValidatedConfig, Training
         default=None,
         metadata={"help": "Pad token id used by the collator. None takes the processing class's pad token."},
     )
-
-    model_init_kwargs: dict | None = field(
-        default=None,
-        metadata={
-            "help": "Model-config overrides on every entry-script path: written onto the loaded "
-            "config's fields before the load, raising on a key that config does not declare and "
-            "on dtype/torch_dtype. Model-loading kwargs only where a trainer is constructed "
-            "programmatically with the model as a path string."
-        },
-    )
     advantage_method: Literal["z_norm", "minmax", "quantile_norm", "quantile_uniform", "robust"] = field(
         default="quantile_norm",
         metadata={
@@ -96,10 +92,6 @@ class OfflineGRPOConfig(ChunkedLogprobsArguments, RangeValidatedConfig, Training
             "over training (None = constant). Requires min_log_prob — without a final value to "
             "schedule toward no scheduler is added (warned). Recommend ~the mean CE loss on the SFT data."
         },
-    )
-    dataset_num_proc: int | None = field(
-        default=None,
-        metadata={"help": "Number of processes to use for processing the dataset."},
     )
     drop_degenerate_groups: bool = field(
         default=False,
@@ -135,10 +127,10 @@ class OfflineGRPOConfig(ChunkedLogprobsArguments, RangeValidatedConfig, Training
         super().__post_init__()
 
     def _validate_ranges(self) -> None:
-        """The ``float | str`` union on ``best_completion_emphasis`` bypasses the parser's Literal
-        gate, so a misspelled sentinel would otherwise fail only inside ``datasets.map`` on
-        ``float(...)``."""
         super()._validate_ranges()
+        owner = type(self).__name__
+        # The ``float | str`` union bypasses the parser's Literal gate, so a misspelled sentinel would
+        # otherwise fail only inside ``datasets.map`` on ``float(...)``.
         emphasis = self.best_completion_emphasis
         if isinstance(emphasis, str):
             if emphasis != "auto":
@@ -146,9 +138,27 @@ class OfflineGRPOConfig(ChunkedLogprobsArguments, RangeValidatedConfig, Training
                     f"best_completion_emphasis must be 'auto' or a number, got {emphasis!r}; "
                     f"'auto' is the only string sentinel (std-adaptive boost)."
                 )
-        elif emphasis != 0.0 and not emphasis > 1.0:
-            raise ValueError(
-                f"best_completion_emphasis must be 0.0 (off), a value > 1.0 (a boost), or 'auto', got "
-                f"{emphasis}. The consumer applies the factor only when it exceeds 1.0, so (0.0, 1.0] "
-                f"and negative values are silent no-ops."
-            )
+        else:
+            require_finite(owner, best_completion_emphasis=emphasis)
+            if emphasis != 0.0 and not emphasis > 1.0:
+                raise ValueError(
+                    f"best_completion_emphasis must be 0.0 (off), a value > 1.0 (a boost), or 'auto', got "
+                    f"{emphasis}. The consumer applies the factor only when it exceeds 1.0, so (0.0, 1.0] "
+                    f"and negative values are silent no-ops."
+                )
+        require_finite(owner, kl_beta=self.kl_beta)
+        if self.kl_beta < 0:
+            raise ValueError(f"{owner}: kl_beta must be >= 0 (0 = no KL term), got {self.kl_beta}")
+        require_finite(
+            owner, **present(min_log_prob=self.min_log_prob, initial_min_log_prob=self.initial_min_log_prob)
+        )
+        require_positive_int(
+            owner,
+            **present(
+                max_prompt_length=self.max_prompt_length,
+                max_completion_length=self.max_completion_length,
+                max_length=self.max_length,
+            ),
+        )
+        # A token id indexes the embedding table.
+        require_int(owner, minimum=0, **present(padding_value=self.padding_value))

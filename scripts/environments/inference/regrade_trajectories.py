@@ -39,12 +39,13 @@ from src.environments.envs.tasks.coding.code_contests import (
     DEFAULT_REASONING_EFFORT,
     SUBMIT_TOOL,
     CodeContestsEnvironment,
+    normalized_program,
 )
 from src.environments.envs.tasks.coding.datasets import CODE_DATASET_ADAPTERS, ContestSelection
 from src.environments.envs.tasks.coding.grading import grade_solution
 from src.environments.eval_runner import GENERATION_ERROR_KEY, load_hf_split
 from src.environments.registry import resolve_environment
-from src.environments.tools.definitions import NativeTool, NativeToolCall, ToolArgumentError
+from src.environments.tools.definitions import NativeToolCall, ToolArgumentError
 
 # Meta keys a re-grade needs: env_type/adapter/dataset/split select the environment and rebuild the
 # hidden tests, model/language name the row of the report. Only run_code_contests.py stamps the full
@@ -143,14 +144,18 @@ def episode_submission_budget(episode: dict[str, Any], env: Any) -> int:
     return int(stamped) if isinstance(stamped, int) and stamped > 0 else env.max_submissions
 
 
-def submitted_solutions(episode: dict[str, Any], tool: NativeTool) -> list[tuple[str, str | None]]:
-    """The ``submit_solution`` payloads the environment admitted, as ``(code, language)`` in
-    submission order; ``language`` is the call's own choice under a multi-language run, ``None`` where
-    the run fixed it. Arguments are read the way the environment read them
-    (:meth:`NativeToolCall.from_openai_format`, Python literals included). A recorded call ``tool``
-    refuses to bind (no code, a missing or foreign language, an argument the tool does not declare,
-    unparseable arguments) never ran and spent no budget, so it takes no slot here either."""
+def submitted_solutions(episode: dict[str, Any], env: CodeContestsEnvironment) -> list[tuple[str, str | None]]:
+    """The ``submit_solution`` payloads ``env`` admitted, as ``(code, language)`` in submission order;
+    ``language`` is the call's own choice under a multi-language run, ``None`` where the run fixed it.
+    Arguments are read the way the environment read them (:meth:`NativeToolCall.from_openai_format`,
+    Python literals included). A recorded call the tool refuses to bind (no code, a missing or foreign
+    language, an argument the tool does not declare, unparseable arguments), or one whose code the
+    environment refused as written in another language (:meth:`CodeContestsEnvironment.mislabelled_as`)
+    or as identical, comments aside, to one already graded (:func:`normalized_program`), was never graded and
+    spent no budget, so it takes no slot here either."""
+    tool = env.registry.get(SUBMIT_TOOL)
     solutions: list[tuple[str, str | None]] = []
+    graded: set[str] = set()
     for message in episode.get("messages", []):
         for raw in message.get("tool_calls") or []:
             call = NativeToolCall.from_openai_format(raw)
@@ -160,7 +165,11 @@ def submitted_solutions(episode: dict[str, Any], tool: NativeTool) -> list[tuple
                 bound = tool.bind(call.arguments)
             except ToolArgumentError:
                 continue
-            solutions.append((bound["code"], bound.get("language")))
+            language = bound.get("language")
+            program = normalized_program(bound["code"], language or env.language)
+            if env.mislabelled_as(bound["code"], language) is None and program not in graded:
+                graded.add(program)
+                solutions.append((bound["code"], language))
     return solutions
 
 
@@ -177,6 +186,13 @@ def regrade_file(path: str, workers: int) -> dict[str, Any]:
     validate_meta(path, meta)
     episodes = [episode for episode in recorded if not episode.get(GENERATION_ERROR_KEY)]
     payloads = build_payloads(meta)
+    # An index past the rebuilt problems means the dataset or its selection no longer matches the run's.
+    stray = sorted({episode["index"] for episode in episodes if not 0 <= episode["index"] < len(payloads)})
+    if stray:
+        raise SystemExit(
+            f"{path}: episode index(es) {stray} address none of the {len(payloads)} problems the rebuilt "
+            f"dataset yields; it no longer matches the one the run was scored on"
+        )
     env = rebuild_environment(meta)
     # The run's own grading contract off its meta line, minus the two knobs an offline re-grade must
     # not inherit. ``stop_on_first_failure``: s@1/s@2 need the all-pass verdict, not the pass
@@ -190,8 +206,8 @@ def regrade_file(path: str, workers: int) -> dict[str, Any]:
 
     def grade(idx: int, code: str | None, language: str | None) -> bool:
         """True iff ``code`` passes all of problem ``idx``'s tests, graded in the submission's language."""
-        payload = payloads[idx] if 0 <= idx < len(payloads) else None
-        if not code or not payload or not payload.get("tests"):
+        payload = payloads[idx]
+        if not code or not payload.get("tests"):
             return False
         passed, total, *_ = grade_solution(
             code,
@@ -204,17 +220,16 @@ def regrade_file(path: str, workers: int) -> dict[str, Any]:
         return total > 0 and passed == total
 
     # One grading task per (episode, admitted submission ≤ budget); bounded concurrency keeps wall-clock real.
-    submit_tool = env.registry.get(SUBMIT_TOOL)
     tasks = [
         (ep_i, code, language)
         for ep_i, episode in enumerate(episodes)
-        for code, language in submitted_solutions(episode, submit_tool)[: episode_submission_budget(episode, env)]
+        for code, language in submitted_solutions(episode, env)[: episode_submission_budget(episode, env)]
     ]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         verdicts = list(pool.map(lambda t: grade(episodes[t[0]]["index"], t[1], t[2]), tasks))
 
     per_episode: dict[int, list[bool]] = {}
-    for (ep_i, _, _), ok in zip(tasks, verdicts, strict=False):
+    for (ep_i, _, _), ok in zip(tasks, verdicts, strict=True):
         per_episode.setdefault(ep_i, []).append(ok)
 
     n = len(episodes)
