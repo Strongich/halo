@@ -203,10 +203,17 @@ def test_distill_out_of_range_raises(kwargs, match):
 _DISTILL_LOSSES = get_args(get_type_hints(DistillationConfig)["distill_loss"])
 
 
-@pytest.mark.parametrize("beta", [-0.1, 1.1, math.nan])
+@pytest.mark.parametrize("beta", [-0.1, 1.1])
 def test_distill_jsd_beta_outside_the_unit_interval_raises(beta):
     """Outside [0, 1] the mixture weight log1p(-β) or log(β) is NaN, so every JSD term would be NaN."""
     with pytest.raises(ValueError, match="distill_jsd_beta must be in"):
+        DistillationConfig(**_CPU_OK, distill_loss="jensen_shannon", distill_jsd_beta=beta)
+
+
+@pytest.mark.parametrize("beta", [True, False, math.nan])
+def test_distill_jsd_beta_that_is_not_a_number_raises(beta):
+    """A YAML ``true``/``false`` compares as 1/0 and would silently train the reverse/forward KL endpoint."""
+    with pytest.raises(ValueError, match="distill_jsd_beta must be a finite number"):
         DistillationConfig(**_CPU_OK, distill_loss="jensen_shannon", distill_jsd_beta=beta)
 
 

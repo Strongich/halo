@@ -93,7 +93,7 @@ class DistillationConfig(DatasetNumProcArguments, RangeValidatedConfig, Training
         super()._validate_ranges()
         owner = type(self).__name__
         require_positive(owner, distill_temperature=self.distill_temperature)
-        require_finite(owner, distill_alpha=self.distill_alpha)
+        require_finite(owner, distill_alpha=self.distill_alpha, distill_jsd_beta=self.distill_jsd_beta)
         # A non-positive length is legal: it resolves to the student's context window at launch.
         require_int(owner, **present(max_length=self.max_length))
         if not 0.0 <= self.distill_alpha <= 1.0:

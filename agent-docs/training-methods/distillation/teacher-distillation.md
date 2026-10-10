@@ -75,7 +75,7 @@ The loss shrinks toward the endpoints, to about `β·KL(q ‖ p)` near 0 and `(1
 
 `distill_topk: k` scores the loss on the teacher's top-k tokens plus one tail bin holding the rest of each distribution's mass. The config refuses it with any loss but `kl_divergence` and `soft_cross_entropy`, the two weighted by the teacher's probabilities. `k` must be below the vocabulary size; the trainer refuses one that covers it, since `null` is the full-vocab loss.
 
-It approximates the full-vocab objective. Merging tokens into one bin never increases a divergence, so the top-k loss is a lower bound on the full-vocab loss. Both forwards still produce full-vocab logits, so it saves no memory.
+It approximates the full-vocab objective. Merging tokens into one bin never increases a divergence, so the top-k loss is a lower bound on the full-vocab loss. Both forwards still produce full-vocab logits, so it saves no memory: the tail bin sums the off-support probabilities, which keeps one more fp32 `[tokens, vocab]` copy of the student's log-probs for the backward.
 
 ## Launch
 

@@ -512,6 +512,7 @@ class SDPGArguments(RangeValidatedConfig):
         super()._validate_ranges()
         if self.sdpg_loss not in get_args(SelfDistillationLoss):
             raise ValueError(f"sdpg_loss must be one of {get_args(SelfDistillationLoss)}, got {self.sdpg_loss!r}")
+        require_finite(type(self).__name__, sdpg_jsd_beta=self.sdpg_jsd_beta)
         if not 0.0 <= self.sdpg_jsd_beta <= 1.0:
             raise ValueError(f"sdpg_jsd_beta must be in [0, 1], got {self.sdpg_jsd_beta}")
         # Every other loss ignores β, so a set β with one of them is a config that does not train

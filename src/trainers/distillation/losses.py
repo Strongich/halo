@@ -30,10 +30,6 @@ from src.data.spans import LABEL_IGNORE_INDEX
 # while its log-prob turns finite, so a term that probability weights is 0 instead of 0 * -inf = NaN.
 _MASKED_LOGIT_FLOOR = torch.finfo(torch.float32).min
 
-# A support holding the whole mass up to fp32 rounding would leave the tail bin log(0); capping its
-# log-mass one fp32 epsilon below 0 keeps the tail finite at ~log(eps).
-_MAX_SUPPORT_LOG_MASS = -torch.finfo(torch.float32).eps
-
 
 def logits_forward_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
     """Model inputs for a forward that must return full-vocab logits.
@@ -209,10 +205,15 @@ def generalized_jsd_loss(
     return temperature_rescaled(jsd_beta * teacher_term + (1.0 - jsd_beta) * student_term, temperature)
 
 
-def _with_tail_bin(support_logprobs: torch.Tensor) -> torch.Tensor:
-    """Append the log-mass outside the support, ``log(1 - sum(exp(support)))``, as one more bin."""
-    support_log_mass = support_logprobs.logsumexp(dim=-1, keepdim=True).clamp(max=_MAX_SUPPORT_LOG_MASS)
-    return torch.cat([support_logprobs, torch.log(-torch.expm1(support_log_mass))], dim=-1)
+def _with_tail_bin(logprobs: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    """``logprobs`` on ``support`` plus one bin holding the log-mass off it.
+
+    The tail is summed over the off-support tokens, not taken as ``log(1 - support mass)``: once a
+    student's support mass rounds to 1 in fp32, that spelling leaves its tail constant, and the
+    student gets no gradient toward the teacher's tail mass.
+    """
+    tail_log_mass = logprobs.scatter(-1, support, float("-inf")).logsumexp(dim=-1, keepdim=True)
+    return torch.cat([logprobs.gather(-1, support), tail_log_mass], dim=-1)
 
 
 def teacher_topk_log_probs(
@@ -227,7 +228,7 @@ def teacher_topk_log_probs(
     student_logprobs = softened_log_probs(student_logits, temperature)
     teacher_logprobs = softened_log_probs(teacher_logits.detach(), temperature)
     support = teacher_logprobs.topk(topk, dim=-1).indices
-    return _with_tail_bin(student_logprobs.gather(-1, support)), _with_tail_bin(teacher_logprobs.gather(-1, support))
+    return _with_tail_bin(student_logprobs, support), _with_tail_bin(teacher_logprobs, support)
 
 
 def teacher_topk_loss(

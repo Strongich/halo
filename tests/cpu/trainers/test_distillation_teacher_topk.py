@@ -6,7 +6,8 @@ bin holding the rest of the vocabulary, and a teacher-weighted loss scores those
 Pinned against independent float64 spellings:
 
 - the tail bin carries exactly the probability mass outside the support, so each binned row is a
-  distribution;
+  distribution, and a student whose support mass rounds to 1 in fp32 still gets the tail's value and
+  gradient;
 - the support is the teacher's top-k;
 - at ``k = V`` the binned loss matches the full-vocab loss, value and student gradient;
 - below that, binning never raises a divergence (a lower bound on the full-vocab KL);
@@ -48,6 +49,13 @@ def _forward_kl_on_bins(student_bins, teacher_bins):
     return (teacher_bins.exp() * (teacher_bins - student_bins)).sum(-1)
 
 
+def _soft_cross_entropy_on_bins(student_bins, teacher_bins):
+    return -(teacher_bins.exp() * student_bins).sum(-1)
+
+
+REFERENCES_ON_BINS = {"kl_divergence": _forward_kl_on_bins, "soft_cross_entropy": _soft_cross_entropy_on_bins}
+
+
 def _topk_loss(name, topk, student, teacher, temperature):
     hard_labels = torch.zeros(BATCH, SEQ, dtype=torch.long)
     return call_divergence(get_divergence(name, topk=topk), student, teacher, temperature, hard_labels)
@@ -77,8 +85,7 @@ def test_the_support_is_the_teacher_topk_not_the_student_topk():
 @pytest.mark.parametrize("temperature", TEMPERATURES)
 @pytest.mark.parametrize("name", TOPK_DISTILL_LOSSES)
 def test_full_vocabulary_support_reproduces_the_full_vocab_loss(name, temperature):
-    """At ``k = V`` only the clamp's ~eps mass is left in the tail, so the binned loss matches the plain loss,
-    value and gradient."""
+    """At ``k = V`` the tail bin is empty, so the binned loss matches the plain loss, value and gradient."""
     student, teacher = _logits(seed=2)
 
     binned_student = student.clone().requires_grad_(True)
@@ -114,23 +121,32 @@ def test_binning_lower_bounds_the_full_vocab_kl():
 
 
 @pytest.mark.parametrize("name", TOPK_DISTILL_LOSSES)
-def test_a_student_with_all_its_mass_on_the_support_keeps_a_finite_tail(name):
-    """A student whose top-k mass rounds to exactly 1 in fp32 must not get log(0) as its tail bin.
+def test_a_student_with_all_its_mass_on_the_support_keeps_its_tail_gradient(name):
+    """A student whose top-k mass rounds to 1 in fp32 still owes the teacher's tail mass.
 
-    The teacher still has tail mass, so it would weight an infinite log-ratio: the loss jumps to
-    ~1e38 and the student's gradient turns non-finite.
+    ``log(1 - support mass)`` would turn its tail bin into a constant: the loss stays off by the
+    missing tail term and the gradient that moves mass back to the tail vanishes.
     """
     teacher = torch.zeros(1, 1, VOCAB)
     teacher[..., 0] = 1.0
-    student = torch.full((1, 1, VOCAB), -1000.0)
+    student = torch.full((1, 1, VOCAB), -40.0)
     student[..., 0] = 0.0
-    student.requires_grad_(True)
+    support = teacher.topk(TOPK, dim=-1).indices
 
-    student_bins, _ = teacher_topk_log_probs(student, teacher, TOPK, 1.0)
-    _topk_loss(name, TOPK, student, teacher, 1.0).sum().backward()
+    fp32_student = student.clone().requires_grad_(True)
+    value = _topk_loss(name, TOPK, fp32_student, teacher, 1.0).sum()
+    value.backward()
 
-    assert torch.isfinite(student_bins).all()
-    assert torch.isfinite(student.grad).all()
+    reference_student = student.double().requires_grad_(True)
+    reference = REFERENCES_ON_BINS[name](
+        _binned_reference(reference_student, support, 1.0), _binned_reference(teacher, support, 1.0)
+    ).sum()
+    reference.backward()
+
+    torch.testing.assert_close(value.double(), reference, rtol=REFERENCE_RTOL, atol=REFERENCE_ATOL)
+    torch.testing.assert_close(
+        fp32_student.grad.double(), reference_student.grad, rtol=REFERENCE_RTOL, atol=REFERENCE_ATOL
+    )
 
 
 if __name__ == "__main__":

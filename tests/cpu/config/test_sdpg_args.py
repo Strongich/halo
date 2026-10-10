@@ -189,10 +189,18 @@ def test_an_out_of_range_tunable_is_refused(arm, field_name, value):
 
 
 @pytest.mark.parametrize("arm", ALL_ARMS, ids=lambda c: c.__name__)
-@pytest.mark.parametrize("beta", [-0.1, 1.1, math.nan])
+@pytest.mark.parametrize("beta", [-0.1, 1.1])
 def test_a_jsd_beta_outside_the_unit_interval_is_refused(arm, beta):
     """Outside [0, 1] the mixture weight log1p(-β) or log(β) is NaN, so every JSD term would be NaN."""
     with pytest.raises(ValueError, match="sdpg_jsd_beta must be in"):
+        arm(sdpg_loss="jensen_shannon", sdpg_jsd_beta=beta)
+
+
+@pytest.mark.parametrize("arm", ALL_ARMS, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("beta", [True, False, math.nan])
+def test_a_jsd_beta_that_is_not_a_number_is_refused(arm, beta):
+    """A YAML ``true``/``false`` compares as 1/0 and would silently train the reverse/forward KL endpoint."""
+    with pytest.raises(ValueError, match="sdpg_jsd_beta must be a finite number"):
         arm(sdpg_loss="jensen_shannon", sdpg_jsd_beta=beta)
 
 
